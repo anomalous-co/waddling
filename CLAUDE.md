@@ -2,6 +2,10 @@
 
 Dynamic agent access-control for DuckDB. Agents connect their DuckDB instances to org-managed endpoints; birdshot enforces per-agent table-level ACLs at the gateway via Quack wire protocol.
 
+## Conventions
+
+- **Git commits**: do NOT add a `Co-Authored-By` trailer (or any co-author/attribution line) to commit messages. Write the message body and stop.
+
 ## Architecture
 
 Three-plane architecture:
