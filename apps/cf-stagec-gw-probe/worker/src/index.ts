@@ -149,7 +149,9 @@ async function mintAuthAndJwt(): Promise<{
 }
 
 async function runProbe(env: Env): Promise<Response> {
-  const gw = getSandbox(env.GATEWAY, "gw-probe-2") as unknown as GatewaySandbox;
+  // Fresh container id per binary rev so a redeploy boots a brand-new container
+  // with the new image, never reusing a prior instance's /tmp/gw-started marker.
+  const gw = getSandbox(env.GATEWAY, "gw-probe-3") as unknown as GatewaySandbox;
 
   const result: Record<string, unknown> = {};
 
