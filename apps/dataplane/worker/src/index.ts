@@ -390,12 +390,94 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (path === "/gwprobe") return gwEgressProbe(env, url);
 
+  if (path === "/lakeprobe" && request.method === "POST") return lakeIsolationProbe(env, body);
+
   if (path === "/selftest") return selftest(env, url);
 
   return new Response(
-    "waddling data plane. Service-binding routes: POST /configure /query /run /snapshot /end, POST /gw/snapshot, GET /gw/status, POST /gw/revoke. GET /selftest?step=1|2 to self-verify. GET /gwprobe?pgHost=<host>&pgPort=5432 = Stage-D egress gate.\n",
+    "waddling data plane. Service-binding routes: POST /configure /query /run /snapshot /end, POST /gw/snapshot, GET /gw/status, POST /gw/revoke. GET /selftest?step=1|2 to self-verify. GET /gwprobe?pgHost=<host>&pgPort=5432 = Stage-D egress gate. POST /lakeprobe {dsn} = #9 metadata-schema isolation gate.\n",
     { status: 200 },
   );
+}
+
+// ── #9 ACCEPTANCE GATE: per-endpoint METADATA_SCHEMA isolation ───────────────────
+// THE hard gate for #9 (the way /gwprobe gated egress). The whole per-org shared-catalog
+// design rests on one property: two endpoints sharing ONE Postgres catalog DB but distinct
+// METADATA_SCHEMA each see ONLY their own DuckLake tables. This boots two ducklake ATTACHes
+// (different schema, local DATA_PATH each) inside a real GatewayDO container (linux/amd64,
+// the production gateway image — has @duckdb/node-api), creates a table in each, and asserts
+// neither sees the other's. Run against a postgres catalog + local data dir to isolate the
+// genuinely-new surface (PG metadata schema) from R2. POST { dsn: "<libpq key=value DSN>" }
+// with a THROWAWAY catalog. Also exercises the gateway's defensive CREATE SCHEMA path.
+async function lakeIsolationProbe(env: Env, body: any): Promise<Response> {
+  const dsn = typeof body?.dsn === "string" ? body.dsn : "";
+  if (!dsn) {
+    return Response.json(
+      { error: "POST { dsn: '<libpq key=value postgres DSN>' } — the #9 metadata-schema isolation gate" },
+      { status: 400 },
+    );
+  }
+  // The probe script runs in-container. The DSN is embedded as a JSON literal (handles the
+  // spaces/=/; in a libpq DSN) and the whole script is base64-piped to node, exactly like
+  // the egress probe dodges shell-quoting. duckdb_tables() lists per-catalog tables.
+  const script = `
+import { DuckDBInstance } from '@duckdb/node-api';
+import { mkdirSync } from 'node:fs';
+const DSN = ${"${JSON_DSN}"};
+async function ensureSchema(c, schema) {
+  await c.run("ATTACH '" + DSN.replace(/'/g, "''") + "' AS _pg (TYPE postgres)");
+  try { await c.run('CREATE SCHEMA IF NOT EXISTS _pg.' + JSON.stringify(schema)); }
+  finally { await c.run('DETACH _pg'); }
+}
+async function attachLake(c, alias, schema, dir) {
+  await ensureSchema(c, schema);
+  mkdirSync(dir, { recursive: true });
+  await c.run("ATTACH 'ducklake:postgres:" + DSN.replace(/'/g, "''") + "' AS " + alias +
+              " (DATA_PATH '" + dir + "/', METADATA_SCHEMA '" + schema + "')");
+}
+async function tablesIn(c, alias) {
+  const r = await c.runAndReadAll("SELECT table_name FROM duckdb_tables() WHERE database_name = '" + alias + "' AND schema_name = 'main'");
+  return r.getRowObjects().map(o => String(o.table_name));
+}
+async function main() {
+  const inst = await DuckDBInstance.create(':memory:', { allow_unsigned_extensions: 'true' });
+  const c = await inst.connect();
+  await c.run('INSTALL ducklake; INSTALL postgres; INSTALL httpfs; LOAD ducklake; LOAD postgres;');
+  await attachLake(c, 'lake_a', 'ep_probe_a', '/tmp/lakeprobe/a');
+  await c.run('CREATE TABLE IF NOT EXISTS lake_a.main.t_only_a (id INTEGER)');
+  await c.run('INSERT INTO lake_a.main.t_only_a VALUES (1)');
+  await attachLake(c, 'lake_b', 'ep_probe_b', '/tmp/lakeprobe/b');
+  await c.run('CREATE TABLE IF NOT EXISTS lake_b.main.t_only_b (id INTEGER)');
+  await c.run('INSERT INTO lake_b.main.t_only_b VALUES (2)');
+  const aTables = await tablesIn(c, 'lake_a');
+  const bTables = await tablesIn(c, 'lake_b');
+  const isolated = aTables.includes('t_only_a') && !aTables.includes('t_only_b')
+                && bTables.includes('t_only_b') && !bTables.includes('t_only_a');
+  console.log('LAKEPROBE_RESULT:' + JSON.stringify({ aTables, bTables, isolated }));
+}
+main().catch(e => console.log('LAKEPROBE_RESULT:' + JSON.stringify({ error: String((e && e.message) || e) })));
+`.replace("${JSON_DSN}", () => JSON.stringify(dsn));
+
+  const gw = getSandbox(env.GATEWAY, gatewayDoId("lake-probe")) as unknown as GatewayHandle & {
+    destroy(): Promise<void>;
+  };
+  try {
+    await withBootRetry(() => gw.exec("echo ready"), "lake-probe warmup");
+    const b64 = btoa(unescape(encodeURIComponent(script))); // utf8-safe base64 of the script
+    const run = await gw.exec(`cd /opt/gateway && mkdir -p /tmp/lakeprobe && echo ${b64} | base64 -d | node --input-type=module`);
+    const line = run.stdout.split("\n").find((l) => l.startsWith("LAKEPROBE_RESULT:"));
+    const result = line ? JSON.parse(line.slice("LAKEPROBE_RESULT:".length)) : { error: "no result line", raw: run.stdout.slice(-2000) };
+    return Response.json({
+      gate: "issue-9-metadata-schema-isolation",
+      ...result,
+      pass: result.isolated === true,
+      verdict: result.isolated === true
+        ? "PASS — distinct METADATA_SCHEMA isolates endpoints inside one shared Postgres catalog"
+        : "FAIL — cross-endpoint table visibility or boot error (see error/aTables/bTables)",
+    });
+  } finally {
+    try { await gw.destroy(); } catch { /* may already be gone */ }
+  }
 }
 
 // ── Stage D EGRESS GATE PROBE ───────────────────────────────────────────────────
