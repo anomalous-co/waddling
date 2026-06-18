@@ -77,13 +77,14 @@ agents.get('/', (c) =>
       api_key_id: string | null;
       owner: string | null;
     }>(
-      // owner = the user who owns the agent's API key (apikey.userId → user).
+      // owner = the user who owns the agent's API key. The Better Auth api-key plugin
+      // references the owning user via "referenceId" (NOT "userId" — that column doesn't exist).
       `SELECT a.id, a.org_id, a.name, a.description, a.default_role, a.mode, a.status,
               a.last_seen_at, a.api_key_id,
               COALESCE(u.name, u.email) AS owner
          FROM waddling.agent a
          LEFT JOIN "apikey" k ON k.id = a.api_key_id
-         LEFT JOIN "user" u   ON u.id = k."userId"
+         LEFT JOIN "user" u   ON u.id = k."referenceId"
         WHERE a.org_id = $1 AND ($2::text IS NULL OR a.status = $2)
         ORDER BY a.created_at ASC`,
       [caller.orgId, status],

@@ -410,6 +410,22 @@ app.get("/probe/auth", async (c) => c.json(await probeAuth(c.env)));
 app.get("/probe/caller", async (c) => c.json(await probeCaller(c.env)));
 app.get("/probe/migrate", async (c) => c.json(await probeMigrate(c.env)));
 
+// Temporary diagnostic: list a table's columns (default 'apikey') to ground-truth the
+// Better-Auth-owned schema (case/quoting). Remove with the rest of /probe/* scaffolding.
+app.get("/probe/cols", async (c) => {
+  const table = new URL(c.req.url).searchParams.get("table") ?? "apikey";
+  try {
+    const r = await query<{ column_name: string; data_type: string }>(
+      `SELECT column_name, data_type FROM information_schema.columns
+        WHERE table_name = $1 ORDER BY ordinal_position`,
+      [table],
+    );
+    return c.json({ ok: true, table, columns: r.rows });
+  } catch (e) {
+    return c.json({ ok: false, table, error: errMessage(e) });
+  }
+});
+
 app.get("/probe", async (c) => {
   const [db, secret, r2, crypto_, jwks, auth, caller] = await Promise.all([
     probeDb(c.env),

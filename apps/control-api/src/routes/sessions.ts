@@ -630,7 +630,7 @@ sessions.get('/:id', (c) =>
          FROM waddling.agent_session se
          LEFT JOIN waddling.agent a  ON a.id = se.agent_id
          LEFT JOIN "apikey" k        ON k.id = a.api_key_id
-         LEFT JOIN "user" u          ON u.id = k."userId"
+         LEFT JOIN "user" u          ON u.id = k."referenceId"
          LEFT JOIN waddling.endpoint e ON e.id = se.endpoint_id
         WHERE se.id = $1`,
       [id],

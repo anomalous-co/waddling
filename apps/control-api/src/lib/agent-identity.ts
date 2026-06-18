@@ -57,7 +57,7 @@ export async function resolveAgentIdentity(
   agentId: string,
 ): Promise<AgentIdentity | null> {
   const row = await queryOne<AgentIdentityRow>(
-    `SELECT a.id, a.name, a.mode, a.status, k."userId" AS owner_user
+    `SELECT a.id, a.name, a.mode, a.status, k."referenceId" AS owner_user
        FROM waddling.agent a
        LEFT JOIN "apikey" k ON k.id = a.api_key_id
       WHERE a.id = $1`,
