@@ -32,13 +32,23 @@
       "class_name": "GatewayDO",
       "image": "../../cf-stagec-gw-probe/container/Dockerfile",
       "instance_type": "standard-2",
-      "max_instances": 5
+      // Concurrent RUNNING gateway containers, one per active endpoint (DO key
+      // gw:<endpointId>). Idle/sleeping endpoints free their slot and don't count;
+      // the 101st simultaneously-active endpoint errors on start. 100 × standard-2
+      // (6 GiB / 1 vCPU) = 600 GiB / 100 vCPU. Paired 1:1 with a workspace per live
+      // session, so both classes scale together under the account ceiling (6 TiB /
+      // 1,500 vCPU): the two pools sum to ~1 TiB / 150 vCPU here — ample headroom.
+      "max_instances": 100
     },
     {
       "class_name": "WorkspaceSandbox",
       "image": "../../cf-stagec-ws-probe/container/Dockerfile",
       "instance_type": "standard-1",
-      "max_instances": 10
+      // Concurrent RUNNING workspace containers, one per (workspace, agent) live
+      // session. Kept equal to the gateway cap so workspaces don't become the tighter
+      // bottleneck (every session needs both). 100 × standard-1 (4 GiB / 0.5 vCPU) =
+      // 400 GiB / 50 vCPU.
+      "max_instances": 100
     }
   ],
 
