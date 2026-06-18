@@ -16,22 +16,27 @@
   "name": "waddling-control-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-06-16",
-  "compatibility_flags": ["nodejs_compat"],
-
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   // Control-plane database: PlanetScale Postgres reached through Hyperdrive
   // (port 5432, caching disabled). The Worker reads env.HYPERDRIVE.connectionString.
   "hyperdrive": [
-    { "binding": "HYPERDRIVE", "id": "cbd2434e2b3043fa914156943178a856" }
+    {
+      "binding": "HYPERDRIVE",
+      "id": "cbd2434e2b3043fa914156943178a856"
+    }
   ],
-
   // Data plane (apps/dataplane), reached ONLY over this service binding — it is
   // private (workers_dev:false). gateway-client transports /gw/* here; sessions
   // connect/query call /configure + /query. Agent SQL still flows through the
   // workspace sidecar's birdshot-gated quack ATTACH (the single chokepoint).
   "services": [
-    { "binding": "DATAPLANE", "service": "waddling-dataplane" }
+    {
+      "binding": "DATAPLANE",
+      "service": "waddling-dataplane"
+    }
   ],
-
   // Secrets Store bindings. MASTER_KEY is a Stage-A PLACEHOLDER; Stage B replaces
   // it with the real BETTER_AUTH_SECRET. The R2 creds are PLACEHOLDERs until a
   // real R2 S3 API token is minted and pushed via `wrangler secrets-store secret update`.
@@ -52,7 +57,6 @@
       "secret_name": "r2-secret-access-key"
     }
   ],
-
   // Non-secret vars. R2 S3-API connection details (the access keys are secret,
   // see secrets_store above). Plus Better Auth / JWT / MCP / Stripe construction
   // vars — all PLACEHOLDER values for B1. BETTER_AUTH_SECRET is deliberately NOT
@@ -62,30 +66,25 @@
     "R2_ENDPOINT": "https://866403f7ed22a791871b45539ac6fbd7.r2.cloudflarestorage.com",
     "R2_BUCKET": "waddling-ws-probe",
     "R2_REGION": "auto",
-
     "BETTER_AUTH_URL": "https://waddling-control-api.mirri.workers.dev",
     "JWT_ISSUER": "https://waddling-control-api.mirri.workers.dev",
     "JWT_AUDIENCE_PREFIX": "waddling",
     "MCP_RESOURCE_URL": "https://waddling-control-api.mirri.workers.dev",
-
     "STRIPE_SECRET_KEY": "sk_test_placeholder_b1",
     "STRIPE_WEBHOOK_SECRET": "whsec_placeholder_b1",
     "STRIPE_PRICE_PRO": "price_placeholder_pro",
     "STRIPE_PRICE_ENTERPRISE": "price_placeholder_ent",
-
     // PlanetScale per-org managed Postgres catalog. PLACEHOLDERs — replace with the
     // real service-token id + org slug + cluster size to enable. The token SECRET half
     // is a Worker secret: `wrangler secret put PLANETSCALE_SERVICE_TOKEN`. Until that
     // secret is set, getPlanetScaleClient() returns null and /api/cp/catalog 503s
     // (managed-postgres catalog disabled) — safe to deploy unconfigured.
-    "PLANETSCALE_SERVICE_TOKEN_ID": "PLACEHOLDER_ps_token_id",
-    "PLANETSCALE_ORG": "PLACEHOLDER_ps_org_slug",
-    "PLANETSCALE_CLUSTER_SIZE": "PS-10",
+    "PLANETSCALE_SERVICE_TOKEN_ID": "bziiutpzar3a",
+    "PLANETSCALE_ORG": "anomalous",
+    "PLANETSCALE_CLUSTER_SIZE": "PS-5",
     "PLANETSCALE_REGION": "us-east",
-
     // (GATEWAY_INTERNAL_URL removed: the gateway now lives in the waddling-dataplane
     // worker's GatewayDO, reached over the DATAPLANE service binding — see services.)
-
     // Deployment posture. MUST be "production": the endpoints/:id/provision dev
     // stand-in is gated on this and fails OPEN (route enabled) when unset, which
     // would let a caller flip prod endpoints to running. Never leave unset on a

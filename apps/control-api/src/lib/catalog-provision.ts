@@ -50,7 +50,7 @@ export function getPlanetScaleClient(env: Env): PlanetScaleClient | null {
     tokenId: env.PLANETSCALE_SERVICE_TOKEN_ID,
     token: env.PLANETSCALE_SERVICE_TOKEN,
     organization: env.PLANETSCALE_ORG,
-    clusterSize: env.PLANETSCALE_CLUSTER_SIZE || 'PS-10',
+    clusterSize: env.PLANETSCALE_CLUSTER_SIZE || 'PS-5',
     region: env.PLANETSCALE_REGION || undefined,
   };
   return new PlanetScaleClient(cfg);
