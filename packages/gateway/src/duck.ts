@@ -21,6 +21,26 @@ function qid(s: string): string {
 }
 
 /**
+ * Expose the lake's `main` tables as read-through VIEWs in `memory.main` so quack (which
+ * serves only the server's default `memory` catalog) can serve them. The view body reads
+ * straight from the lake, so the data stays durable in the lake/object store. Idempotent
+ * (CREATE OR REPLACE); a fresh local-file demo lake has no tables and this is a no-op.
+ */
+async function restoreLakeViews(connection: DuckDBConnection, alias: string): Promise<void> {
+  try {
+    const reader = await connection.runAndReadAll(
+      `SELECT table_name FROM duckdb_tables() WHERE database_name = ${q(alias)} AND schema_name = 'main'`,
+    );
+    for (const row of reader.getRowObjects() as Record<string, unknown>[]) {
+      const t = String(row.table_name);
+      await connection.run(`CREATE OR REPLACE VIEW memory.main.${qid(t)} AS SELECT * FROM ${alias}.main.${qid(t)}`);
+    }
+  } catch (e) {
+    console.log(`[gateway] restoreLakeViews failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
  * Defensively create the Postgres schema that a postgres-catalog DuckLake will use as
  * its METADATA_SCHEMA, before the ducklake ATTACH. DuckLake auto-creates its metadata
  * *tables* (CREATE_IF_NOT_EXISTS) but not the enclosing PG *schema*, so a fresh endpoint
@@ -181,6 +201,15 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   // birdshot_set_lake_catalog (applySnapshot), since `USE` does NOT carry to the
   // transient per-request connections quack's auth callbacks run on.
   await connection.run(`USE ${config.lakeAlias}`);
+
+  // quack serves ONLY the server's `memory` catalog (verified: USE does not change what it
+  // serves, and a client cannot address an attached server catalog). So expose the lake's
+  // tables as read-through VIEWs in memory.main — the data stays in the lake (R2), but
+  // `FROM memory.main.<t>` reads through. birdshot's bind-walk sees the view's expanded
+  // `<lakeAlias>.main.<t>`, which matches the grants pushed with lakeCatalog=<lakeAlias>.
+  // memory.main is shared across the instance's connections, so quack's per-request
+  // serving connections see these views. Restores on every (re)boot from the durable lake.
+  await restoreLakeViews(connection, config.lakeAlias);
 
   // Hand quack's auth/authz hooks to birdshot BEFORE the server starts listening.
   // The auth callbacks are evaluated on a fresh server-side connection per request

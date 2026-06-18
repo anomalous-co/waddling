@@ -28,6 +28,7 @@
 import { getSandbox, Sandbox, ContainerProxy } from "@cloudflare/sandbox";
 import { AwsClient } from "aws4fetch";
 import { importJWK, SignJWT, type JWK } from "jose";
+import { createHash } from "node:crypto";
 
 export { ContainerProxy };
 
@@ -65,7 +66,12 @@ function endpointFromGatewayHost(host: string): string | null {
 // DO id + R2 object key for a (workspace, agent). Lowercased (the SDK warns uppercase
 // breaks case-insensitive preview hostnames). Object key is CONSTANT across sessions so
 // a cold restore on a different DO instance hits the same R2 object.
-const wsDoId = (workspaceId: string, agentId: string): string => `${workspaceId}:${agentId}`.toLowerCase();
+// Deterministic ≤63-char Sandbox DO id for a (workspace, agent). The raw
+// `${workspaceId}:${agentId}` (two UUIDs) is 73 chars — over the SDK's 63-char limit — so
+// hash it. The R2 object key (workspaceObjectKey) still uses the ids separately, so a cold
+// restore on a different DO instance hits the same object regardless of this id.
+const wsDoId = (workspaceId: string, agentId: string): string =>
+  createHash("sha256").update(`${workspaceId}:${agentId}`).digest("hex").slice(0, 48);
 const workspaceObjectKey = (workspaceId: string, agentId: string): string => `workspace/${workspaceId}/db/${agentId}.duckdb`;
 
 // ── DO classes ─────────────────────────────────────────────────────────────────

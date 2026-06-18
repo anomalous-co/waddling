@@ -119,13 +119,14 @@ endpoints.post('/', (c) =>
     const caller = await resolveCaller(c);
     const input = await parseBody(c, CreateSchema);
 
-    // Quota check (plan entitlement gate).
+    // Quota check (plan entitlement gate) — only when billing is configured.
+    const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
     const ent = await getEntitlements(caller.orgId);
     const count = await queryOne<{ n: string }>(
       `SELECT count(*)::text AS n FROM waddling.endpoint WHERE org_id = $1`,
       [caller.orgId],
     );
-    if (Number(count?.n ?? 0) >= ent.endpoints) {
+    if (billingOn && Number(count?.n ?? 0) >= ent.endpoints) {
       return err(c, 'endpoint_quota_exceeded', 402, `Plan allows ${ent.endpoints} endpoint(s)`);
     }
 

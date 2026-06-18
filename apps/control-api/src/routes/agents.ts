@@ -114,12 +114,15 @@ agents.post('/', (c) =>
     }
     const input = await parseBody(c, CreateSchema);
 
+    // Plan quotas only apply when billing is configured (can't enforce a paid limit with
+    // no way to pay — mirrors the ACL plan gate + auth.ts stripeConfigured check).
+    const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
     const ent = await getEntitlements(caller.orgId);
     const count = await queryOne<{ n: string }>(
       `SELECT count(*)::text AS n FROM waddling.agent WHERE org_id = $1 AND status <> 'revoked'`,
       [caller.orgId],
     );
-    if (Number(count?.n ?? 0) >= ent.agents) {
+    if (billingOn && Number(count?.n ?? 0) >= ent.agents) {
       return err(c, 'agent_quota_exceeded', 402, `Plan allows ${ent.agents} agent(s)`);
     }
 

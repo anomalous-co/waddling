@@ -89,7 +89,12 @@ export async function resolveWorkspaceForSession(
     ws = { id: created!.id, data_path: dp!.data_path };
   }
 
-  const dbUri = `s3://${bucketFromDataPath(ws.data_path)}/${workspaceKey(ws.id, agentId)}`;
+  // db_uri is informational for the CF data plane: the dataplane owns the actual workspace
+  // file I/O (presigned URLs against its own R2 bucket), so this is NOT a storage coord.
+  // A managed endpoint's data_path is a marker (the faucet sets the real lake path at boot),
+  // so don't require s3:// here — fall back to a logical bucket for the uri.
+  const wsBucket = /^s3:\/\//i.test(ws.data_path) ? bucketFromDataPath(ws.data_path) : 'managed-workspace';
+  const dbUri = `s3://${wsBucket}/${workspaceKey(ws.id, agentId)}`;
 
   // Ensure the m2m membership + db_uri (idempotent).
   await query(

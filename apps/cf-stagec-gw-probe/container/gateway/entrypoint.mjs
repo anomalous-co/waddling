@@ -278,6 +278,9 @@ async function main() {
              FROM read_json('/tmp/hn.json', maximum_object_size=104857600)
             WHERE title IS NOT NULL`,
       );
+      // Expose it for quack serving: a read-through view in memory.main (quack serves only
+      // the server's default catalog). The data stays in the lake (R2).
+      await rt.run(`CREATE OR REPLACE VIEW memory.main.hn_posts AS SELECT * FROM ${alias}.main.hn_posts`);
       const countReader = await rt.connection.runAndReadAll(`SELECT count(*) AS n FROM ${alias}.main.hn_posts`);
       const count = Number(countReader.getRowObjects()[0]?.n ?? 0);
       log(`loaded ${count} HN posts into ${alias}.main.hn_posts (last ${days}d)`);
