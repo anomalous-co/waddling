@@ -56,7 +56,7 @@ import {
   type BirdshotJwk,
 } from '../lib/gateway-client';
 import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
-import { resolveGatewayBoot, CatalogNotReadyError } from '../lib/gateway-boot';
+import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import type { ConnectResult, QueryResult } from '../lib/types';
 import {
   resolveCaller,
@@ -352,10 +352,13 @@ sessions.post('/', (c) =>
     // retryable 503 (the org's PlanetScale DB isn't ready yet).
     let boot;
     try {
-      boot = await resolveGatewayBoot(endpointId);
+      boot = await resolveGatewayBoot(c.env, endpointId);
     } catch (e) {
       if (e instanceof CatalogNotReadyError) {
         return err(c, 'catalog_provisioning', 503, e.message);
+      }
+      if (e instanceof StorageNotReadyError) {
+        return err(c, 'storage_unavailable', 503, e.message);
       }
       throw e;
     }

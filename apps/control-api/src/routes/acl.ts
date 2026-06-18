@@ -103,7 +103,7 @@ async function recompileAndPush(
       // push is the one that cold-boots the gateway, it ATTACHes the real DuckLake (not
       // the demo). resolveGatewayBoot may report the managed catalog still provisioning;
       // skip the push then (the rule is persisted; connect/recompile re-pushes later).
-      const boot = await resolveGatewayBoot(endpointId);
+      const boot = await resolveGatewayBoot(c.env, endpointId);
       const snapshotReq: SnapshotRequest = {
         endpointId,
         auth: {
@@ -218,17 +218,20 @@ acl.post('/', (c) =>
     const caller = await resolveCaller(c);
     const input = await parseBody(c, AclRuleSchema);
 
-    // Free tier may not create dynamic ACL rules. The original emitted an
-    // upgrade_viewed PostHog event before re-throwing; that funnel hook is a
-    // neutered no-op on workerd (posthog-node does not bundle/run here), so the
-    // UpgradeRequiredError simply propagates to handle() → 402 upgrade_required.
-    try {
-      await requirePlan(caller.orgId, 'pro');
-    } catch (e) {
-      if (e instanceof UpgradeRequiredError) {
-        // analytics deferred on workerd — no upgrade_viewed event emitted.
+    // Free tier may not create dynamic ACL rules — BUT only gate on a plan when billing
+    // is actually configured. With placeholder Stripe keys there is no way to buy a plan,
+    // so requiring one would lock everyone out; skip the gate until real pricing exists
+    // (mirrors auth.ts's stripeConfigured check).
+    const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
+    if (billingOn) {
+      try {
+        await requirePlan(caller.orgId, 'pro');
+      } catch (e) {
+        if (e instanceof UpgradeRequiredError) {
+          // analytics deferred on workerd — no upgrade_viewed event emitted.
+        }
+        throw e;
       }
-      throw e;
     }
 
     // Tenant-isolate the endpoint (and agent, if present).

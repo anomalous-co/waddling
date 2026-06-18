@@ -19,6 +19,16 @@ import { query, queryOne } from './db';
 import { getEndpointGatewayConfig } from './endpoint-secrets';
 import { getOrgCatalogDsn } from './catalog-provision';
 import type { GatewayBoot } from './gateway-client';
+import type { Env } from './env';
+import { getR2Faucet, orgBucketName } from './r2-faucet';
+
+/** A managed-postgres endpoint requires the managed R2 faucet for its lake data. */
+export class StorageNotReadyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StorageNotReadyError';
+  }
+}
 
 export class CatalogNotReadyError extends Error {
   constructor(message: string) {
@@ -54,7 +64,7 @@ export function endpointMetadataSchema(endpointId: string): string {
  * CatalogNotReadyError when the endpoint is configured for the managed catalog but the
  * org's catalog is still provisioning (the caller maps that to a retryable 503).
  */
-export async function resolveGatewayBoot(endpointId: string): Promise<ResolvedGatewayBoot> {
+export async function resolveGatewayBoot(env: Env, endpointId: string): Promise<ResolvedGatewayBoot> {
   const ep = await queryOne<EndpointCatalogRow>(
     `SELECT org_id, server_token, catalog_mode, catalog_schema
        FROM waddling.endpoint WHERE id = $1`,
@@ -84,7 +94,8 @@ export async function resolveGatewayBoot(endpointId: string): Promise<ResolvedGa
     s3,
   };
 
-  // (a) managed-postgres: shared per-org catalog + per-endpoint metadata schema.
+  // (a) managed-postgres: shared per-org catalog + per-endpoint metadata schema, with
+  // managed R2 storage minted by the faucet (per-org bucket, per-endpoint prefix scope).
   if (ep.catalog_mode === 'managed-postgres') {
     const dsn = await getOrgCatalogDsn(ep.org_id);
     if (!dsn) {
@@ -93,9 +104,43 @@ export async function resolveGatewayBoot(endpointId: string): Promise<ResolvedGa
       );
     }
     const schema = ep.catalog_schema ?? (await ensureEndpointSchema(endpointId));
+
+    // Managed lake data: provision the org's R2 bucket + mint SHORT-LIVED creds scoped to
+    // exactly this endpoint's prefix. The gateway never sees a broad account credential.
+    const faucet = getR2Faucet(env);
+    if (!faucet) {
+      throw new StorageNotReadyError('managed storage requires the R2 faucet (R2_FAUCET_TOKEN / R2_PARENT_ACCESS_KEY_ID)');
+    }
+    const slug = await orgSlugFor(ep.org_id);
+    const bucket = orgBucketName(slug);
+    await faucet.ensureBucket(bucket);
+    const prefix = `${endpointId}/`;
+    const creds = await faucet.mintScopedCreds(bucket, {
+      permission: 'object-read-write',
+      ttlSeconds: 604_800, // 7d (max) — covers a long-lived gateway between cold boots
+      prefixes: [prefix],
+    });
+    const s3host = env.R2_ENDPOINT.replace(/^https?:\/\//, '');
+
     return {
       lakeCatalog: LAKE_ALIAS,
-      gatewayBoot: { ...base, catalogDsn: dsn, metadataSchema: schema },
+      gatewayBoot: {
+        serverToken: ep.server_token,
+        dataPath: `s3://${bucket}/${prefix}`,
+        alias: LAKE_ALIAS,
+        encrypted: cfg.encrypted,
+        catalogDsn: dsn,
+        metadataSchema: schema,
+        s3: {
+          endpoint: s3host,
+          keyId: creds.accessKeyId,
+          secret: creds.secretAccessKey,
+          sessionToken: creds.sessionToken,
+          region: 'auto',
+          useSsl: true,
+          urlStyle: 'path', // R2 S3 endpoint, path-style (matches the dataplane presign)
+        },
+      },
     };
   }
 
@@ -121,6 +166,12 @@ export async function resolveGatewayBoot(endpointId: string): Promise<ResolvedGa
 
   // (d) nothing real configured — the offline demo.
   return { lakeCatalog: 'memory' };
+}
+
+/** The org's slug (for the deterministic bucket name). Falls back to the org id. */
+async function orgSlugFor(orgId: string): Promise<string> {
+  const row = await queryOne<{ slug: string }>(`SELECT slug FROM "organization" WHERE id = $1`, [orgId]);
+  return row?.slug ?? orgId;
 }
 
 /** Lazily assign + persist a deterministic metadata schema for an endpoint that has none. */

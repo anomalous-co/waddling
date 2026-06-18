@@ -41,6 +41,7 @@ export interface GatewayConfig {
     endpoint: string; // 'minio:9000' or 'r2-account.r2.cloudflarestorage.com'
     keyId: string;
     secret: string;
+    sessionToken: string; // STS-style session token (R2 faucet temp creds); '' for static creds
     region: string;
     useSsl: boolean; // false for MinIO; true for R2
     urlStyle: "path" | "vhost"; // MinIO needs path-style
@@ -96,6 +97,7 @@ export function loadGatewayConfig(): GatewayConfig {
       endpoint: localData ? opt("S3_ENDPOINT", "") : req("S3_ENDPOINT"),
       keyId: localData ? opt("S3_KEY_ID", "") : req("S3_KEY_ID"),
       secret: localData ? opt("S3_SECRET", "") : req("S3_SECRET"),
+      sessionToken: opt("S3_SESSION_TOKEN", ""),
       region: opt("S3_REGION", "auto"),
       useSsl: bool("S3_USE_SSL", false),
       urlStyle: (opt("S3_URL_STYLE", "path") as "path" | "vhost"),

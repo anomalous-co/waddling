@@ -25,6 +25,10 @@ export interface Env {
   // provisioning). The id half + org/cluster/region are non-secret vars below.
   // Unset ⇒ the managed-postgres catalog path is disabled (getPlanetScaleClient → null).
   PLANETSCALE_SERVICE_TOKEN?: string;
+  // R2 faucet (per-org lake bucket provisioning + scoped temp creds). The account-scoped
+  // R2 API token VALUE (Cloudflare API Bearer); its Access Key ID is the parent below.
+  // Unset ⇒ the R2 faucet is disabled (getR2Faucet → null).
+  R2_FAUCET_TOKEN?: string;
   // Optional dedicated key for endpoint-credential encryption. Falls back to
   // BETTER_AUTH_SECRET (mirrors the original getSecretEncryptionKey()).
   WADDLING_SECRET_KEY?: string;
@@ -64,6 +68,12 @@ export interface Env {
   PLANETSCALE_ORG?: string;
   PLANETSCALE_CLUSTER_SIZE?: string;
   PLANETSCALE_REGION?: string;
+
+  // ── R2 faucet (per-org lake bucket) — non-secret ─────────────────────────
+  // The parent R2 Access Key ID (the account-scoped token's S3 key id) to scope temp
+  // creds down from, and the CF account id. Optional: unset ⇒ R2 faucet disabled.
+  R2_PARENT_ACCESS_KEY_ID?: string;
+  CF_ACCOUNT_ID?: string;
 
   // ── R2 (Model B: presigned URLs, no native binding) ──────────────────────
   R2_ENDPOINT: string;

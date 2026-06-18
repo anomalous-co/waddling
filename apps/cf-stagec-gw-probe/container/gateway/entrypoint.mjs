@@ -27,7 +27,7 @@
 // for the snapshot push regardless.)
 
 import { createServer } from "node:http";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { DuckDBInstance } from "@duckdb/node-api";
@@ -91,6 +91,7 @@ async function main() {
       endpoint: process.env.S3_ENDPOINT ?? "",
       keyId: process.env.S3_KEY_ID ?? "",
       secret: process.env.S3_SECRET ?? "",
+      sessionToken: process.env.S3_SESSION_TOKEN ?? "",
       region: process.env.S3_REGION || "auto",
       useSsl: /^(1|true|yes|on)$/i.test(process.env.S3_USE_SSL ?? ""),
       urlStyle: process.env.S3_URL_STYLE === "vhost" ? "vhost" : "path",
@@ -244,6 +245,44 @@ async function main() {
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ birdshot: { ...fields, raw } }));
+      return;
+    }
+
+    // ── Data load (trusted connection): index HN stories into the real lake ─────
+    // Runs on rt.connection (which ATTACHed the lake with the S3 secret), so the parquet
+    // lands in the lake's DATA_PATH (R2). NOT an agent path — this is the trusted loader
+    // that seeds lake content; agents only READ it through the birdshot-gated quack path.
+    if (path === "/ctrl/load-hn" && method === "POST") {
+      const body = await readJson(req);
+      const days = Number(body.days ?? 30);
+      const limit = Math.min(Number(body.limit ?? 1000), 1000);
+      const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+      // HN Algolia /search ranks by popularity (points) — "top" stories. One page, ≤1000.
+      const url = `https://hn.algolia.com/api/v1/search?tags=story&numericFilters=created_at_i>${sinceTs}&hitsPerPage=${limit}`;
+      const hnRes = await fetch(url);
+      if (!hnRes.ok) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "hn_fetch_failed", status: hnRes.status }));
+        return;
+      }
+      const hn = await hnRes.json();
+      const hits = Array.isArray(hn.hits) ? hn.hits : [];
+      writeFileSync("/tmp/hn.json", JSON.stringify(hits));
+      const alias = config.lakeAlias;
+      // CREATE OR REPLACE in the lake's `main` schema → parquet written to DATA_PATH (R2).
+      await rt.run(
+        `CREATE OR REPLACE TABLE ${alias}.main.hn_posts AS
+           SELECT CAST(objectID AS BIGINT) AS id, title, url, author,
+                  CAST(points AS INTEGER) AS points, CAST(num_comments AS INTEGER) AS num_comments,
+                  to_timestamp(created_at_i) AS created_at
+             FROM read_json('/tmp/hn.json', maximum_object_size=104857600)
+            WHERE title IS NOT NULL`,
+      );
+      const countReader = await rt.connection.runAndReadAll(`SELECT count(*) AS n FROM ${alias}.main.hn_posts`);
+      const count = Number(countReader.getRowObjects()[0]?.n ?? 0);
+      log(`loaded ${count} HN posts into ${alias}.main.hn_posts (last ${days}d)`);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, count, fetched: hits.length, days }));
       return;
     }
 

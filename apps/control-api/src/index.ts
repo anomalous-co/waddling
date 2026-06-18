@@ -410,6 +410,14 @@ app.get("/probe/auth", async (c) => c.json(await probeAuth(c.env)));
 app.get("/probe/caller", async (c) => c.json(await probeCaller(c.env)));
 app.get("/probe/migrate", async (c) => c.json(await probeMigrate(c.env)));
 
+// Temporary diagnostic: does the dataplane's R2 cred reach a per-org bucket? Forwards to
+// the private dataplane /r2probe. Remove with the rest of /probe/* scaffolding.
+app.get("/probe/r2dp", async (c) => {
+  const bucket = new URL(c.req.url).searchParams.get("bucket") ?? "";
+  const res = await c.env.DATAPLANE.fetch(`https://dataplane/r2probe?bucket=${encodeURIComponent(bucket)}`);
+  return c.json((await res.json()) as Record<string, unknown>, res.status as 200);
+});
+
 // Temporary diagnostic: list a table's columns (default 'apikey') to ground-truth the
 // Better-Auth-owned schema (case/quoting). Remove with the rest of /probe/* scaffolding.
 app.get("/probe/cols", async (c) => {

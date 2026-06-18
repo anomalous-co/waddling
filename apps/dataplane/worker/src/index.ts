@@ -142,7 +142,7 @@ interface GatewayBoot {
   alias?: string;             // lake ATTACH alias (default 'lake')
   encrypted?: boolean;
   s3?: {
-    endpoint?: string; keyId?: string; secret?: string;
+    endpoint?: string; keyId?: string; secret?: string; sessionToken?: string;
     region?: string; useSsl?: boolean; urlStyle?: 'path' | 'vhost';
   };
 }
@@ -164,6 +164,7 @@ function bootEnvFromConfig(boot?: GatewayBoot): Record<string, string> | undefin
     set('S3_ENDPOINT', boot.s3.endpoint);
     set('S3_KEY_ID', boot.s3.keyId);
     set('S3_SECRET', boot.s3.secret);
+    set('S3_SESSION_TOKEN', boot.s3.sessionToken);
     set('S3_REGION', boot.s3.region);
     if (boot.s3.useSsl !== undefined) env.S3_USE_SSL = boot.s3.useSsl ? 'true' : 'false';
     set('S3_URL_STYLE', boot.s3.urlStyle);
@@ -386,6 +387,41 @@ async function route(request: Request, env: Env): Promise<Response> {
     try { shutdown = (await wsSidecar(ws, "/shutdown")).json; } catch { /* may already be gone */ }
     try { await ws.destroy(); } catch { /* free the container slot */ }
     return Response.json({ ok: true, shutdown });
+  }
+
+  if (path === "/r2probe") {
+    // Does the dataplane's R2 S3 cred reach an arbitrary (per-org) bucket, or only
+    // R2_BUCKET? Presigned PUT + GET a tiny object against ?bucket=. Determines whether
+    // per-org lake buckets work with the existing account creds.
+    const bucket = url.searchParams.get("bucket") ?? env.R2_BUCKET;
+    const key = "r2probe/ping.txt";
+    try {
+      const accessKeyId = await env.R2_ACCESS_KEY_ID.get();
+      const secretAccessKey = await env.R2_SECRET_ACCESS_KEY.get();
+      const client = new AwsClient({ accessKeyId, secretAccessKey, region: env.R2_REGION, service: "s3" });
+      const base = `${env.R2_ENDPOINT}/${bucket}/${key}`;
+      const put = await client.fetch(base, { method: "PUT", body: "pong" });
+      const get = await client.fetch(base, { method: "GET" });
+      const body = get.ok ? await get.text() : "";
+      return Response.json({ bucket, put: put.status, get: get.status, body, ok: put.ok && get.ok && body === "pong" });
+    } catch (e) {
+      return Response.json({ bucket, error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+    }
+  }
+
+  // Trusted data load: boot the per-endpoint gateway with its REAL lake config, then have
+  // it index HN stories into the lake (trusted connection → parquet to R2). Agents only
+  // READ the result through the birdshot-gated quack path.
+  if (path === "/lakeload" && request.method === "POST") {
+    const { endpointId, gatewayBoot, days, limit } = body;
+    if (!endpointId || !gatewayBoot) return Response.json({ error: "missing endpointId/gatewayBoot" }, { status: 400 });
+    const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
+    await ensureGateway(gw, bootEnvFromConfig(gatewayBoot as GatewayBoot));
+    const r = await gwFwd(gw, "/ctrl/load-hn", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ days, limit }),
+    });
+    return Response.json(r.json, { status: r.status });
   }
 
   if (path === "/gwprobe") return gwEgressProbe(env, url);

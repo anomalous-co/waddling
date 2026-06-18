@@ -62,7 +62,7 @@ export interface GatewayBoot {
   alias?: string;
   encrypted?: boolean;
   s3?: {
-    endpoint?: string; keyId?: string; secret?: string;
+    endpoint?: string; keyId?: string; secret?: string; sessionToken?: string;
     region?: string; useSsl?: boolean; urlStyle?: 'path' | 'vhost';
   };
 }

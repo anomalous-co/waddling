@@ -19,6 +19,8 @@ import type { StorageCreds, CatalogCreds } from '../lib/endpoint-secrets';
 import { getCrypto } from '../lib/secret-crypto';
 import { gatewayClientFor, GatewayError } from '../lib/gateway-client';
 import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
+import { provisionOrgCatalog } from '../lib/catalog-provision';
+import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import type { DescribeResult, TableInfo, EndpointStatus, EndpointSummary } from '../lib/types';
 
 // Endpoint status domain (canonical: lib/types EndpointSummary['status']). The full
@@ -60,9 +62,12 @@ const CreateSchema = z
     storage: StorageSchema.optional(),
     // Legacy flat field (admin MCP / seed.ts) — treated as a local data dir.
     dataPath: z.string().min(1).optional(),
+    // Fully-managed: per-org PlanetScale catalog + per-org R2 bucket (faucet). No BYO
+    // catalog/storage needed — waddling provisions both.
+    managed: z.boolean().default(false),
   })
-  .refine((d) => !!d.storage || !!d.dataPath, {
-    message: 'storage is required',
+  .refine((d) => !!d.storage || !!d.dataPath || d.managed, {
+    message: 'storage is required (or set managed:true)',
     path: ['storage'],
   });
 
@@ -124,9 +129,11 @@ endpoints.post('/', (c) =>
       return err(c, 'endpoint_quota_exceeded', 402, `Plan allows ${ent.endpoints} endpoint(s)`);
     }
 
-    // Normalise BYO storage vs. legacy flat dataPath into one descriptor.
+    // Normalise BYO storage vs. legacy flat dataPath into one descriptor. For a fully-
+    // managed endpoint there is no BYO storage: the data_path is a marker (the R2 faucet
+    // sets the real s3://<org-bucket>/<endpointId>/ path at gateway boot).
     const storage = input.storage ?? {
-      dataPath: input.dataPath!,
+      dataPath: input.managed ? 'managed-r2' : input.dataPath!,
       provider: 'config' as const,
       region: input.region,
       urlStyle: 'path' as const,
@@ -137,8 +144,26 @@ endpoints.post('/', (c) =>
       endpoint: undefined,
     };
     const storageRegion = storage.region ?? input.region;
-    // Managed catalog ⇒ local DuckLake file (production uses a postgres catalog).
-    const catalogMode = input.catalogDsn ? 'byo-postgres' : 'managed-local';
+    // managed ⇒ per-org PlanetScale catalog (resolved at boot); BYO dsn ⇒ byo-postgres;
+    // else the managed-local DuckLake file.
+    const catalogMode = input.managed
+      ? 'managed-postgres'
+      : input.catalogDsn
+        ? 'byo-postgres'
+        : 'managed-local';
+
+    // A managed endpoint needs the org's PlanetScale catalog — kick off provisioning
+    // (idempotent; connect returns 503 catalog_provisioning until it is ready).
+    if (input.managed) {
+      const slugRow = await queryOne<{ slug: string }>(`SELECT slug FROM "organization" WHERE id = $1`, [caller.orgId]);
+      const slug = slugRow?.slug ?? caller.orgId;
+      try {
+        await provisionOrgCatalog(c.env, caller.orgId, slug);
+      } catch {
+        // best-effort: an already-provisioned catalog (or transient API hiccup) is fine;
+        // connect re-checks readiness via getOrgCatalogDsn.
+      }
+    }
 
     const serverToken = `srv_${crypto.randomUUID().replace(/-/g, '')}`;
     try {
@@ -509,6 +534,48 @@ endpoints.post('/:id/provision', (c) =>
           : null,
       },
     });
+  }),
+);
+
+/**
+ * POST /:id/seed-hn — trusted data load: index the top HN stories from the last `days`
+ * into the endpoint's real lake. Resolves the boot config (faucet creds + catalog) and
+ * hands it to the data plane, which boots the gateway and runs the loader on its trusted
+ * connection (parquet → R2). Agents only READ the result via the birdshot-gated path.
+ */
+endpoints.post('/:id/seed-hn', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const id = c.req.param('id');
+    const ep = await queryOne<{ org_id: string }>(
+      `SELECT org_id FROM waddling.endpoint WHERE id = $1`,
+      [id],
+    );
+    if (!ep || ep.org_id !== caller.orgId) return err(c, 'endpoint_not_found', 404);
+    const body = (await c.req.json().catch(() => ({}))) as { days?: number; limit?: number };
+
+    let boot;
+    try {
+      boot = await resolveGatewayBoot(c.env, id);
+    } catch (e) {
+      if (e instanceof CatalogNotReadyError) return err(c, 'catalog_provisioning', 503, e.message);
+      if (e instanceof StorageNotReadyError) return err(c, 'storage_unavailable', 503, e.message);
+      throw e;
+    }
+    if (!boot.gatewayBoot) return err(c, 'no_real_lake', 409, 'endpoint has no managed/real lake to load into');
+
+    const res = await c.env.DATAPLANE.fetch('https://dataplane/lakeload', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        endpointId: id,
+        gatewayBoot: boot.gatewayBoot,
+        days: body.days ?? 30,
+        limit: body.limit ?? 1000,
+      }),
+    });
+    const json = (await res.json().catch(() => ({ error: 'non-json data-plane response' }))) as Record<string, unknown>;
+    return c.json(json, res.status as 200);
   }),
 );
 

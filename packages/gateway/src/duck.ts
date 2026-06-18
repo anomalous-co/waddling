@@ -109,6 +109,11 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   // MinIO: USE_SSL false + URL_STYLE path; R2: USE_SSL true + vhost.
   // Skipped entirely in local-data mode (DATA_PATH is a local dir, no object store).
   if (!config.localData) {
+    // SESSION_TOKEN present ⇒ STS-style temp creds (the R2 faucet's scoped, short-lived
+    // key). DuckDB's httpfs S3 secret carries it alongside KEY_ID/SECRET.
+    const sessionTokenLine = config.s3.sessionToken
+      ? `,\n        SESSION_TOKEN ${q(config.s3.sessionToken)}`
+      : "";
     await connection.run(`
       CREATE OR REPLACE SECRET lake_s3 (
         TYPE s3,
@@ -118,7 +123,7 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
         ENDPOINT ${q(config.s3.endpoint)},
         REGION ${q(config.s3.region)},
         USE_SSL ${config.s3.useSsl ? "true" : "false"},
-        URL_STYLE ${q(config.s3.urlStyle)}
+        URL_STYLE ${q(config.s3.urlStyle)}${sessionTokenLine}
       )
     `);
   }
