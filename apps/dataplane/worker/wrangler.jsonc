@@ -18,6 +18,13 @@
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
 
+  // PRIVATE: no public *.workers.dev route. The data plane is reachable ONLY via the
+  // service binding (control-api + mcp-external → env.DATAPLANE.fetch) and the internal
+  // DO/container fabric — never the public internet. This is the security posture: the
+  // workspace + gateway DOs are private, and the one egress (quack:443) is intercepted.
+  // (/selftest is consequently only reachable once a bound worker proxies to it.)
+  "workers_dev": false,
+
   // Two container classes, reusing the proven images by Dockerfile path (gateway =
   // DuckDB+quack+birdshot; workspace = DuckDB, NO birdshot).
   "containers": [
