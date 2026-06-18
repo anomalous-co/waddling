@@ -281,10 +281,26 @@ async function route(request: Request, env: Env): Promise<Response> {
     return Response.json(r.json, { status: r.status });
   }
   if (path === "/gw/revoke" && request.method === "POST") {
-    // jti denylist on the gateway. The gw-probe forwarder has no /ctrl/revoke yet;
-    // forward-only revocation is a Stage D deliverable. Stubbed so the control-plane
-    // supersede/kill path does not 500 — the session is already marked in Postgres.
-    return Response.json({ ok: true, note: "gateway revocation deferred to Stage D (session marked in control plane)" });
+    // Forward-only jti/user/session denylist on the PER-ENDPOINT gateway. The denylist
+    // is in-memory on the gateway's trusted control connection, so we forward to the
+    // live container. A COLD gateway has no live sessions (and an empty denylist on its
+    // next boot), so a forward failure = nothing to revoke → no-op ok. We do NOT boot a
+    // cold gateway just to revoke.
+    const { endpointId, kind, id, reason, expiresUs } = body;
+    if (!endpointId || !kind || !id) {
+      return Response.json({ error: "missing endpointId/kind/id" }, { status: 400 });
+    }
+    const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
+    try {
+      const r = await gwFwd(gw, "/ctrl/revoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind, id, reason, expiresUs }),
+      });
+      return Response.json(r.json, { status: r.status });
+    } catch {
+      return Response.json({ ok: true, note: "gateway cold — no live session to revoke" });
+    }
   }
 
   // ── workspace lifecycle (control-api configure; mcp-external query/run) ─────────
@@ -319,12 +335,87 @@ async function route(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true, shutdown });
   }
 
+  if (path === "/gwprobe") return gwEgressProbe(env, url);
+
   if (path === "/selftest") return selftest(env, url);
 
   return new Response(
-    "waddling data plane. Service-binding routes: POST /configure /query /run /snapshot /end, POST /gw/snapshot, GET /gw/status, POST /gw/revoke. GET /selftest?step=1|2 to self-verify.\n",
+    "waddling data plane. Service-binding routes: POST /configure /query /run /snapshot /end, POST /gw/snapshot, GET /gw/status, POST /gw/revoke. GET /selftest?step=1|2 to self-verify. GET /gwprobe?pgHost=<host>&pgPort=5432 = Stage-D egress gate.\n",
     { status: 200 },
   );
+}
+
+// ── Stage D EGRESS GATE PROBE ───────────────────────────────────────────────────
+// THE gate for the real per-endpoint DuckLake story. The gateway's birdshot-gated
+// (trusted) connection ATTACHes `ducklake:postgres:<dsn>` (raw Postgres wire on :5432)
+// + reads `s3://…` data over httpfs (:443). CF container egress historically passes
+// only HTTP 80/443+DNS (the finding that forced quack onto :443) — so whether a raw
+// 5432 connection LEAVES a GatewayDO container is unproven and gates the whole design.
+// This probes it empirically from a real GatewayDO container (deploy-only):
+//   1. raw TCP connect to <pgHost>:<pgPort> — does 5432 leave the container?
+//   2. fetch the R2 endpoint over 443 — the s3:// data-path leg.
+// Pass ?pgHost=<your real Postgres catalog host>&pgPort=5432. A CONNECTED (or even
+// ECONNREFUSED — reached the host, no listener) means egress works; a TIMEOUT/
+// unreachable means 5432 is BLOCKED and ducklake:postgres is not viable as-is.
+async function gwEgressProbe(env: Env, url: URL): Promise<Response> {
+  const pgHost = url.searchParams.get("pgHost");
+  const pgPort = Number(url.searchParams.get("pgPort") ?? "5432");
+  if (!pgHost) {
+    return Response.json(
+      { error: "pass ?pgHost=<postgres catalog host> (&pgPort=5432) — the Stage-D egress gate" },
+      { status: 400 },
+    );
+  }
+  const gw = getSandbox(env.GATEWAY, gatewayDoId("egress-probe")) as unknown as GatewayHandle & {
+    destroy(): Promise<void>;
+  };
+  try {
+    await withBootRetry(() => gw.exec("echo ready"), "gw egress-probe warmup");
+
+    // 1) raw TCP to host:5432 — base64-piped to dodge shell-quoting of the inline JS.
+    const dialScript =
+      `const net=require('net');` +
+      `const s=net.connect({host:${JSON.stringify(pgHost)},port:${pgPort}},()=>{console.log('CONNECTED');s.destroy();process.exit(0)});` +
+      `s.setTimeout(8000,()=>{console.log('TIMEOUT');try{s.destroy()}catch(e){}process.exit(0)});` +
+      `s.on('error',e=>{console.log('ERROR:'+(e.code||e.message));process.exit(0)});`;
+    const dialB64 = btoa(dialScript); // ASCII script → btoa is safe (no @types/node needed)
+    const dial = await gw.exec(`echo ${dialB64} | base64 -d | node`);
+    const pgRaw = dial.stdout.trim();
+
+    // 2) R2 over 443 — the s3:// DATA_PATH leg (httpfs). Only proven localData so far.
+    const r2Script =
+      `fetch(${JSON.stringify(env.R2_ENDPOINT)}).then(r=>{console.log('R2:'+r.status)}).catch(e=>{console.log('R2ERR:'+(e.code||e.message))});`;
+    const r2B64 = btoa(r2Script);
+    const r2 = await gw.exec(`echo ${r2B64} | base64 -d | node`);
+    const r2Raw = r2.stdout.trim();
+
+    const pgConnected = /^CONNECTED/.test(pgRaw);
+    const pgEgressLeaves = pgConnected || /^ERROR:ECONNREFUSED/.test(pgRaw);
+    const r2Ok = /^R2:\d/.test(r2Raw);
+    return Response.json({
+      gate: "stage-d-egress",
+      pgHost,
+      pgPort,
+      pg: {
+        raw: pgRaw,
+        egressLeavesContainer: pgEgressLeaves,
+        verdict: pgConnected
+          ? "5432 egress WORKS — ducklake:postgres catalog is viable from the container"
+          : /^ERROR:ECONNREFUSED/.test(pgRaw)
+            ? "reached the host but no listener (egress works; check host:port)"
+            : "5432 BLOCKED (timeout/unreachable) — ducklake:postgres NOT viable as-is; needs a 443 catalog path or a managed file-catalog-on-R2 design",
+      },
+      r2: { raw: r2Raw, reachableOver443: r2Ok },
+      pass: pgEgressLeaves && r2Ok,
+    });
+  } finally {
+    // Free the container slot (probe DOs never idle-expire — see destroy() lesson).
+    try {
+      await gw.destroy();
+    } catch {
+      /* may already be gone */
+    }
+  }
 }
 
 // ── selftest: production-shaped, self-minting (proves the data-plane mechanics green

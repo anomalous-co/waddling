@@ -34,6 +34,7 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import {
   bootDuckRuntime,
   applySnapshot,
+  birdshotRevoke,
   birdshotStatus,
   normalize,
 } from "./gateway-src/duck.ts";
@@ -178,6 +179,25 @@ async function main() {
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, grants: body.snapshot.roleGrants.length }));
+      return;
+    }
+
+    // birdshot_revoke → in-memory, forward-only denylist (kind ∈ user|jti|session).
+    // The next query for that subject is denied. Runs on the trusted control
+    // connection. expiresUs (µs-from-now) optional; 0/undefined ⇒ forever. The
+    // denylist is in-memory, so a cold gateway has nothing to revoke (the dataplane
+    // side no-ops in that case).
+    if (path === "/ctrl/revoke" && method === "POST") {
+      const body = await readJson(req);
+      const { kind, id, reason, expiresUs } = body;
+      if (!kind || !id) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing kind/id" }));
+        return;
+      }
+      await birdshotRevoke(rt, kind, id, reason ?? "", expiresUs);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, kind, id }));
       return;
     }
 
