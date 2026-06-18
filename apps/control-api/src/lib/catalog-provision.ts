@@ -189,5 +189,13 @@ export async function getOrgCatalogDsn(orgId: string): Promise<string | null> {
   );
   if (!row || !row.dsn_iv || !row.dsn_auth_tag || !row.dsn_ciphertext) return null;
   const sealed: SealedSecret = { iv: row.dsn_iv, authTag: row.dsn_auth_tag, ciphertext: row.dsn_ciphertext };
-  return getCrypto().openJson<{ dsn: string }>(sealed).dsn;
+  const dsn = getCrypto().openJson<{ dsn: string }>(sealed).dsn;
+  // Heal DSNs sealed before sslrootcert=system was added (see buildCatalogDsn): a
+  // verify-full DSN without an explicit root cert fails the ducklake:postgres ATTACH in
+  // the gateway container (no cert file at the libpq default path). Append it at read time
+  // so already-provisioned catalogs work without re-minting.
+  if (/sslmode=verify-full/.test(dsn) && !/sslrootcert=/.test(dsn)) {
+    return `${dsn} sslrootcert=system`;
+  }
+  return dsn;
 }

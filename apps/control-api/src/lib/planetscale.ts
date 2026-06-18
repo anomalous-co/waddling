@@ -165,6 +165,11 @@ export function buildCatalogDsn(p: { hostname: string; username: string; passwor
     `user=${p.username}`,
     `password=${p.password}`,
     `sslmode=verify-full`,
+    // PlanetScale's cert chains to a public CA. The gateway container has no libpq cert
+    // file at the default /root/.postgresql/root.crt, so point verification at the system
+    // trust store (libpq 16+ / DuckDB postgres extension support `sslrootcert=system`).
+    // Without this the ducklake:postgres ATTACH fails: "root certificate file … does not exist".
+    `sslrootcert=system`,
   ].join(' ');
 }
 
