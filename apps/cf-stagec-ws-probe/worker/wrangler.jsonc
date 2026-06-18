@@ -17,14 +17,17 @@
 
   // The workspace sidecar runs in a Cloudflare Container driven by the
   // WorkspaceSandbox DO (Sandbox ⊂ Container ⊂ DO). standard-1: a single DuckDB
-  // process + a small encrypted file. max_instances 3 — the probe brings up 3 distinct
-  // sandbox ids (session 1, session 2 cold-restore, wrong-key) concurrently.
+  // process + a small encrypted file. The probe runs as 3 SEPARATE requests (/s1,/s2,
+  // /s3) that each destroy() their container before returning, so steady-state is ~1
+  // live instance; max_instances 4 is headroom for a straggler that hasn't finished
+  // idle-expiring when the next step starts (the destroy() reclaim is what actually
+  // keeps the cap from starving back-to-back runs — /shutdown alone does not).
   "containers": [
     {
       "class_name": "WorkspaceSandbox",
       "image": "../container/Dockerfile",
       "instance_type": "standard-1",
-      "max_instances": 3
+      "max_instances": 4
     }
   ],
 
