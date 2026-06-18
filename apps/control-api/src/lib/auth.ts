@@ -42,6 +42,10 @@ function construct(env: Env) {
   const stripeClientInstance = new Stripe(env.STRIPE_SECRET_KEY, {
     httpClient: Stripe.createFetchHttpClient(),
   });
+  // Real Stripe config vs the Stage-B placeholders (all contain "placeholder"). Gates
+  // the plugin's external-call side-effects so they never hang auth/org flows when
+  // billing isn't set up yet. Flips to true automatically when real keys are deployed.
+  const stripeConfigured = !!env.STRIPE_SECRET_KEY && !/placeholder/i.test(env.STRIPE_SECRET_KEY);
 
   return betterAuth({
     baseURL: env.BETTER_AUTH_URL,
@@ -119,11 +123,21 @@ function construct(env: Env) {
       stripe({
         stripeClient: stripeClientInstance,
         stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET,
-        createCustomerOnSignup: true,
+        // Stripe's customer/subscription side-effects make external Stripe API calls
+        // during auth + org-create flows. With PLACEHOLDER keys those calls don't
+        // return cleanly and hang the request (the org-create timeout we hit). Better
+        // Auth treats these as OPT-IN, so gate them on real Stripe config: when keys
+        // are placeholders, construct the plugin (so the billing surface still exists)
+        // but disable the side-effecting hooks. Flips on automatically once real keys
+        // are set. Both casings are set because the option was renamed across versions
+        // (createCustomerOnSignUp in current @better-auth/stripe) — the inactive one is
+        // ignored, and either way it is false while unconfigured.
+        createCustomerOnSignup: stripeConfigured,
+        createCustomerOnSignUp: stripeConfigured,
         subscription: {
-          enabled: true,
+          enabled: stripeConfigured,
           // Subscriptions bound to organization — referenceId = org id.
-          plans: stripePlans(env),
+          plans: stripeConfigured ? stripePlans(env) : [],
         },
       }),
     ],
