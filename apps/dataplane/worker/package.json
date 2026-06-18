@@ -1,0 +1,10 @@
+{
+  "name": "waddling-dataplane",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "waddling data plane: one worker hosting the WorkspaceSandbox DO (per-(workspace,agent) durable encrypted DuckDB) + the GatewayDO (birdshot-gated quack), exposed to control-api + mcp-external via a service binding. Productionizes the proven cf-stagec-loop-probe topology in place.",
+  "scripts": { "deploy": "wrangler deploy", "dev": "wrangler dev" },
+  "dependencies": { "@cloudflare/sandbox": "0.12.1", "aws4fetch": "^1", "jose": "^6" },
+  "devDependencies": { "wrangler": "^4", "@cloudflare/workers-types": "^4" }
+}

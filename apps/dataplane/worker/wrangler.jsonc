@@ -1,0 +1,76 @@
+{
+  // waddling DATA PLANE — one worker, two private Container DOs, exposed to control-api
+  // + mcp-external over a SERVICE BINDING (env.DATAPLANE.fetch). This productionizes the
+  // proven cf-stagec-loop-probe topology IN PLACE (same-worker GATEWAY binding — the
+  // outbound handler reaching a cross-worker DO is unproven, so we keep both DOs here):
+  //   • WorkspaceSandbox — per-(workspace,agent) durable encrypted DuckDB workspace
+  //     (Model B: DO mints presigned R2 URLs from Secrets-Store creds, sidecar does its
+  //     own file I/O); its outbound handler routes the one quack:443 egress to the
+  //     PER-ENDPOINT GatewayDO via the same-worker GATEWAY binding.
+  //   • GatewayDO — the real packages/gateway (quack_serve + birdshot), keyed per
+  //     endpoint, serving birdshot-gated quack in production RS256 mode.
+  // Deploy-only (native DuckDB/quack/birdshot + CF egress interception live only in the
+  // CF runtime).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "waddling-dataplane",
+  "main": "src/index.ts",
+
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Two container classes, reusing the proven images by Dockerfile path (gateway =
+  // DuckDB+quack+birdshot; workspace = DuckDB, NO birdshot).
+  "containers": [
+    {
+      "class_name": "GatewayDO",
+      "image": "../../cf-stagec-gw-probe/container/Dockerfile",
+      "instance_type": "standard-2",
+      "max_instances": 5
+    },
+    {
+      "class_name": "WorkspaceSandbox",
+      "image": "../../cf-stagec-ws-probe/container/Dockerfile",
+      "instance_type": "standard-1",
+      "max_instances": 10
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "GatewayDO", "name": "GATEWAY" },
+      { "class_name": "WorkspaceSandbox", "name": "WORKSPACE" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["GatewayDO", "WorkspaceSandbox"] }
+  ],
+
+  // REAL R2 S3-API creds (Secrets Store), read by the WorkspaceSandbox DO to MINT
+  // short-lived single-object presigned URLs. They NEVER enter the container — the DO
+  // signs, the sidecar fetches (Model B). Same store as the ws-probe.
+  "secrets_store_secrets": [
+    { "binding": "R2_ACCESS_KEY_ID", "store_id": "121d675c4103466f90c6e1a97e1fd494", "secret_name": "r2-access-key-id" },
+    { "binding": "R2_SECRET_ACCESS_KEY", "store_id": "121d675c4103466f90c6e1a97e1fd494", "secret_name": "r2-secret-access-key" }
+  ],
+
+  // R2 S3-API connection details (non-secret) + posture. R2_HOST is the egress-allowlist
+  // entry the DO adds (alongside the per-endpoint gateway host) so the sidecar can reach
+  // R2 to restore/persist its own encrypted .duckdb. Interim: ONE bucket with per-
+  // (workspaceId,agentId) key prefixes (per-team bucket provisioning is a separate infra
+  // follow-up — does not block Stage C).
+  "vars": {
+    "WADDLING_ENV": "production",
+    "R2_ENDPOINT": "https://866403f7ed22a791871b45539ac6fbd7.r2.cloudflarestorage.com",
+    "R2_BUCKET": "waddling-ws-probe",
+    "R2_REGION": "auto",
+    "R2_HOST": "866403f7ed22a791871b45539ac6fbd7.r2.cloudflarestorage.com"
+  },
+
+  "observability": {
+    "enabled": false,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "head_sampling_rate": 1, "persist": true, "invocation_logs": true },
+    "traces": { "enabled": true, "persist": true, "head_sampling_rate": 1 }
+  }
+}
