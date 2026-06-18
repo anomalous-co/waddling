@@ -1,46 +1,57 @@
 /**
- * Control-plane Postgres pool (ported from apps/waddling/src/lib/db.ts).
+ * Control-plane Postgres access (ported from apps/waddling/src/lib/db.ts).
  *
- * Single shared `pg.Pool` for the waddling + auth schemas. Better Auth uses its
- * own Pool (see auth.ts) against the same database; this pool is for our custom
- * `waddling.*` tables and for reading the Better-Auth-owned `jwks`/`subscription`
- * rows directly.
+ * PER-REQUEST pool, NOT a module-cached one. Hyperdrive already pools/multiplexes
+ * connections server-side, so the Worker's job is just to open a cheap connection for the
+ * request and close it — caching a pg.Pool across requests both defeats Hyperdrive and is
+ * unsafe on workerd: a connection opened in request A's I/O context hangs when reused by
+ * request B, and the runtime cancels the hung request as an opaque 1101. (This was the
+ * intermittent ~40% failure on every /api/cp/* route.)
  *
- * Workers difference vs the original: on workerd there is NO `process.env` and no
- * module-load-time env, so the pool cannot read a connection string at import.
- * Instead the connection string arrives per-request from the Hyperdrive binding
- * (`env.HYPERDRIVE.connectionString`). A Hono middleware calls `initDbPool(...)`
- * once before any handler; `query`/`queryOne`/`withTransaction` then read the
- * already-initialized module-level pool. Their signatures are unchanged from the
- * original so existing importers port over verbatim.
- *
- * `max:5` (vs the original's 10): Hyperdrive sits between the Worker and Postgres
- * and pools server-side, and Better Auth opens a second Pool of its own against
- * the same binding — keeping each isolate's two pools at 5 leaves headroom.
+ * The connection string arrives per-request from the Hyperdrive binding. A Hono middleware
+ * wraps each request in runInDbScope; query/queryOne/withTransaction read the request's own
+ * pool from AsyncLocalStorage, so their signatures are unchanged for existing importers.
  */
 import { Pool, type QueryResult, type QueryResultRow } from 'pg';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
-let _pool: Pool | undefined;
+interface DbSlot {
+  connectionString: string;
+  pool?: Pool;
+}
+const dbScope = new AsyncLocalStorage<DbSlot>();
 
 /**
- * Idempotent per-isolate pool initializer. The first call wins; subsequent calls
- * (every request after the isolate warms) are no-ops. The connection string comes
- * from the Hyperdrive binding — there is no ambient env to fall back on here.
+ * Run `next` inside a per-request DB scope. The pool is created lazily (only if the request
+ * actually runs a query) and closed after the response via waitUntil. Wrap every request.
  */
-export function initDbPool(connectionString: string): Pool {
-  if (!_pool) {
-    _pool = new Pool({ connectionString, max: 5 });
+export async function runInDbScope(
+  executionCtx: { waitUntil(p: Promise<unknown>): void } | undefined,
+  connectionString: string,
+  next: () => Promise<void>,
+): Promise<void> {
+  const slot: DbSlot = { connectionString };
+  await dbScope.run(slot, next);
+  if (slot.pool) {
+    const closing = slot.pool.end().catch(() => {});
+    if (executionCtx) executionCtx.waitUntil(closing);
+    else await closing;
   }
-  return _pool;
 }
 
 function getPool(): Pool {
-  if (!_pool) {
+  const slot = dbScope.getStore();
+  if (!slot) {
     throw new Error(
-      'db pool not initialized — initDbPool(env.HYPERDRIVE.connectionString) must run before queries',
+      'db scope not active — runInDbScope(env.HYPERDRIVE.connectionString) must wrap the request',
     );
   }
-  return _pool;
+  if (!slot.pool) {
+    // Fresh per-request pool. Hyperdrive multiplexes server-side, so a small client cap is
+    // plenty; the connection opens lazily on first query and closes after the request.
+    slot.pool = new Pool({ connectionString: slot.connectionString, max: 5 });
+  }
+  return slot.pool;
 }
 
 /** Typed query helper. Use parameterized `$1,$2,…` — never string-concat SQL. */

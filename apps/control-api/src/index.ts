@@ -14,7 +14,7 @@ import { Hono } from "hono";
 import { AwsClient } from "aws4fetch";
 import { Pool } from "pg";
 import type { Env } from "./lib/env";
-import { initDbPool, query } from "./lib/db";
+import { runInDbScope, query } from "./lib/db";
 import { buildAuth, runMigrations, runInAuthScope } from "./lib/auth";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
 import { initDataplane } from "./lib/gateway-client";
@@ -45,15 +45,14 @@ function errMessage(e: unknown): string {
 // isolate does work. The crypto secret uses WADDLING_SECRET_KEY with a
 // BETTER_AUTH_SECRET fallback (mirrors the original getSecretEncryptionKey()).
 app.use("*", async (c, next) => {
-  initDbPool(c.env.HYPERDRIVE.connectionString);
   initCrypto(c.env.WADDLING_SECRET_KEY ?? c.env.BETTER_AUTH_SECRET);
   initDataplane(c.env.DATAPLANE);
-  // Establish a per-request Better Auth scope (see auth.ts): every buildAuth(c.env)
-  // this request shares ONE instance + pool, closed after the response. A Better Auth
-  // instance cached across requests hangs on workerd → 1101.
+  // Per-request DB + Better Auth scopes: each request opens its OWN pool(s), closed after
+  // the response. Hyperdrive pools server-side, so caching a pool across requests is both
+  // redundant and unsafe on workerd (a connection bound to a prior request hangs → 1101).
   let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
   try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
-  await runInAuthScope(exCtx, next);
+  await runInDbScope(exCtx, c.env.HYPERDRIVE.connectionString, () => runInAuthScope(exCtx, next));
 });
 
 // ─── Better Auth ──────────────────────────────────────────────────────────────

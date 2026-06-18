@@ -111,8 +111,14 @@ function construct(env: Env, pool: Pool) {
       apiKey({
         defaultPrefix: 'sk_agent_',
         enableMetadata: true,
+        // Rate limiting DISABLED: on workerd the per-verify rate-limit counter UPDATEs
+        // (consumeRemaining/consumeRateLimit on the apikey row) hang the request → the
+        // runtime cancels it as "hung" (1101). Every agent query authenticates via an
+        // sk_agent_ key, so this blocked the whole data path. Re-enable once the
+        // rate-limit write path is proven non-hanging on Hyperdrive (or move rate
+        // limiting to a gateway/edge layer).
         rateLimit: {
-          enabled: true,
+          enabled: false,
           maxRequests: 10000,
           timeWindow: 1000 * 60 * 60,
         },
