@@ -46,5 +46,23 @@
   // real gating proof. The verdict additionally asserts birdshot_status().mode === rs256.
   "vars": {
     "WADDLING_ENV": "production"
+  },
+
+  // Persist logs + invocation logs so the deployed gateway's runtime output (boot,
+  // birdshot gating) is queryable from the dashboard / `wrangler tail`.
+  "observability": {
+    "enabled": false,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "persist": true,
+      "head_sampling_rate": 1
+    }
   }
 }
