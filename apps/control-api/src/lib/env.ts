@@ -57,10 +57,19 @@ export interface Env {
   R2_BUCKET: string;
   R2_REGION: string;
 
-  // ── Gateway control channel (lib/gateway-client) ─────────────────────────
-  // Base URL of the EXISTING Rivet/GCP DuckDB gateway's control port. The control
-  // plane tunnels every endpoint's snapshot/revoke/describe/status call here until
-  // Stage D repoints to the gateway Durable Object. Non-secret (the per-endpoint
-  // server_token authorizes the call).
-  GATEWAY_INTERNAL_URL: string;
+  // ── Data plane (service binding) ─────────────────────────────────────────
+  // The waddling-dataplane Worker (apps/dataplane): one private worker hosting the
+  // GatewayDO + WorkspaceSandbox Container DOs. It is service-binding-only (no
+  // public route), so the control plane reaches it ONLY through this Fetcher:
+  //   • gateway control channel — POST /gw/snapshot, GET /gw/status, POST /gw/revoke
+  //     (lib/gateway-client transports through here);
+  //   • workspace lifecycle — POST /configure (connect) + POST /query (the revived
+  //     /:id/query forwarder). Agent SQL still reaches the lake only via the
+  //     workspace sidecar's birdshot-gated quack ATTACH — never a trusted conn.
+  DATAPLANE: Fetcher;
+
+  // Legacy: base URL of the EXISTING Rivet/GCP DuckDB gateway's control port. The
+  // gateway now lives in the DATAPLANE worker's GatewayDO, so gateway-client no
+  // longer reads this. Kept OPTIONAL so an old wrangler var doesn't break typing.
+  GATEWAY_INTERNAL_URL?: string;
 }

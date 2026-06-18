@@ -24,6 +24,14 @@
     { "binding": "HYPERDRIVE", "id": "cbd2434e2b3043fa914156943178a856" }
   ],
 
+  // Data plane (apps/dataplane), reached ONLY over this service binding — it is
+  // private (workers_dev:false). gateway-client transports /gw/* here; sessions
+  // connect/query call /configure + /query. Agent SQL still flows through the
+  // workspace sidecar's birdshot-gated quack ATTACH (the single chokepoint).
+  "services": [
+    { "binding": "DATAPLANE", "service": "waddling-dataplane" }
+  ],
+
   // Secrets Store bindings. MASTER_KEY is a Stage-A PLACEHOLDER; Stage B replaces
   // it with the real BETTER_AUTH_SECRET. The R2 creds are PLACEHOLDERs until a
   // real R2 S3 API token is minted and pushed via `wrangler secrets-store secret update`.
@@ -65,12 +73,8 @@
     "STRIPE_PRICE_PRO": "price_placeholder_pro",
     "STRIPE_PRICE_ENTERPRISE": "price_placeholder_ent",
 
-    // Gateway control-channel base URL (lib/gateway-client). PLACEHOLDER pointing
-    // at the local demo gateway (http://localhost:9510, from apps/waddling/.env.local) —
-    // this LOCAL value will NOT resolve from deployed workerd. Repoint to the
-    // reachable Rivet/GCP gateway control port before the gateway routes go live;
-    // Stage D replaces it with the gateway Durable Object.
-    "GATEWAY_INTERNAL_URL": "http://localhost:9510",
+    // (GATEWAY_INTERNAL_URL removed: the gateway now lives in the waddling-dataplane
+    // worker's GatewayDO, reached over the DATAPLANE service binding — see services.)
 
     // Deployment posture. MUST be "production": the endpoints/:id/provision dev
     // stand-in is gated on this and fails OPEN (route enabled) when unset, which

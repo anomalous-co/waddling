@@ -65,17 +65,21 @@ async function loadJwk(): Promise<BirdshotJwk | null> {
 }
 
 /**
- * Recompile the endpoint's policy and push it. When `agentId` is given, only that
- * agent's rules are recompiled (plus org-wide rules); otherwise all rules for the
- * endpoint are recompiled in one snapshot.
+ * Recompile the endpoint's FULL policy (every agent) and push it.
+ *
+ * The push is ALWAYS the whole endpoint — never a single agent's slice. The GatewayDO
+ * is shared per endpoint (`gw:<endpointId>`) and applySnapshot does a full
+ * birdshot_reset_config → re-add → commit, so pushing one agent's compiled snapshot
+ * would WIPE every other agent's grants on the shared gateway. `agentId` is accepted
+ * (call-site compatibility / audit) but does NOT narrow the push.
  *
  * Best-effort push: if the gateway is unreachable the rule is still persisted; the
- * next connect/recompile re-pushes. Returns the compile result for the caller.
+ * next connect/recompile re-pushes. Returns the (full) compile result for the caller.
  */
 async function recompileAndPush(
   c: { env: Env },
   endpointId: string,
-  agentId?: string,
+  _agentId?: string,
 ): Promise<CompileResult> {
   const endpoint = await queryOne<RecompileEndpointRow>(
     `SELECT id, org_id, status, gateway_host, quack_port, server_token
@@ -84,10 +88,8 @@ async function recompileAndPush(
   );
 
   const rows = await query<AclRuleRow>(
-    agentId
-      ? `SELECT * FROM waddling.acl_rule WHERE endpoint_id = $1 AND (agent_id = $2 OR agent_id IS NULL)`
-      : `SELECT * FROM waddling.acl_rule WHERE endpoint_id = $1`,
-    agentId ? [endpointId, agentId] : [endpointId],
+    `SELECT * FROM waddling.acl_rule WHERE endpoint_id = $1`,
+    [endpointId],
   );
 
   const compiled = compilePolicy(rows.rows, new Date());
@@ -106,10 +108,10 @@ async function recompileAndPush(
       snapshot: compiled.snapshot,
     };
     try {
-      // e2e-gated on Stage D gateway reachability — GATEWAY_INTERNAL_URL is a
-      // localhost placeholder unreachable from workerd until the gateway lands on
-      // a CF Container/Durable Object. Best-effort: column + window ACLs ride inside
-      // the snapshot (`roleConstraints`); there is no separate constraint push.
+      // Best-effort: pushes over the DATAPLANE binding to the per-endpoint GatewayDO.
+      // Column + window ACLs ride inside the snapshot (`roleConstraints`); there is no
+      // separate constraint push. A failure leaves the rule persisted for the next
+      // connect/recompile to re-push.
       await gw.pushSnapshot(snapshotReq);
     } catch {
       // gateway down — persisted rule re-pushes on next connect/recompile

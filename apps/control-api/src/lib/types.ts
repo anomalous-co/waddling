@@ -20,11 +20,16 @@ export interface SessionGrant {
   }[];
 }
 
+// A workspace HANDLE — what connect returns in the Cloudflare data-plane model. The
+// agent does NOT attach the lake itself anymore: its durable workspace DuckDB (a
+// WorkspaceSandbox container DO) ATTACHes quack→gateway→birdshot and runs the agent's
+// SQL. So connect returns NO attachSql / sessionJwt / endpoint — the session JWT and
+// workspace key live ONLY in the data plane (the DO holds them). The agent queries via
+// waddling_query (→ control-api /:id/query → data plane /query {workspaceId,agentId}).
 export interface ConnectResult {
   sessionId: string;
-  attachSql: string;
-  sessionJwt: string;
-  endpoint: { host: string; port: number };
+  workspaceId: string;
+  agentId: string;
   ttlSeconds: number;
   granted: SessionGrant;
 }

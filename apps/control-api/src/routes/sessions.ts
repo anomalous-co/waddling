@@ -4,14 +4,23 @@
  *
  * GET  /          → list this org's sessions (?status=&agentId=).
  * POST /          → connect (the data-plane entry): verify api-key/OAuth/session,
- *                   resolve agent+endpoint, compile policy, push the birdshot
- *                   snapshot, MINT a short-lived RS256 session JWT (jose, kid from
- *                   the Better Auth jwks table), insert agent_session, return
- *                   ConnectResult.
+ *                   resolve agent+endpoint, push the FULL-endpoint birdshot snapshot,
+ *                   MINT a short-lived RS256 session JWT (jose, kid from the Better
+ *                   Auth jwks table), resolve+key the agent's durable workspace, and
+ *                   CONFIGURE it in the data plane (boots the WorkspaceSandbox DO,
+ *                   restores-from-R2, ATTACHes quack:443 → gateway with the JWT as
+ *                   TOKEN). Inserts agent_session, returns a workspace HANDLE.
  * DELETE /        → kill a session: jti denylist on gateway + mark 'killed'.
  * GET  /:id       → single session detail for the dashboard.
- * POST /:id/query → RETIRED → HTTP 410 Gone (the /gw/query proxy bypass is gone;
- *                   agent SQL now runs through the MCP/birdshot-gated workspace path).
+ * POST /:id/query → run agent SQL in the agent's workspace (data plane /query). This
+ *                   is NOT the retired /gw/query bypass: it forwards to the workspace
+ *                   sidecar, whose locked DuckDB reaches the lake ONLY via the
+ *                   birdshot-gated quack ATTACH. See the route for the invariant note.
+ *
+ * The JWT triangle (the load-bearing C/D seam): each connect RE-PUSHES the endpoint's
+ * snapshot with the CURRENT signing key (kid), THEN mints the session JWT with the
+ * matching kid, THEN configures the workspace with that JWT. Skipping the re-push →
+ * "Authentication failed" at ATTACH (a JWT signed by a key birdshot doesn't know).
  *
  * Session JWT claims (§3a + birdshot identity mapping):
  *   id  = agent:<agentId>   ← birdshot reads THIS as the principal
@@ -20,13 +29,15 @@
  *   header.kid = jwks row id (matches /api/auth/jwks → birdshot_add_jwk)
  * The private key is the plaintext private JWK from the `jwks` table — readable
  * because the jwt plugin runs with disablePrivateKeyEncryption:true (see lib/auth).
+ * The JWT is NEVER returned to the agent: it is handed to the data plane's /configure
+ * as the quack TOKEN and held only by the workspace DO.
  *
  * The quack `sid` is per-connection and unknown at mint time; the JWT `jti` is the
  * logical session key (agent_session.sid = jti, jwt_jti = jti).
  *
- * Gateway interactions (pushSnapshot / revoke) are e2e-gated on Stage D — see the
- * inline markers. PostHog is neutered via lib/agent-identity's captureAgentEvent
- * (guarded no-op on workerd).
+ * Gateway + workspace interactions transport over the DATAPLANE service binding
+ * (gatewayClientFor + dpFetch). PostHog is neutered via lib/agent-identity's
+ * captureAgentEvent (guarded no-op on workerd).
  */
 import { z } from 'zod';
 import { Hono } from 'hono';
@@ -44,7 +55,8 @@ import {
   type SnapshotRequest,
   type BirdshotJwk,
 } from '../lib/gateway-client';
-import type { ConnectResult } from '../lib/types';
+import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
+import type { ConnectResult, QueryResult } from '../lib/types';
 import {
   resolveCaller,
   assertOrg,
@@ -56,6 +68,32 @@ import {
 } from '../lib/cp-shared';
 
 const SESSION_TTL_SECONDS = 15 * 60; // 15m (spec default; max 1h)
+
+/**
+ * POST a JSON body to a data-plane lifecycle route over the DATAPLANE service binding
+ * (the data plane is private — no public route). Returns the parsed JSON + status; the
+ * caller maps status (200 ok / 409 needs_configure / 500 error) to its own contract.
+ * The host is ignored by the binding.
+ */
+async function dpFetch(
+  env: Env,
+  path: string,
+  body: unknown,
+): Promise<{ status: number; json: any }> {
+  const res = await env.DATAPLANE.fetch(`https://dataplane${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const txt = await res.text();
+  let json: any = txt;
+  try {
+    json = txt ? JSON.parse(txt) : {};
+  } catch {
+    /* keep raw text */
+  }
+  return { status: res.status, json };
+}
 
 // One-key-per-agent runtime policy (agent-auth.md §cardinality). Claude gives the
 // server no per-conversation id, so the credential IS the agent instance: a key may
@@ -283,12 +321,15 @@ sessions.post('/', (c) =>
       toSupersede = existing.rows;
     }
 
-    // Compile active rules for this (endpoint, agent).
+    // Compile the WHOLE endpoint's policy (every agent), NOT just this agent's. The
+    // GatewayDO is shared per endpoint (`gw:<endpointId>`) and applySnapshot does a
+    // full birdshot_reset_config → re-add → commit, so pushing only the connecting
+    // agent's grants would WIPE every other agent's grants on the shared gateway. The
+    // per-agent `granted` view is then extracted from the same full compile.
     const now = new Date();
     const ruleRows = await query<AclRuleRow>(
-      `SELECT * FROM waddling.acl_rule
-        WHERE endpoint_id = $1 AND (agent_id = $2 OR agent_id IS NULL)`,
-      [endpointId, agentId],
+      `SELECT * FROM waddling.acl_rule WHERE endpoint_id = $1`,
+      [endpointId],
     );
     const compiled = compilePolicy(ruleRows.rows, now);
     const granted = grantsForAgent(compiled, agentId);
@@ -296,9 +337,9 @@ sessions.post('/', (c) =>
       return err(c, 'no_grants', 403, 'Agent has no active ACL rules for this endpoint');
     }
 
-    // Push the birdshot policy snapshot to the gateway control channel. Column +
-    // window ACLs ride INSIDE the snapshot (`roleConstraints`) and are enforced by
-    // birdshot's bind-walk — there is no separate constraint push anymore.
+    // Push the FULL birdshot policy snapshot to the gateway control channel (over the
+    // DATAPLANE binding → boots gw:<endpointId> if cold). Column + window ACLs ride
+    // INSIDE the snapshot (`roleConstraints`), enforced by birdshot's bind-walk.
     const { kid, publicJwk, privateJwk } = await loadSigningKey();
     const gw = gatewayClientFor(endpoint);
     const jwks: BirdshotJwk[] = [{ kid, n: publicJwk.n, e: publicJwk.e }];
@@ -312,10 +353,10 @@ sessions.post('/', (c) =>
       },
       snapshot: compiled.snapshot,
     };
-    // e2e-gated on Stage D gateway reachability — GATEWAY_INTERNAL_URL is a localhost
-    // placeholder unreachable from workerd until the gateway lands on a CF Container/
-    // Durable Object. Unlike recompile, connect awaits the push (a session must not be
-    // minted against a gateway that never received its snapshot); it surfaces as 500.
+    // connect AWAITS the push (a session must not be minted against a gateway that
+    // never received its snapshot + JWKS); a failure surfaces as 500. This is the
+    // first leg of the JWT triangle — the JWT minted just below carries `kid` and is
+    // verified against THIS pushed JWKS at ATTACH.
     await gw.pushSnapshot(snapshotReq);
 
     // Mint the RS256 session JWT (jose) with custom claims + kid header.
@@ -340,6 +381,43 @@ sessions.post('/', (c) =>
       .setJti(jti)
       .setExpirationTime(`${SESSION_TTL_SECONDS}s`)
       .sign(key);
+
+    // Resolve the agent's durable workspace (default-per-endpoint) + vend its 32-byte
+    // encryption key (generated lazily, sealed in Postgres; NEVER returned to the
+    // agent). Then CONFIGURE the workspace in the data plane: boot the WorkspaceSandbox
+    // DO, restore-from-R2, and ATTACH quack:443 → gateway with the session JWT as the
+    // quack TOKEN. This is the second + third legs of the JWT triangle — the JWT (kid)
+    // is verified against the JWKS pushed above. The key + JWT cross ONLY into the data
+    // plane (the DO holds them); neither is ever returned to the agent. A configure
+    // failure surfaces as 500 BEFORE any session row is written (fail-safe: the agent's
+    // prior live session, if any, stays intact since the supersede is in the insert txn
+    // below).
+    const ws = await resolveWorkspaceForSession(endpoint.org_id, endpointId, agentId);
+    const workspaceKey = await ensureWorkspaceKey(ws.workspaceId, agentId);
+    const cfg = await dpFetch(c.env, '/configure', {
+      workspaceId: ws.workspaceId,
+      agentId,
+      endpointId,
+      workspaceKey,
+      lakeToken: sessionJwt,
+      disableSsl: false, // quack speaks HTTPS:443 (intercepted by the CF egress handler)
+    });
+    if (cfg.status !== 200 || cfg.json?.ok !== true) {
+      return err(
+        c,
+        'workspace_configure_failed',
+        502,
+        `data plane /configure → ${cfg.status}: ${JSON.stringify(cfg.json)}`,
+      );
+    }
+    if (cfg.json?.lakeAttached !== true) {
+      return err(
+        c,
+        'lake_attach_failed',
+        502,
+        'workspace configured but the lake quack ATTACH did not succeed (check gateway JWKS / JWT triangle)',
+      );
+    }
 
     const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000);
     const grantedRoles = [`agent_${agentId}`];
@@ -426,18 +504,6 @@ sessions.post('/', (c) =>
       });
     }
 
-    const host = endpoint.gateway_host ?? 'localhost';
-    const port = endpoint.quack_port ?? 9500;
-    const quackUri = `quack:${host}:${port}`;
-    // quack ATTACH does NOT accept inline TOKEN/DISABLE_SSL — use CREATE SECRET.
-    // The catalog alias 'lake' shadows the server's default catalog (same name);
-    // query through lake.query('...') with full server-side paths (lake.sales.orders).
-    const attachSql = [
-      `CREATE SECRET (TYPE quack, TOKEN '${sessionJwt}', SCOPE '${quackUri}');`,
-      `ATTACH '${quackUri}' AS lake (disable_ssl true);`,
-      `-- query via: FROM lake.query('FROM lake.sales.orders LIMIT 5')`,
-    ].join('\n');
-
     // Audit + last-seen + trace — AAP identity (mode, on-behalf-of, capability)
     // stamped on the event so a single agent is legible vs others under the same user.
     await query(
@@ -463,11 +529,13 @@ sessions.post('/', (c) =>
       extra: { granted_tables: granted.tables.length, origin },
     });
 
+    // Return a workspace HANDLE — no attachSql/JWT/key. The agent does not ATTACH the
+    // lake itself; its workspace DO does, and the agent queries via
+    // POST /api/cp/sessions/:id/query (→ data plane /query).
     const body: ConnectResult = {
       sessionId: inserted?.id ?? jti,
-      attachSql,
-      sessionJwt,
-      endpoint: { host, port },
+      workspaceId: ws.workspaceId,
+      agentId,
       ttlSeconds: SESSION_TTL_SECONDS,
       granted,
     };
@@ -601,28 +669,102 @@ sessions.get('/:id', (c) =>
   }),
 );
 
+const QuerySchema = z.object({ sql: z.string().min(1) });
+
 /**
- * POST /:id/query — RETIRED → 410 Gone.
+ * POST /:id/query — run the agent's SQL in its durable workspace.
  *
- * This route used to forward agent SQL to the gateway's POST /gw/query proxy, which
- * executed it on the gateway's TRUSTED control connection — the single bypass of the
- * birdshot chokepoint. Both are gone. Agent SQL now reaches the lake only via the
- * MCP session's birdshot-gated quack path. Kept as an authenticated stub (rather than
- * deleted) so any client still pointed here gets a clear, structured redirect.
+ * THE INVARIANT (read before touching this): this is NOT the retired /gw/query proxy.
+ * That bypass ran agent SQL on the gateway's TRUSTED control connection, sidestepping
+ * birdshot. This route instead forwards to the data plane's POST /query, which runs
+ * the SQL inside the agent's WorkspaceSandbox — a LOCKED DuckDB (no S3/HTTP fs, no
+ * secrets) whose ONLY lake access is the birdshot-gated quack ATTACH set up at
+ * /configure. So agent SQL still reaches the lake through exactly one path. NEVER
+ * point this at /gw/* or any trusted connection.
+ *
+ * The data plane is keyed by (workspaceId, agentId), re-resolved here from the session
+ * row (deterministic: the default workspace per (org, endpoint)). A 409 needs_configure
+ * means the workspace DO hibernated (the container — hence the ATTACH — is gone); the
+ * agent must reconnect (which re-pushes the snapshot + re-configures). We surface that
+ * as a structured error rather than transparently reconnecting (the frozen contract).
  */
 sessions.post('/:id/query', (c) =>
   handle(c, async () => {
-    // Authenticate like the rest of the data-plane surface so this isn't an open
-    // endpoint, but execute nothing — the bypass is gone.
-    await resolveCaller(c, true, true);
-    return c.json(
-      {
-        error: 'use_mcp_session',
-        reason:
-          'This query route is retired. Run queries through an MCP session: waddling_connect, then waddling_query. Agent SQL reaches the lake only via the birdshot-gated workspace path.',
-      },
-      410,
+    // allowDelegated=true: a data-plane route. requireOrg=false: org derived from the
+    // session row below.
+    const caller = await resolveCaller(c, false, true);
+    const id = c.req.param('id');
+    const { sql } = await parseBody(c, QuerySchema);
+
+    const sess = await queryOne<{
+      id: string;
+      org_id: string;
+      agent_id: string;
+      endpoint_id: string;
+      status: string;
+    }>(
+      `SELECT id, org_id, agent_id, endpoint_id, status
+         FROM waddling.agent_session WHERE id = $1`,
+      [id],
     );
+    if (!sess) return err(c, 'session_not_found', 404);
+    // Tenant isolation (works for agent + delegated + user callers — orgId is always
+    // resolved). An API-key agent may run ONLY its own session.
+    assertOrg(caller, sess.org_id);
+    if (caller.agentId && caller.agentId !== sess.agent_id) {
+      return err(c, 'forbidden', 403, 'An agent may only query its own session');
+    }
+    if (sess.status !== 'active') {
+      return err(c, 'session_not_active', 409, `Session status is ${sess.status} — reconnect`);
+    }
+
+    // Re-resolve the workspace deterministically (idempotent upsert) — the data plane
+    // is keyed by (workspaceId, agentId), not the sessionId.
+    const ws = await resolveWorkspaceForSession(sess.org_id, sess.endpoint_id, sess.agent_id);
+    const r = await dpFetch(c.env, '/query', {
+      workspaceId: ws.workspaceId,
+      agentId: sess.agent_id,
+      sql,
+    });
+
+    // Cold/hibernated workspace → caller must reconnect (re-push snapshot + reconfigure).
+    if (r.status === 409 && r.json?.error === 'needs_configure') {
+      return c.json(
+        {
+          error: 'needs_configure',
+          reason:
+            'Your workspace went cold (the session container was reclaimed). Call waddling_connect again to re-establish it, then retry the query.',
+        },
+        409,
+      );
+    }
+
+    // The sidecar returns HTTP 500 with an error string on a birdshot denial. Map it to
+    // the structured authorization_denied shape the agent surface knows (so mcp-external
+    // can show table + reason instead of a raw 500).
+    if (r.status === 500) {
+      const msg = String(r.json?.error ?? '');
+      if (/authoriz|permission|denied|not allowed/i.test(msg)) {
+        return c.json({ error: 'authorization_denied', reason: msg }, 403);
+      }
+      return err(c, 'query_failed', 500, msg || 'workspace query failed');
+    }
+    if (r.status !== 200) {
+      // Any other non-200 from the data plane is an upstream failure (e.g. 400 bad
+      // args, 502 boot failure) — surface as 502 with the raw detail.
+      return err(c, 'query_failed', 502, `data plane /query → ${r.status}: ${JSON.stringify(r.json)}`);
+    }
+
+    // Sidecar /query → { columns, rows, rowCount, queueDepth, peakDepth }. Map to the
+    // QueryResult contract (the workspace sidecar does not truncate — the locked DuckDB
+    // returns exactly what birdshot's column/row enforcement let through).
+    const result: QueryResult = {
+      columns: r.json?.columns ?? [],
+      rows: r.json?.rows ?? [],
+      rowCount: r.json?.rowCount ?? (r.json?.rows?.length ?? 0),
+      truncated: false,
+    };
+    return ok(c, result);
   }),
 );
 

@@ -61,15 +61,14 @@ function fail(err: unknown): ToolOutput {
 }
 
 /**
- * Gateway endpoint resolved at connect, cached per session so waddling_query /
- * waddling_explain can hit /gw/query without re-connecting.
+ * Workspace handle resolved at connect, cached per session so waddling_query /
+ * waddling_explain have the agent + endpoint context without re-connecting. NO key
+ * material is cached — the session JWT + workspace key live ONLY in the data plane.
  */
 interface SessionCacheEntry {
   endpointId: string;
-  endpoint: { host: string; port: number };
-  sessionJwt: string;
-  /** Control-plane base for query proxying via REST fallback. */
-  gatewayQueryUrl: string;
+  workspaceId: string;
+  agentId: string;
 }
 
 export function registerTools(
@@ -78,15 +77,16 @@ export function registerTools(
   opts: { state: LinkState; telemetry: Telemetry },
 ): void {
   const { state, telemetry } = opts;
-  // session_id → resolved gateway coordinates (populated by waddling_connect).
+  // session_id → resolved workspace handle (populated by waddling_connect).
   const sessions = new Map<string, SessionCacheEntry>();
 
   /** Gate a data tool: until the device is linked, return structured not_linked. */
   const linked = (): boolean => state.creds !== null;
 
-  // The gateway /gw/query URL. Agents never reach the gateway directly; the
-  // control plane proxies. We route queries through the control-plane REST
-  // endpoint POST /api/cp/sessions/<id>/query, which forwards to the gateway.
+  // Agents never reach the data plane directly; the control plane forwards. Queries
+  // go through POST /api/cp/sessions/<id>/query, which forwards to the workspace DO's
+  // /query — where the agent's locked DuckDB runs the SQL against the birdshot-gated
+  // quack ATTACH (the single path to the lake).
   const queryPath = (sessionId: string): string => `/api/cp/sessions/${encodeURIComponent(sessionId)}/query`;
 
   // ── 1. waddling_list_endpoints ───────────────────────────────────────────────
@@ -147,13 +147,12 @@ export function registerTools(
     "waddling_connect",
     {
       description:
-        "Open a governed session on an endpoint. Returns { session_id, attach_sql, session_jwt, " +
-        "endpoint, ttl_seconds, granted }. `attach_sql` is ready-to-paste SQL (CREATE SECRET + ATTACH) " +
-        "— run it verbatim in your own DuckDB to ATTACH the lake, then query via " +
-        "`FROM lake.query('FROM lake.sales.orders LIMIT 5')`. The catalog alias shadows the server's " +
-        "default catalog, so queries must use full server-side paths (lake.schema.table) through lake.query(). " +
-        "Or just use waddling_query with the returned session_id. " +
-        "`granted` tells you which tables/verbs/row-limits you have. Sessions are short-lived (default 15m).",
+        "Open a governed session on an endpoint. Returns { session_id, workspace_id, agent_id, " +
+        "ttl_seconds, granted }. This provisions your DURABLE, encrypted, private workspace and " +
+        "attaches the governed lake to it server-side — you do NOT run any ATTACH yourself. Just " +
+        "call waddling_query with the returned session_id. `granted` tells you which tables/verbs/" +
+        "row-limits you have. Sessions are short-lived (default 15m); if a later query returns " +
+        "{ error:'needs_configure' }, call waddling_connect again to refresh and retry.",
       inputSchema: {
         endpoint_id: z.string().describe("Endpoint id from waddling_list_endpoints."),
       },
@@ -167,15 +166,13 @@ export function registerTools(
         });
         sessions.set(result.sessionId, {
           endpointId: args.endpoint_id,
-          endpoint: result.endpoint,
-          sessionJwt: result.sessionJwt,
-          gatewayQueryUrl: queryPath(result.sessionId),
+          workspaceId: result.workspaceId,
+          agentId: result.agentId,
         });
         return ok({
           session_id: result.sessionId,
-          attach_sql: result.attachSql,
-          session_jwt: result.sessionJwt,
-          endpoint: result.endpoint,
+          workspace_id: result.workspaceId,
+          agent_id: result.agentId,
           ttl_seconds: result.ttlSeconds,
           granted: result.granted,
         });
@@ -190,26 +187,28 @@ export function registerTools(
     "waddling_query",
     {
       description:
-        "Run a governed read/write through the gateway for an open session. Returns " +
-        "{ columns, rows, row_count, truncated, snapshot_version }. Column projection, row limits, " +
-        "and time windows are enforced server-side: columns you lack are stripped, results are capped. " +
-        "On a denial you get { error:'authorization_denied', table, reason } — read `reason` and adjust " +
-        "(e.g. drop a forbidden column, qualify a table as schema.table). Single SELECT/WITH for read grants.",
+        "Run a governed read/write in your workspace for an open session. Returns " +
+        "{ columns, rows, row_count, truncated, snapshot_version }. Query the attached lake by its " +
+        "catalog alias `lake`, qualified as `lake.<schema>.<table>` (e.g. " +
+        "`SELECT * FROM lake.sales.orders LIMIT 5`). Column projection, row limits, and time windows " +
+        "are enforced server-side by birdshot: columns you lack are stripped, results are capped. " +
+        "On a denial you get { error:'authorization_denied', reason } — read `reason` and adjust " +
+        "(e.g. drop a forbidden column, qualify a table). If you get { error:'needs_configure' }, your " +
+        "session went cold — call waddling_connect again, then retry. Single SELECT/WITH for read grants.",
       inputSchema: {
         session_id: z.string().describe("session_id from waddling_connect."),
-        sql: z.string().describe("A single SQL statement (SELECT/WITH for read grants)."),
+        sql: z.string().describe("A single SQL statement; reference the lake as lake.<schema>.<table>."),
       },
     },
     async (args): Promise<ToolOutput> => {
       if (!linked()) return notLinked();
       const startedAt = Date.now();
       try {
-        // Pass the cached session JWT (from waddling_connect) so the control
-        // plane can forward it to the gateway proxy as the TOKEN birdshot verifies.
-        const cached = sessions.get(args.session_id);
+        // The control plane resolves the session → (workspace, agent) and forwards to
+        // the workspace DO's /query; no key material is passed from here.
         const result = await client.cp<QueryResult>(queryPath(args.session_id), {
           method: "POST",
-          body: { sql: args.sql, sessionJwt: cached?.sessionJwt },
+          body: { sql: args.sql },
         });
         // Telemetry: duration + row_count ONLY — never the SQL text.
         telemetry.setOnce("first_query"); // $set_once on person, fires once

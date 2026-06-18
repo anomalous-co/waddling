@@ -17,7 +17,7 @@ import type { Env } from "./lib/env";
 import { initDbPool, query } from "./lib/db";
 import { buildAuth, runMigrations } from "./lib/auth";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
-import { initGatewayBaseUrl } from "./lib/gateway-client";
+import { initDataplane } from "./lib/gateway-client";
 import { resolveCaller } from "./lib/cp-shared";
 import { endpoints } from "./routes/endpoints";
 import { agents } from "./routes/agents";
@@ -38,7 +38,7 @@ function errMessage(e: unknown): string {
 }
 
 // Initialize per-isolate singletons once, before any handler — the db pool plus
-// the secret-crypto pair and gateway control-channel base URL the ported lib layer
+// the secret-crypto pair and the DATAPLANE service binding the ported lib layer
 // resolves through getCrypto()/gatewayClientFor(). All read from `c.env` (no
 // ambient env on workerd) and are idempotent — only the first request in a warm
 // isolate does work. The crypto secret uses WADDLING_SECRET_KEY with a
@@ -46,7 +46,7 @@ function errMessage(e: unknown): string {
 app.use("*", async (c, next) => {
   initDbPool(c.env.HYPERDRIVE.connectionString);
   initCrypto(c.env.WADDLING_SECRET_KEY ?? c.env.BETTER_AUTH_SECRET);
-  initGatewayBaseUrl(c.env.GATEWAY_INTERNAL_URL);
+  initDataplane(c.env.DATAPLANE);
   await next();
 });
 

@@ -19,13 +19,13 @@
  * defined locally (re-using ./types where a shared shape exists) because they are a
  * control-channel wire contract, not a domain model.
  *
- * Workers difference vs the original: the original derived the control-channel base
- * URL from the endpoint row's `gateway_host`/`quack_port`. On Cloudflare the control
- * plane tunnels to the EXISTING Rivet/GCP gateway at a single internal URL
- * (env.GATEWAY_INTERNAL_URL), so `gatewayClientFor` reads that via the per-isolate
- * getter (initialized from env by middleware — see initGatewayBaseUrl). The
- * endpoint's `server_token` still authorizes the call. `fetch` is workerd-native;
- * no node:http is used.
+ * Transport: the gateway now lives in the waddling-dataplane Worker's GatewayDO,
+ * which is service-binding-only (no public route). So this client transports every
+ * call through the DATAPLANE service binding (a Fetcher), initialized per-isolate
+ * from env by middleware (see initDataplane). The data plane exposes /gw/snapshot,
+ * /gw/status, /gw/revoke; it has NO /gw/describe (catalog introspection needs a real
+ * per-endpoint lake — Stage D), so `describe` throws a structured GatewayError and
+ * its one caller degrades to an empty catalog. `fetch` is workerd-native.
  */
 import type { BirdshotSnapshot } from './types';
 
@@ -88,24 +88,17 @@ export class GatewayError extends Error {
 // ── Client ───────────────────────────────────────────────────────────────────
 
 export interface GatewayClientOptions {
-  /** Control-channel base URL, e.g. `http://gw-prod-lake.getwaddling.com:9510`. */
-  baseUrl: string;
-  /** Shared secret authorizing control-plane → gateway calls (endpoint.server_token). */
-  serverToken: string;
-  fetchImpl?: typeof fetch;
+  /** Service binding to the waddling-dataplane Worker (env.DATAPLANE). */
+  fetcher: Fetcher;
   timeoutMs?: number;
 }
 
 export class GatewayClient {
-  private readonly baseUrl: string;
-  private readonly token: string;
-  private readonly fetchImpl: typeof fetch;
+  private readonly fetcher: Fetcher;
   private readonly timeoutMs: number;
 
   constructor(opts: GatewayClientOptions) {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, '');
-    this.token = opts.serverToken;
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.fetcher = opts.fetcher;
     this.timeoutMs = opts.timeoutMs ?? 10_000;
   }
 
@@ -117,12 +110,11 @@ export class GatewayClient {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
     try {
-      const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      // The data plane is private (service-binding-only); the binding IS the trust
+      // boundary, so no bearer token is sent. The host is ignored by the binding.
+      const res = await this.fetcher.fetch(`https://dataplane${path}`, {
         method,
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${this.token}`,
-        },
+        headers: { 'content-type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: ctrl.signal,
       });
@@ -145,19 +137,27 @@ export class GatewayClient {
     }
   }
 
+  /** Push a birdshot ACL snapshot + RS256 JWKS to the per-endpoint GatewayDO. The
+   *  data plane boots `gw:<endpointId>` if cold and applies the snapshot (a full
+   *  reset → set_auth → grants → commit), so callers MUST push the endpoint's WHOLE
+   *  compiled policy (all agents), not a single agent's — see sessions/acl. */
   pushSnapshot(req: SnapshotRequest): Promise<GatewayAck> {
     return this.send<GatewayAck>('POST', '/gw/snapshot', req);
   }
 
   /**
-   * Introspect columns/types for the given tables (the gateway returns FULL
-   * schema; the caller filters to the agent's grants). Pass the agent's granted
-   * table refs to avoid shipping the whole catalog.
+   * Introspect columns/types for granted tables. NOT available on the data-plane
+   * gateway — catalog introspection needs the real per-endpoint DuckLake (Stage D),
+   * and the GatewayDO image attaches only a demo lake. Throws a structured
+   * GatewayError(501); the one caller (endpoints describe) degrades to an empty
+   * catalog rather than failing the editor.
    */
   describe(
-    tables?: { schema: string; table: string }[],
+    _tables?: { schema: string; table: string }[],
   ): Promise<{ tables: GatewayTableInfo[] }> {
-    return this.send<{ tables: GatewayTableInfo[] }>('POST', '/gw/describe', { tables });
+    return Promise.reject(
+      new GatewayError('describe not available on the data-plane gateway (Stage D)', 501),
+    );
   }
 
   revoke(req: RevokeRequest): Promise<GatewayAck> {
@@ -167,51 +167,47 @@ export class GatewayClient {
   status(endpointId: string): Promise<GatewayStatus> {
     return this.send<GatewayStatus>(
       'GET',
-      `/gw/status?endpoint=${encodeURIComponent(endpointId)}`,
+      `/gw/status?endpointId=${encodeURIComponent(endpointId)}`,
     );
   }
 }
 
 /**
- * Per-isolate gateway base-URL singleton + throwing getter (mirrors db.ts's pool
- * pattern). On workerd the control plane reaches a single internal gateway URL
- * sourced from env; a middleware calls `initGatewayBaseUrl(env.GATEWAY_INTERNAL_URL)`
- * once before any handler, and `gatewayClientFor` reads it via the getter. This keeps
- * `gatewayClientFor`'s signature unchanged from the original.
+ * Per-isolate DATAPLANE service-binding singleton + throwing getter (mirrors db.ts's
+ * pool pattern). A middleware calls `initDataplane(env.DATAPLANE)` once before any
+ * handler, and `gatewayClientFor` reads it via the getter — keeping that function's
+ * signature unchanged from the original (callers still pass the endpoint row).
  */
-let _gatewayBaseUrl: string | undefined;
+let _dataplane: Fetcher | undefined;
 
-/** Idempotent per-isolate gateway base-URL initializer. First call wins. */
-export function initGatewayBaseUrl(baseUrl: string): void {
-  if (_gatewayBaseUrl === undefined) {
-    _gatewayBaseUrl = baseUrl;
+/** Idempotent per-isolate DATAPLANE binding initializer. First call wins. */
+export function initDataplane(fetcher: Fetcher): void {
+  if (_dataplane === undefined) {
+    _dataplane = fetcher;
   }
 }
 
-function getGatewayBaseUrl(): string {
-  if (_gatewayBaseUrl === undefined) {
+function getDataplane(): Fetcher {
+  if (_dataplane === undefined) {
     throw new Error(
-      'gateway base URL not initialized — initGatewayBaseUrl(env.GATEWAY_INTERNAL_URL) must run before gatewayClientFor',
+      'DATAPLANE binding not initialized — initDataplane(env.DATAPLANE) must run before gatewayClientFor',
     );
   }
-  return _gatewayBaseUrl;
+  return _dataplane;
 }
 
-/** Build a client from an endpoint row's gateway runtime fields. */
-export function gatewayClientFor(endpoint: {
+/**
+ * Build a gateway control-channel client. The `endpoint` row is accepted for
+ * call-site compatibility (and to make the per-endpoint intent legible) but its
+ * fields are no longer used for transport: every endpoint's control channel is
+ * routed through the single DATAPLANE binding, and the GatewayDO is keyed per
+ * endpoint INSIDE the data plane by the `endpointId` carried in each request body.
+ */
+export function gatewayClientFor(_endpoint?: {
   gateway_host: string | null;
   quack_port: number | null;
   server_token: string;
-  /** Control port; defaults to quack_port + 10 (demo: 9500 quack / 9510 ctrl). */
   ctrl_port?: number | null;
 }): GatewayClient {
-  // Stage D: repoint from GATEWAY_INTERNAL_URL to the gateway Durable Object. The
-  // original derived the base URL per-endpoint from `gateway_host`/`quack_port`;
-  // on Cloudflare every endpoint's control channel tunnels to one internal gateway
-  // URL (the existing Rivet/GCP gateway) until the gateway moves to a CF Container/
-  // Durable Object in Stage D. The endpoint's `server_token` still authorizes.
-  return new GatewayClient({
-    baseUrl: getGatewayBaseUrl(),
-    serverToken: endpoint.server_token,
-  });
+  return new GatewayClient({ fetcher: getDataplane() });
 }
