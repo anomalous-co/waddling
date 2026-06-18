@@ -21,6 +21,7 @@ import { apiKey } from '@better-auth/api-key';
 import { stripe } from '@better-auth/stripe';
 import { Pool } from 'pg';
 import Stripe from 'stripe';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Env } from './env';
 
 /**
@@ -35,7 +36,7 @@ function stripePlans(env: Env): { name: string; priceId: string }[] {
   ].filter((p) => p.priceId);
 }
 
-function construct(env: Env) {
+function construct(env: Env, pool: Pool) {
   // Stripe MUST use the fetch HTTP client on workerd — the default Node http
   // client relies on `node:http`, which is not available in the Workers runtime.
   // A placeholder key constructs fine; Stripe only validates on a real request.
@@ -51,8 +52,12 @@ function construct(env: Env) {
     baseURL: env.BETTER_AUTH_URL,
     secret: env.BETTER_AUTH_SECRET,
     // Better Auth owns this Pool (separate from db.ts's pool against the same
-    // Hyperdrive binding). Cap at 5 — see db.ts for the two-pool rationale.
-    database: new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 }),
+    // Hyperdrive binding). Built fresh PER REQUEST and closed after (see buildAuth) —
+    // a Pool cached across requests makes Better Auth's Kysely connection wrapper hang
+    // on workerd (the runtime cancels a request whose code awaits I/O on a connection
+    // owned by a prior request → opaque 1101). Per-request is Better Auth's own
+    // documented Cloudflare pattern. Cap at 5; Hyperdrive pools server-side.
+    database: pool,
     emailAndPassword: { enabled: true },
 
     // PostHog funnel hooks. The original called posthog-node (`getPostHogServer()`),
@@ -146,19 +151,56 @@ function construct(env: Env) {
 
 export type Auth = ReturnType<typeof construct>;
 
-// Per-isolate cache. Keyed on the auth secret so a secret rotation rebuilds.
-let cached: { key: string; auth: Auth } | undefined;
+/**
+ * Per-REQUEST Better Auth instance, scoped via AsyncLocalStorage so every
+ * `buildAuth(c.env)` call site stays unchanged while each request gets its own
+ * instance + pg.Pool. This is mandatory on workerd: a Better Auth instance cached
+ * across requests reuses a Kysely connection bound to an earlier request's I/O
+ * context, and the runtime then cancels the new request as "hung" (the opaque
+ * 1101 that broke org-create / agent-create). Matches Better Auth's official
+ * Cloudflare example (createAuth(c.env) per request). The pool is created lazily
+ * (only when a request actually touches auth) and closed after the response by
+ * runInAuthScope, so non-auth requests pay nothing and nothing leaks.
+ */
+interface AuthSlot {
+  auth?: Auth;
+  pool?: Pool;
+}
+const authScope = new AsyncLocalStorage<AuthSlot>();
+
+export function buildAuth(env: Env): Auth {
+  const slot = authScope.getStore();
+  if (slot) {
+    if (!slot.auth) {
+      const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
+      slot.auth = construct(env, pool);
+      slot.pool = pool;
+    }
+    return slot.auth;
+  }
+  // Outside a request scope (rare — e.g. an out-of-band migration). Construct a
+  // throwaway; its pool isn't tracked for cleanup, so only use off the request path.
+  const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
+  return construct(env, pool);
+}
 
 /**
- * Get the cached Better Auth instance for this isolate, constructing it on first
- * use. Caching is essential: each instance owns a pg.Pool, so a per-request
- * instance would leak connections.
+ * Run `next` inside a fresh per-request auth scope and close any Better Auth pool it
+ * opened, after the response (via waitUntil). Wrap the whole request with this so every
+ * buildAuth() call within it shares ONE instance + pool, torn down when the request ends.
  */
-export function buildAuth(env: Env): Auth {
-  if (!cached || cached.key !== env.BETTER_AUTH_SECRET) {
-    cached = { key: env.BETTER_AUTH_SECRET, auth: construct(env) };
+export async function runInAuthScope(
+  executionCtx: { waitUntil(p: Promise<unknown>): void } | undefined,
+  next: () => Promise<void>,
+): Promise<void> {
+  const slot: AuthSlot = {};
+  await authScope.run(slot, next);
+  if (slot.pool) {
+    const pool = slot.pool;
+    const closing = pool.end().catch(() => {});
+    if (executionCtx) executionCtx.waitUntil(closing);
+    else await closing;
   }
-  return cached.auth;
 }
 
 /**

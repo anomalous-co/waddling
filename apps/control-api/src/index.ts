@@ -15,7 +15,7 @@ import { AwsClient } from "aws4fetch";
 import { Pool } from "pg";
 import type { Env } from "./lib/env";
 import { initDbPool, query } from "./lib/db";
-import { buildAuth, runMigrations } from "./lib/auth";
+import { buildAuth, runMigrations, runInAuthScope } from "./lib/auth";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
 import { initDataplane } from "./lib/gateway-client";
 import { resolveCaller } from "./lib/cp-shared";
@@ -48,12 +48,17 @@ app.use("*", async (c, next) => {
   initDbPool(c.env.HYPERDRIVE.connectionString);
   initCrypto(c.env.WADDLING_SECRET_KEY ?? c.env.BETTER_AUTH_SECRET);
   initDataplane(c.env.DATAPLANE);
-  await next();
+  // Establish a per-request Better Auth scope (see auth.ts): every buildAuth(c.env)
+  // this request shares ONE instance + pool, closed after the response. A Better Auth
+  // instance cached across requests hangs on workerd → 1101.
+  let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
+  try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
+  await runInAuthScope(exCtx, next);
 });
 
 // ─── Better Auth ──────────────────────────────────────────────────────────────
-// All auth/OAuth/MCP endpoints live under /api/auth/*. buildAuth caches per
-// isolate, so this does not reconstruct (or reopen its pool) on every request.
+// All auth/OAuth/MCP endpoints live under /api/auth/*. buildAuth returns this
+// request's instance (constructed once per request inside runInAuthScope).
 app.on(["GET", "POST"], "/api/auth/*", (c) => buildAuth(c.env).handler(c.req.raw));
 
 // ─── /probe/db ──────────────────────────────────────────────────────────────
