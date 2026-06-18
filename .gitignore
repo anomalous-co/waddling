@@ -48,3 +48,7 @@ pgdata-*/
 *.parquet
 *.ducklake
 *.ducklake.wal
+
+# subagent worktrees + scratch proof scripts (the latter hold throwaway test creds)
+.claude/worktrees/
+apps/control-api/tt.sh
