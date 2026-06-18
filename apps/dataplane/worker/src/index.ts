@@ -463,7 +463,7 @@ main().catch(e => console.log('LAKEPROBE_RESULT:' + JSON.stringify({ error: Stri
   };
   try {
     await withBootRetry(() => gw.exec("echo ready"), "lake-probe warmup");
-    const b64 = btoa(unescape(encodeURIComponent(script))); // utf8-safe base64 of the script
+    const b64 = btoa(script); // script is pure ASCII → btoa is safe (matches the egress probe)
     const run = await gw.exec(`cd /opt/gateway && mkdir -p /tmp/lakeprobe && echo ${b64} | base64 -d | node --input-type=module`);
     const line = run.stdout.split("\n").find((l) => l.startsWith("LAKEPROBE_RESULT:"));
     const result = line ? JSON.parse(line.slice("LAKEPROBE_RESULT:".length)) : { error: "no result line", raw: run.stdout.slice(-2000) };
