@@ -1,0 +1,135 @@
+---
+title: "Introducing waddling: dynamic ACLs for AI agents on your lakehouse"
+author: The waddling team
+date: 2026-06-12
+description: Agents need data access. Static credentials are a bad answer. We built per-agent dynamic ACLs, instant revoke, and full audit — enforced at the DuckDB gateway.
+---
+
+# Introducing waddling: dynamic ACLs for AI agents on your lakehouse
+
+We've been building AI agents that query analytics data for the past two years. And we keep running into the same problem: **how do you give an LLM agent access to your data warehouse without giving it the keys to the whole thing?**
+
+Static database credentials are the obvious answer, and they're a terrible one. You either give the agent read access to everything — including PII, financials, and tables it has no business querying — or you provision a separate read-only account per agent and pray nothing goes wrong. When something does go wrong, you revoke the credential, break every other session, and spend an hour figuring out what the agent actually accessed.
+
+waddling is our answer to this problem.
+
+## What we built
+
+waddling is a **control plane for governed AI agent access to analytics lakehouses**. The architecture has three pieces:
+
+**1. The gateway** — a DuckDB process per org, running the [birdshot](https://github.com/waddling/birdshot) extension. Agents `ATTACH` to the gateway over the quack wire protocol, not to the lake directly. The gateway sits between the agent and your data and enforces policy.
+
+**2. Per-agent ACL rules** — dynamic policies stored in Postgres, compiled into birdshot grants. Each rule specifies what a specific agent can read or write: which tables, which columns, with what row limit, during what time window. Agents are machine principals, distinct from human users.
+
+**3. Instant revocation** — birdshot maintains an in-memory denylist. When you revoke an agent, the next query is denied in milliseconds. No token expiry wait. No credential rotation across your data warehouse.
+
+## The problem with static credentials in more detail
+
+Here's what actually happens when you give an LLM agent a Postgres connection string:
+
+The agent gets `SELECT` on your analytics schema. It can enumerate every table in `information_schema`. It can `SELECT *` from your `customers` table, including every PII column you forgot to exclude. If the agent is running in a context window with tool-call injection vulnerabilities (and they all are, to some degree), an attacker who can influence the agent's inputs can query anything the credential allows.
+
+When you detect the problem, you revoke the credential. Every session — including other legitimate agents — is broken. You have no audit trail of what the compromised agent actually queried, because your data warehouse logs a connection string, not an agent identity.
+
+DuckDB over the quack protocol doesn't change this. `ATTACH 's3://my-lake'` with a hard-coded credential is just a faster version of the same problem.
+
+## What actually needed building
+
+We spent a while staring at this. The answer turned out to be **layered enforcement**, where each security dimension is handled at the layer that can actually defend it:
+
+| What you want to control | Where we enforce it | Why |
+|--------------------------|--------------------|----|
+| Table access | birdshot (in-process, C++) | Can't be bypassed from the agent plane; fires before DuckDB parses the query |
+| Column projection | Gateway query proxy | DuckDB views are bypassable — an agent can reference the base table directly or enumerate columns via `duckdb_columns()` |
+| Row limits | Gateway query proxy | Same: any view/function the agent writes can read the base table |
+| Instant revoke | birdshot in-memory denylist | Sub-millisecond; no coordination with the control plane needed |
+| Time windows | Session mint + gateway | Sessions only issued when the window is open; gateway rejects stale sessions |
+
+The birdshot security audit (which we're publishing separately) was the forcing function here. We'd originally planned to use DuckDB views for column ACL. The audit found two clean bypasses: the confused-deputy pattern (agent creates a view/macro referencing the base table) and metadata introspection (`duckdb_columns()` leaks column names even without read access). So we moved column enforcement to the gateway proxy. birdshot is now the table-level backstop — it enforces what it can defend.
+
+## The token model
+
+Agents never see lake credentials. They see a short-lived RS256 session JWT.
+
+The flow:
+
+1. Agent has an API key (`sk_agent_…`), created by a human admin, bound to the org and agent.
+2. Agent calls `waddling_connect` (via the MCP server). The control plane verifies the API key, evaluates active ACL rules for that agent + endpoint, and mints a session JWT (`id=agent:<id>`, `aud=gw:<endpoint>`, 15-minute `exp`).
+3. The MCP server returns `attach_sql` — a literal `ATTACH 'quack:gw.getwaddling.com:9500' AS lake (TOKEN 'eyJ...', DISABLE_SSL false)` that the agent can run.
+4. Every subsequent query goes through the gateway, which verifies the JWT against the JWKS endpoint and enforces birdshot grants.
+
+The API key never reaches the gateway. The session JWT encodes only what the agent is allowed to do. If the JWT is intercepted, the attacker has 15 minutes of access to exactly the columns and tables the ACL rules allow.
+
+## The MCP story
+
+We built two MCP servers:
+
+**`@waddling/mcp`** — the external server for analytics agents. 8 tools:
+
+```sh
+npx -y @waddling/mcp@latest
+# or
+claude mcp add waddling -- npx -y @waddling/mcp@latest
+```
+
+The tools are verb-first and structured. `waddling_connect` returns ready-to-paste ATTACH SQL. `waddling_whoami` tells the agent exactly what it can access before it starts querying. `waddling_explain` lets the agent dry-run a query to check permissions without writing an audit event. Denials are structured JSON with a `suggestion` field — the agent can self-correct or report a meaningful error to the human operator.
+
+**`@waddling/mcp-admin`** — the internal server for admin agents. 10 tools. The pattern that surprised us during the demo was `waddling_admin_grant` followed immediately by `waddling_admin_revoke_agent`: an admin agent can dynamically expand a user agent's access for a specific task, then revoke it when done. The whole cycle is logged with `actor=admin_agent_id`.
+
+## The demo walkthrough
+
+Here's what the demo stack (Docker Compose, seeded with synthetic data) shows:
+
+The `analyst` agent connects and queries `sales.orders` successfully. It then tries `SELECT * FROM sales.customers` — the gateway proxy denies it because `analyst` has no grant on `sales.customers`. The structured error looks like:
+
+```json
+{
+  "error": "authorization_denied",
+  "table": "sales.customers",
+  "reason": "no grant for table sales.customers",
+  "suggestion": "Ask your admin to create an ACL rule for this table."
+}
+```
+
+The admin's agent runs `waddling_admin_grant` to allow `analyst` to read `customers` — but only columns `[id, name]`, not `ssn`. The policy compiler pushes a birdshot snapshot. Now `analyst` can query customers, but `SELECT ssn FROM customers` hits the proxy and returns:
+
+```json
+{
+  "error": "authorization_denied",
+  "table": "sales.customers",
+  "reason": "column ssn not in allow-list",
+  "allowed_columns": ["id", "name"]
+}
+```
+
+Meanwhile, `etl-bot` is writing to `sales.events`. The admin runs `waddling_admin_revoke_agent` with reason `"off-hours activity"`. The next write from `etl-bot` is denied instantly:
+
+```json
+{
+  "error": "authorization_denied",
+  "reason": "agent revoked",
+  "agent_id": "agt_etl_bot"
+}
+```
+
+The dashboard's audit log shows the full sequence: every auth decision, every query, the column denial, the grant, the revoke, the killed session. Live.
+
+## What we're launching with
+
+- **Free tier**: 1 endpoint, 2 agents, static `reader`/`writer` roles, 7-day audit. Good for evaluating.
+- **Pro ($99/seat/month)**: 5 endpoints, 25 agents, full dynamic ACL (column/row/window/TTL), instant revoke, admin MCP server, 90-day audit.
+- **Enterprise (contact us)**: dedicated gateways, dedicated R2 buckets, SSO/SAML, 1-year audit, SLA. If you're running agents on data that needs to be isolated, this is what you want.
+
+## What's next
+
+Short term: the column proxy today parses SQL using a hand-rolled AST walker. We're replacing it with DuckDB's own parser (via `@duckdb/node-api`'s `duckdb_parse()`) for correctness on complex expressions. We're also adding `EXPLAIN` cost estimates to `waddling_explain` so agents can reason about query expense before running.
+
+Medium term: we're building a **policy DSL** so admins can express rules like "any agent with tag `analyst` gets read access to `sales.*` except columns matching `*_pii`" without enumerating tables manually. The compiler will expand these into concrete birdshot grants.
+
+We're also watching DuckDB's extension signing roadmap. When community-signed extensions ship, we'll submit birdshot — removing the `allow_unsigned_extensions` requirement for self-hosted installs.
+
+---
+
+waddling is in beta. If you're building agents that query analytics data and the credential problem resonates, we'd genuinely like to hear from you: [hello@getwaddling.com](mailto:hello@getwaddling.com).
+
+Start here: [quickstart guide](/docs/quickstart) · [all 18 MCP tools](/docs/mcp-tools) · [ACL model deep-dive](/docs/acl-model)

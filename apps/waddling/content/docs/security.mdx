@@ -1,0 +1,127 @@
+---
+title: Security model
+description: Token lifecycle, instant revocation, audit trail, and the precise boundaries of what birdshot enforces versus what the gateway proxy enforces.
+---
+
+# Security model
+
+## Token model
+
+waddling uses a two-token model that keeps lake credentials out of agents entirely.
+
+### Org API key (`sk_agent_…`)
+
+- Long-lived, created by a human admin in the dashboard.
+- Bound to an organization and an agent.
+- Stored hashed by Better Auth; never returned after creation.
+- Used only to authenticate to the waddling control plane (e.g. `waddling_connect`).
+- **Never presented to the DuckDB gateway** — the gateway never sees it.
+
+### Session JWT
+
+- Short-lived RS256 token, default 15 minutes, maximum 1 hour.
+- Minted by `POST /api/cp/sessions` after the control plane verifies the API key, evaluates ACL rules, and confirms the org's gateway is running.
+- Claims: `id=agent:<agent_id>`, `aud=gw:<endpoint_id>`, `jti` (revocation handle), `exp`.
+- Presented to the gateway as the quack `TOKEN` parameter in the ATTACH string.
+- The gateway's birdshot extension verifies the JWT signature using the org's RS256 public key fetched from `/api/auth/jwks`.
+- **Never transmitted to the end user's DuckDB** — the MCP server presents it on the agent's behalf.
+
+### Key property
+
+An attacker who intercepts a session JWT gets at most 15 minutes of access, scoped to exactly the tables and columns the ACL rules allow. There are no lake credentials to steal — the JWT is the only material that grants access, and it expires.
+
+## birdshot boundaries — what it enforces and what it doesn't
+
+birdshot is a DuckDB C++ extension that runs inside the gateway process. It enforces:
+
+- **Table-level read/write** (the `birdshot_authorize` hook rejects queries on ungranted tables before they reach the DuckDB planner)
+- **JWT signature verification** (RS256, JWKS-fetched per connection)
+- **In-memory denylist** (instant revocation — `birdshot_revoke` is in-memory, sub-millisecond)
+- **Session TTL** (via JWT `exp`)
+
+birdshot does **NOT** enforce:
+
+- Column-level projection
+- Row limits
+- Time-of-day windows
+
+These are enforced by the **gateway query proxy** (a layer above birdshot, in the MCP gateway server). The proxy parses the agent's SQL, validates column references against the ACL allow-list, rewrites `SELECT *` to the allowed column set, and injects/clamps `LIMIT`. The proxy also enforces time windows by refusing to mint sessions outside the window.
+
+### Why the split?
+
+birdshot's in-process position makes it the right enforcement point for table-level and revocation decisions — it cannot be bypassed by the agent plane. Column and row enforcement are best done at a higher layer where SQL parsing and semantic rewriting are straightforward without modifying DuckDB internals.
+
+### What birdshot explicitly does NOT do for columns
+
+DuckDB views were considered as a mechanism for column ACL. The birdshot security audit found that view-based column ACL is bypassable: an agent can reference the underlying table directly in its own view or macro (confused-deputy), or enumerate column names via `duckdb_columns()` metadata introspection. For this reason, waddling uses the gateway proxy for column enforcement — it is the only defensible path.
+
+## Instant revocation
+
+When an admin calls `waddling_admin_revoke_agent` or `waddling_admin_kill_session`, the sequence is:
+
+1. Control plane calls `birdshot_revoke('user', 'agent:<id>', reason, expires_us)` on the gateway.
+2. birdshot adds the principal to an in-memory denylist. The next `birdshot_authorize` call for that principal returns `deny` immediately.
+3. The `agent_session` row is marked `revoked` / `killed` in Postgres.
+4. An `audit_event` is written with `event='revoke'`, `actor=<admin who triggered it>`.
+
+The agent receives a structured error on its next query:
+```json
+{ "error": "authorization_denied", "reason": "agent revoked", "agent_id": "agt_xxxx" }
+```
+
+There is no delay, no token expiry wait. The denylist is in-memory at the gateway — the revocation takes effect within the latency of the next query's `birdshot_authorize` call.
+
+## Audit trail
+
+Every security-relevant event is recorded in `waddling.audit_event`:
+
+| Event | Trigger |
+|-------|---------|
+| `auth` | JWT verification at quack ATTACH |
+| `authorize` | Per-query table access check (allow or deny) |
+| `query` | Query execution (truncated SQL, row count) |
+| `grant` | ACL rule created |
+| `revoke` | Agent or session revoked |
+| `kill` | Session killed |
+| `attach` | quack ATTACH |
+
+Audit events have a `source` field (`gateway`, `control-plane`, `mcp-external`, `mcp-internal`) and an `actor` field for admin-triggered events.
+
+Retention: 7 days (Free), 90 days (Pro), 1 year (Enterprise).
+
+The audit log is append-only in the control plane database. Gateway events are drained from birdshot's ring buffer via the MCP server and written to Postgres — they survive gateway restarts.
+
+## What birdshot enforces vs. gateway proxy: summary
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Agent sends: SELECT ssn, id FROM lake.sales.customers     │
+└───────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌────────────────────────────────────────────────────────────┐
+│  Gateway query proxy (MCP gateway layer)                   │
+│  • Parse SQL                                               │
+│  • Check column allow-list: ssn NOT in [id, name]          │
+│  → REJECT with authorization_denied (column not in list)   │
+│  (query never reaches DuckDB)                              │
+└────────────────────────────────────────────────────────────┘
+                             │  (if columns pass)
+                             ▼
+┌────────────────────────────────────────────────────────────┐
+│  birdshot (in-process C++ extension)                       │
+│  • birdshot_authenticate(sid, jwt, server_token)           │
+│  • birdshot_authorize(sid, sql)                            │
+│    → checks: is sales.customers in agent's role grants?    │
+│    → checks: is agent on denylist?                         │
+│  → ALLOW or DENY                                           │
+└────────────────────────────────────────────────────────────┘
+                             │  (if allowed)
+                             ▼
+┌────────────────────────────────────────────────────────────┐
+│  DuckDB query engine                                       │
+│  executes the (possibly proxy-rewritten) SQL               │
+└────────────────────────────────────────────────────────────┘
+```
+
+Even if an attacker somehow bypassed the proxy (e.g. direct quack connection), birdshot's table-level check would still fire. Even if birdshot had a bug on a specific table, the proxy would have already rejected the column reference. Defense in depth.

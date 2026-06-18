@@ -1,0 +1,52 @@
+---
+title: What is waddling?
+description: Dynamic ACLs for AI agents on your analytics lakehouse — per-agent policies, instant revoke, and full audit enforced at the DuckDB gateway.
+---
+
+# What is waddling?
+
+waddling is the control plane for **governed AI agent access to analytics lakehouses**.
+
+You connect your DuckLake (DuckDB + Parquet on Cloudflare R2 or S3) to a waddling-managed **DuckDB gateway endpoint**. Your agents connect to that endpoint using the standard DuckDB `ATTACH` command — but instead of raw lake credentials, they receive a short-lived session token. Every table, column, and row the agent can read or write is defined by ACL rules you control, enforced at the gateway, with every decision recorded in a live audit log.
+
+## The problem it solves
+
+LLM agents that query analytics data are a double-edged sword: they can surface insights faster than any human analyst, but they can also exfiltrate sensitive data, run expensive scans, or be compromised. Static database credentials don't help — they're all-or-nothing, and revoking them breaks every session.
+
+waddling gives you:
+
+- **Per-agent ACL policies**: define exactly which tables, columns, and rows each agent may access. Policies are dynamic — change them live without restarting anything.
+- **Instant revocation**: kill any agent's access in milliseconds via the dashboard or admin MCP server. The next query is denied before any rows are returned.
+- **Layered enforcement**: table-level access enforced by birdshot (a DuckDB C++ extension) in-process at the gateway; column projection and row limits enforced by the gateway query proxy; time windows enforced at session mint. No single layer can be bypassed without hitting another.
+- **Full audit**: every auth decision, query, grant, and revoke — durable, queryable, streamable to your dashboard.
+
+## Architecture overview
+
+```
+Agent DuckDB                waddling gateway             waddling control plane
+───────────────            ─────────────────────        ──────────────────────────
+ATTACH 'quack:…'  ──────▶  birdshot_authenticate()  ──▶  POST /api/cp/sessions
+                            birdshot_authorize()          (session JWT minted)
+SELECT …          ──────▶  column-proxy rewrite      ──▶  audit_event written
+                            LIMIT injection
+results           ◀──────  gateway streams rows           usage_event written
+```
+
+The agent **never sees lake credentials**. It receives a short-lived RS256 session JWT that grants only the access its ACL rules allow.
+
+## Key concepts
+
+| Concept | What it is |
+|---------|-----------|
+| **Endpoint** | A DuckLake bound to a waddling-managed DuckDB gateway. Each endpoint has a `quack:` address your agents ATTACH to. |
+| **Agent** | A machine principal (not a human). Holds an API key, receives per-agent ACL grants, appears in the audit log. |
+| **ACL rule** | A policy row: `(endpoint, agent, schema, table, columns[], verb, effect, row_limit, window, ttl)`. The policy compiler turns active rules into birdshot grants. |
+| **Session** | A live ATTACH connection. Backed by a short-lived RS256 JWT (15 min default, 1 hour max). Revocable instantly via the denylist. |
+| **birdshot** | A DuckDB C++ extension that enforces table-level read/write access and maintains an in-memory denylist for instant revocation. Runs inside the gateway process. |
+
+## Next steps
+
+- [Quickstart](/docs/quickstart) — sign up, create your first endpoint, connect an agent
+- [ACL model](/docs/acl-model) — understand layered enforcement
+- [MCP tools](/docs/mcp-tools) — all 18 governed tools for agents and admins
+- [Security](/docs/security) — token model, audit, birdshot boundaries

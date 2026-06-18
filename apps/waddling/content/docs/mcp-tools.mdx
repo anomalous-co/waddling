@@ -1,0 +1,577 @@
+---
+title: MCP tools reference
+description: All 18 waddling MCP tools — 8 data-plane tools for analytics agents and 10 admin tools for ops agents. Params, return shapes, and example structured errors.
+---
+
+# MCP tools reference
+
+waddling exposes **18 tools** across two MCP servers: the external server (`@waddling/mcp`) for analytics agents, and the internal server (`@waddling/mcp-admin`) for admin / ops agents.
+
+All tools are verb-first and namespaced. Every error is structured and actionable.
+
+---
+
+## External MCP — data plane (`@waddling/mcp`)
+
+For analytics agents. Auth via `WADDLING_API_KEY` env var (`sk_agent_…`).
+
+### `waddling_list_endpoints`
+
+List analytics endpoints this API key can access.
+
+**Params:** `{}`
+
+**Returns:**
+```json
+[
+  { "id": "ep_xxxx", "name": "prod-lake", "slug": "prod-lake", "status": "running", "schemas": ["sales", "marketing"] }
+]
+```
+
+**Use:** first call an agent makes to orient itself. Returns only endpoints the agent's org owns and the agent has at least one grant on.
+
+---
+
+### `waddling_describe`
+
+Catalog discovery scoped to what this agent may see.
+
+**Params:**
+```json
+{
+  "endpoint_id": "ep_xxxx",
+  "schema": "sales",         // optional — omit to list all visible schemas
+  "table": "orders"          // optional — omit to list all visible tables in schema
+}
+```
+
+**Returns:**
+```json
+{
+  "endpoint_id": "ep_xxxx",
+  "schema": "sales",
+  "table": "orders",
+  "columns": [
+    { "name": "id", "type": "VARCHAR" },
+    { "name": "customer_id", "type": "VARCHAR" },
+    { "name": "amount", "type": "DECIMAL(12,2)" },
+    { "name": "region", "type": "VARCHAR" },
+    { "name": "created_at", "type": "TIMESTAMP" }
+  ],
+  "row_estimate": 1240000
+}
+```
+
+**Note:** columns not in the agent's `columns[]` allow-list are **filtered out of the response** — the agent cannot even learn ungranted column names.
+
+---
+
+### `waddling_connect`
+
+Open a governed session. Returns the literal `ATTACH` SQL the agent runs in its own DuckDB.
+
+**Params:**
+```json
+{ "endpoint_id": "ep_xxxx" }
+```
+
+**Returns:**
+```json
+{
+  "session_id": "sess_xxxx",
+  "attach_sql": "ATTACH 'quack:gw.getwaddling.com:9500' AS lake (TOKEN 'eyJ...', DISABLE_SSL false)",
+  "session_jwt": "eyJ...",
+  "endpoint": { "host": "gw.getwaddling.com", "port": 9500 },
+  "ttl_seconds": 900,
+  "granted": {
+    "tables": [
+      { "schema": "sales", "table": "orders", "verbs": ["read"] },
+      { "schema": "sales", "table": "customers", "verbs": ["read"], "columns": ["id", "name"], "rowLimit": 10000 }
+    ]
+  }
+}
+```
+
+The `attach_sql` is ready to copy-paste or execute directly. The session JWT encodes `id=agent:<agent_id>`, `aud=gw:<endpoint_id>`, and a 15-minute `exp`.
+
+**Error — no active grants:**
+```json
+{
+  "error": "no_grants",
+  "message": "Agent agt_xxxx has no active ACL rules on endpoint ep_xxxx. Contact your admin.",
+  "endpoint_id": "ep_xxxx",
+  "agent_id": "agt_xxxx"
+}
+```
+
+---
+
+### `waddling_query`
+
+Run a governed read or write through the gateway.
+
+**Params:**
+```json
+{
+  "session_id": "sess_xxxx",
+  "sql": "SELECT id, name FROM lake.sales.customers WHERE region = 'EMEA' LIMIT 100"
+}
+```
+
+**Returns:**
+```json
+{
+  "columns": ["id", "name"],
+  "rows": [
+    ["cust_001", "Acme GmbH"],
+    ["cust_002", "WidgetCo"]
+  ],
+  "row_count": 2,
+  "truncated": false,
+  "snapshot_version": 42
+}
+```
+
+**Error — column denied:**
+```json
+{
+  "error": "authorization_denied",
+  "table": "sales.customers",
+  "reason": "column ssn not in allow-list",
+  "allowed_columns": ["id", "name"],
+  "suggestion": "Remove ssn from your SELECT or ask your admin to expand the allow-list."
+}
+```
+
+**Error — table denied:**
+```json
+{
+  "error": "authorization_denied",
+  "table": "sales.payments",
+  "reason": "no grant for table sales.payments",
+  "suggestion": "Ask your admin to create an ACL rule for this table."
+}
+```
+
+**Error — session expired:**
+```json
+{
+  "error": "session_expired",
+  "session_id": "sess_xxxx",
+  "suggestion": "Call waddling_connect to get a new session."
+}
+```
+
+---
+
+### `waddling_explain`
+
+Dry-run: returns the access decision and would-be row estimate **without executing the query or writing an audit event**.
+
+**Params:**
+```json
+{
+  "session_id": "sess_xxxx",
+  "sql": "SELECT ssn FROM lake.sales.customers"
+}
+```
+
+**Returns:**
+```json
+{
+  "decision": "deny",
+  "reason": "column ssn not in allow-list for sales.customers",
+  "allowed_columns": ["id", "name"],
+  "estimated_rows": null
+}
+```
+
+```json
+{
+  "decision": "allow",
+  "estimated_rows": 1240000,
+  "clamped_to_row_limit": 10000,
+  "note": "result will be clamped to row_limit=10000 by gateway proxy"
+}
+```
+
+**Use:** lets agents verify access before acting, reducing noisy denials in the audit log.
+
+---
+
+### `waddling_time_travel`
+
+Read a DuckLake snapshot at a specific version or timestamp.
+
+**Params:**
+```json
+{
+  "session_id": "sess_xxxx",
+  "table": "lake.sales.orders",
+  "at_version": 39,           // optional — DuckLake version number
+  "at_timestamp": null        // optional — ISO 8601 timestamp; use one or the other
+}
+```
+
+**Returns:**
+Same shape as `waddling_query` — columns, rows, row_count, truncated, snapshot_version (the version you read).
+
+Translates to DuckDB `AT (VERSION=>39)` / `AT (TIMESTAMP=>'...')` syntax — ACL rules still apply at the historical snapshot.
+
+---
+
+### `waddling_whoami`
+
+Returns the agent's identity, active grants, remaining TTL, and rate-limit headroom.
+
+**Params:**
+```json
+{ "session_id": "sess_xxxx" }
+```
+*(session_id is optional — omitting it returns org/agent identity without session details)*
+
+**Returns:**
+```json
+{
+  "agent_id": "agt_xxxx",
+  "agent_name": "analyst",
+  "org_id": "org_xxxx",
+  "org_name": "acme",
+  "status": "active",
+  "grants": [
+    { "schema": "sales", "table": "orders", "verbs": ["read"] },
+    { "schema": "sales", "table": "customers", "verbs": ["read"], "columns": ["id", "name"], "rowLimit": 10000 }
+  ],
+  "session": {
+    "session_id": "sess_xxxx",
+    "ttl_remaining_seconds": 712,
+    "endpoint": { "host": "gw.getwaddling.com", "port": 9500 }
+  },
+  "rate_limit": {
+    "queries_used_1m": 3,
+    "queries_limit_1m": 60
+  }
+}
+```
+
+**Use:** agents call this to orient themselves before starting a task. Reduces wasted queries against denied tables.
+
+---
+
+### `waddling_install_extension`
+
+Returns the one-liner to install the birdshot extension for local governed DuckDB use.
+
+**Params:** `{}`
+
+**Returns:**
+```json
+{
+  "install_sql": "SET allow_unsigned_extensions = true;\nINSTALL birdshot FROM 'https://ext.getwaddling.com';\nLOAD birdshot;",
+  "platform_note": "birdshot is available for linux_amd64, linux_arm64, osx_arm64, osx_amd64, windows_amd64. Matches DuckDB v1.5.3.",
+  "note": "Most users don't need this — birdshot runs server-side on the waddling gateway. This is for self-hosted or edge deployments."
+}
+```
+
+---
+
+## Internal MCP — admin plane (`@waddling/mcp-admin`)
+
+For admin / ops agents. Auth via `WADDLING_ADMIN_TOKEN` env var. Pro plan required for dynamic ACL tools; all tools require at least Pro for `admin_mcp`.
+
+### `waddling_admin_list_agents`
+
+List all agents in the org with their last-seen time, default role, and API key status.
+
+**Params:**
+```json
+{
+  "org_id": "org_xxxx",  // optional — defaults to the authed org
+  "status": "active"     // optional — "active" | "suspended" | "revoked"
+}
+```
+
+**Returns:**
+```json
+[
+  {
+    "id": "agt_xxxx", "name": "analyst",
+    "status": "active", "default_role": "reader",
+    "last_seen_at": "2026-06-12T14:23:01Z",
+    "api_key_status": "active"
+  }
+]
+```
+
+---
+
+### `waddling_admin_list_sessions`
+
+List live and recent agent sessions.
+
+**Params:**
+```json
+{
+  "org_id": "org_xxxx",
+  "agent_id": "agt_xxxx",  // optional
+  "status": "active"       // optional — "active" | "expired" | "revoked" | "killed"
+}
+```
+
+**Returns:**
+```json
+[
+  {
+    "id": "sess_xxxx",
+    "agent_id": "agt_xxxx", "agent_name": "analyst",
+    "endpoint_id": "ep_xxxx", "endpoint_name": "prod-lake",
+    "status": "active",
+    "started_at": "2026-06-12T14:23:01Z",
+    "expires_at": "2026-06-12T14:38:01Z",
+    "granted_roles": ["agent_analyst"],
+    "ip": "10.0.1.44"
+  }
+]
+```
+
+---
+
+### `waddling_admin_grant`
+
+Create an ACL rule and immediately trigger a policy recompile + birdshot snapshot push.
+
+**Params:**
+```json
+{
+  "endpoint_id": "ep_xxxx",
+  "agent_id": "agt_xxxx",
+  "schema": "sales",
+  "table": "customers",
+  "columns": ["id", "name", "email"],  // optional — omit for all columns
+  "verb": "read",
+  "effect": "allow",                   // optional, default "allow"
+  "row_limit": 5000,                   // optional
+  "ttl_seconds": 3600,                 // optional — rule auto-expires
+  "window": { "start": "09:00", "end": "18:00" },  // optional — UTC time window
+  "not_before": "2026-06-12T09:00:00Z" // optional
+}
+```
+
+**Returns:**
+```json
+{
+  "rule_id": "rule_xxxx",
+  "compiled_grants": [
+    { "role": "agent_analyst", "table_ref": "sales.customers", "action": "read" }
+  ],
+  "snapshot_pushed": true,
+  "effective_at": "2026-06-12T14:23:45Z"
+}
+```
+
+**Error — plan gate:**
+```json
+{
+  "error": "upgrade_required",
+  "feature": "dynamic_acl",
+  "message": "Dynamic ACL rules require the Pro plan. Upgrade at https://app.getwaddling.com/billing.",
+  "current_plan": "free"
+}
+```
+
+---
+
+### `waddling_admin_revoke_rule`
+
+Delete an ACL rule and recompile the policy.
+
+**Params:**
+```json
+{ "rule_id": "rule_xxxx" }
+```
+
+**Returns:**
+```json
+{
+  "ok": true,
+  "rule_id": "rule_xxxx",
+  "snapshot_pushed": true,
+  "affected_agents": ["agt_xxxx"]
+}
+```
+
+---
+
+### `waddling_admin_revoke_agent`
+
+Instant kill — adds the agent to birdshot's in-memory denylist across all active sessions. The next query is denied before any rows are returned.
+
+**Params:**
+```json
+{
+  "agent_id": "agt_xxxx",
+  "reason": "off-hours suspicious activity",
+  "expires_seconds": 3600  // optional — revocation auto-expires; null = permanent
+}
+```
+
+**Returns:**
+```json
+{
+  "ok": true,
+  "agent_id": "agt_xxxx",
+  "sessions_killed": 2,
+  "denylist_entry": { "expires_at": "2026-06-12T15:23:01Z" },
+  "audit_event_id": 100042
+}
+```
+
+---
+
+### `waddling_admin_kill_session`
+
+Revoke a single session's JWT (`jti` added to denylist) and mark it `killed`.
+
+**Params:**
+```json
+{
+  "session_id": "sess_xxxx",
+  "reason": "manual kill by operator"
+}
+```
+
+**Returns:**
+```json
+{
+  "ok": true,
+  "session_id": "sess_xxxx",
+  "status": "killed",
+  "audit_event_id": 100043
+}
+```
+
+---
+
+### `waddling_admin_audit`
+
+Query the durable audit log.
+
+**Params:**
+```json
+{
+  "org_id": "org_xxxx",
+  "agent_id": "agt_xxxx",   // optional
+  "since": "2026-06-12T00:00:00Z",  // optional ISO 8601
+  "decision": "deny",        // optional — "allow" | "deny"
+  "limit": 100               // optional, default 100, max 1000
+}
+```
+
+**Returns:**
+```json
+[
+  {
+    "id": 100041,
+    "ts": "2026-06-12T14:23:03Z",
+    "source": "gateway",
+    "event": "authorize",
+    "agent_id": "agt_xxxx",
+    "session_id": "sess_xxxx",
+    "endpoint_id": "ep_xxxx",
+    "decision": "deny",
+    "reason": "column ssn not in allow-list",
+    "query": "SELECT ssn FROM sales.customers",
+    "actor": null
+  }
+]
+```
+
+---
+
+### `waddling_admin_usage`
+
+Usage rollups: queries, rows/bytes scanned, active sessions, cost estimate vs plan.
+
+**Params:**
+```json
+{
+  "org_id": "org_xxxx",
+  "agent_id": "agt_xxxx",  // optional
+  "period": "7d"           // optional — "1d" | "7d" | "30d" | "mtd"
+}
+```
+
+**Returns:**
+```json
+{
+  "period": "7d",
+  "queries": 4821,
+  "rows_scanned": 12400000,
+  "bytes_scanned": 890000000,
+  "active_sessions_now": 2,
+  "agents_active": 1,
+  "plan": "pro",
+  "plan_limits": { "endpoints": 5, "agents": 25 }
+}
+```
+
+---
+
+### `waddling_admin_endpoint_status`
+
+Gateway health: birdshot status + DuckLake snapshot lag.
+
+**Params:**
+```json
+{ "endpoint_id": "ep_xxxx" }  // optional — omit for all org endpoints
+```
+
+**Returns:**
+```json
+{
+  "endpoint_id": "ep_xxxx",
+  "endpoint_name": "prod-lake",
+  "status": "running",
+  "gateway": {
+    "auth_mode": "rs256",
+    "policy_roles": 2,
+    "policy_grants": 3,
+    "active_sessions": 2,
+    "audit_ring_depth": 1024,
+    "birdshot_version": "0.1.0"
+  },
+  "ducklake": {
+    "snapshot_version": 42,
+    "snapshot_lag_seconds": 4,
+    "catalog_reachable": true
+  }
+}
+```
+
+---
+
+### `waddling_admin_provision_endpoint`
+
+Spin up a new dedicated endpoint (Enterprise plan).
+
+**Params:**
+```json
+{
+  "org_id": "org_xxxx",
+  "name": "analytics-eu",
+  "data_path": "s3://acme-lake-eu/",  // optional — auto-provisioned on Enterprise
+  "region": "eu-west-1"               // optional, default "auto"
+}
+```
+
+**Returns:**
+```json
+{
+  "endpoint_id": "ep_yyyy",
+  "name": "analytics-eu",
+  "status": "provisioning",
+  "estimated_ready_seconds": 45,
+  "gateway_host": "gw-analytics-eu.getwaddling.com",
+  "quack_port": 9501
+}
+```

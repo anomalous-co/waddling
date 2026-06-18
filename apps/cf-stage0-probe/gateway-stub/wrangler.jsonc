@@ -1,0 +1,8 @@
+{
+  // Trivial allowlisted-gateway stand-in for Stage 0 probe #1. Throwaway.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-stage0-gateway-stub",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-01",
+  "workers_dev": true
+}

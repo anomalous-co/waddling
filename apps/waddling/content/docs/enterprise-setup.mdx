@@ -1,0 +1,147 @@
+---
+title: Enterprise setup
+description: Provision a dedicated R2 bucket and DuckLake catalog, configure isolated gateways, set up SSO, and understand the network topology for Enterprise customers.
+---
+
+# Enterprise setup
+
+Enterprise customers get **dedicated, isolated infrastructure**: your own DuckDB gateway processes, your own R2 bucket, and a 1-year audit trail. This guide walks through the full provisioning flow.
+
+## Prerequisites
+
+- An Enterprise waddling subscription (contact [enterprise@getwaddling.com](mailto:enterprise@getwaddling.com) to activate)
+- Admin access to your Cloudflare account (for R2 bucket creation, if self-provisioning)
+- A Postgres 16 instance reachable from waddling's gateway network (or use our managed Postgres)
+
+## 1. Provision a dedicated R2 bucket
+
+**Option A — waddling-provisioned (recommended):** We create a Cloudflare R2 bucket scoped to your org. You receive a pair of R2 credentials (access key + secret) with read/write access to `s3://waddling-<org>/`. You never share these credentials with agents — the gateway uses them internally.
+
+**Option B — bring your own:** Create a Cloudflare R2 bucket in your Cloudflare account:
+
+1. Cloudflare dashboard → R2 → Create bucket → name it `<your-org>-lake`.
+2. Create an API token with Object Read & Write on this bucket.
+3. Note the bucket URL: `https://<account_id>.r2.cloudflarestorage.com/<bucket-name>` (S3-compatible endpoint).
+
+In both cases, you'll provide waddling with the `data_path` (`s3://<bucket>/<prefix>/`) and the R2 credentials when creating the endpoint.
+
+## 2. Set up the DuckLake catalog (Postgres)
+
+DuckLake uses a Postgres schema to store catalog metadata (table versions, snapshot manifests, column stats). Provide a Postgres 16 DSN with a dedicated schema:
+
+```
+postgres://waddling_app:<password>@<host>:5432/ducklake?search_path=ducklake_catalog
+```
+
+The user needs `CREATE` rights on the target schema. DuckLake auto-creates its catalog tables on first `ATTACH`.
+
+**Option A — managed by waddling:** We provision a schema on our multi-tenant Postgres with row-level isolation. Your gateway credentials access only your schema.
+
+**Option B — your own Postgres:** Provide a DSN pointing to your own Postgres 16 instance. Must be reachable from `gateway.getwaddling.com` network (add a firewall allowlist if needed; contact support for the gateway CIDR).
+
+## 3. Create a dedicated endpoint
+
+In the dashboard → **Endpoints** → **New endpoint**, or via the admin MCP:
+
+```json
+// tool: waddling_admin_provision_endpoint
+{
+  "org_id": "org_xxxx",
+  "name": "prod-lake",
+  "data_path": "s3://acme-lake/lakehouse/",
+  "region": "auto"
+}
+```
+
+This spins up your isolated gateway process at `gw-prod-lake.getwaddling.com:9500`. The gateway:
+
+1. Loads the birdshot extension (`LOAD birdshot`)
+2. Sets auth mode: `birdshot_set_auth(issuer='https://app.getwaddling.com', audience='gw:<endpoint_id>', mode='rs256')`
+3. Fetches your org's RS256 public key from `/api/auth/jwks`
+4. ATTACHes DuckLake: `ATTACH 'ducklake:postgres://<catalog_dsn>' AS lake (DATA_PATH 's3://acme-lake/lakehouse/', SECRET ...)`
+
+Provisioning typically completes in under 60 seconds. Status moves: `provisioning` → `running`.
+
+## 4. Configure SSO / SAML (optional but recommended)
+
+In the dashboard → **Settings** → **SSO**:
+
+| Provider | Notes |
+|----------|-------|
+| Okta | SAML 2.0; provide entity ID + SSO URL + x509 cert |
+| Azure AD | SAML 2.0; use the waddling enterprise app template |
+| Google Workspace | SAML 2.0; configure via Google Admin console |
+| Any SAML 2.0 | Use the generic SAML configuration form |
+
+After SSO is configured:
+- Dashboard login redirects to your IdP.
+- SCIM provisioning (optional) auto-creates org members from your IdP directory.
+- Agents still use API keys — SSO only applies to human admin accounts.
+
+## 5. Network topology
+
+```
+Your org's network
+    │
+    │  firewall allowlist: gw-<slug>.getwaddling.com
+    │
+    ▼
+waddling gateway (dedicated per endpoint)
+    gw-<slug>.getwaddling.com:9500 (quack)
+    gw-<slug>.getwaddling.com:9510 (ctrl, internal only)
+    │
+    ├── birdshot (in-process C++ extension)
+    ├── DuckLake ATTACH → your Postgres (catalog DSN)
+    └── DuckLake data → your R2 bucket (DATA_PATH)
+
+Control plane
+    app.getwaddling.com:443 (HTTPS)
+    → API keys, session minting, ACL rule storage, audit
+    → Postgres: auth schema (Better Auth) + waddling schema
+```
+
+**Firewall notes:**
+- Agents ATTACH to `gw-<slug>.getwaddling.com:9500` (quack TCP). Allow this outbound from your agent network.
+- The control-plane REST API is at `app.getwaddling.com:443` (HTTPS). The MCP server needs this for session minting.
+- If you bring your own Postgres catalog, allow inbound from `gateway.getwaddling.com` CIDRs (contact support).
+
+## 6. Verify the setup
+
+From the dashboard → **Endpoints** → select your endpoint → **Gateway status**:
+
+```json
+{
+  "status": "running",
+  "gateway": {
+    "auth_mode": "rs256",
+    "policy_roles": 0,
+    "policy_grants": 0,
+    "active_sessions": 0,
+    "birdshot_version": "0.1.0"
+  },
+  "ducklake": {
+    "snapshot_version": 0,
+    "catalog_reachable": true
+  }
+}
+```
+
+Or via admin MCP:
+```json
+// tool: waddling_admin_endpoint_status
+{ "endpoint_id": "ep_xxxx" }
+```
+
+## 7. Encrypted lake storage
+
+By default, R2 encrypts data at rest using Cloudflare-managed keys. Enterprise customers can request **customer-managed keys (BYOK)** via Cloudflare R2 + KMS integration. Contact [enterprise@getwaddling.com](mailto:enterprise@getwaddling.com) to enable BYOK.
+
+The `encrypted: true` flag on the endpoint record indicates that the `catalog_dsn` and `data_path` credentials are encrypted at rest in waddling's Postgres using application-level encryption (AES-256-GCM, key stored in env).
+
+## SLA and support
+
+Enterprise customers have a **99.9% monthly uptime SLA** on gateway availability (quack + control plane). Incidents escalate to a named engineer within 1 business hour.
+
+Your dedicated support channel (Slack Connect or email) is set up during onboarding. Architecture reviews are available for the initial lakehouse and agent fleet setup.
+
+For billing, plan changes, or SLA questions: [enterprise@getwaddling.com](mailto:enterprise@getwaddling.com).

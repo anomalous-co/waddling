@@ -1,0 +1,24 @@
+{
+  "name": "@pglite-sandbox/db",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "boot": "node --experimental-strip-types src/boot.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.5.3-r.3",
+    "@electric-sql/pglite": "^0.5.2",
+    "@electric-sql/pglite-socket": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

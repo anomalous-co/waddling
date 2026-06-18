@@ -1,0 +1,60 @@
+---
+title: Telemetry
+description: What waddling collects, what it never touches, and how to opt out — honest and short.
+---
+
+# Telemetry
+
+waddling CLIs and MCP servers send anonymous usage events to help us understand onboarding drop-off, diagnose common errors, and prioritize features. This page tells you exactly what is captured and what is not.
+
+## What we collect
+
+We collect product-level events — things like "onboarding started", "first query executed", "denial hit", "upgrade viewed". Each event includes:
+
+- A **device ID** (`device:<uuid>`) generated locally and stored at `~/.waddling/device.json`. This is a random UUID — not tied to your name, email, or machine fingerprint.
+- **After signup**, the device ID is aliased to your user ID and events include your user ID and org ID.
+- **Event metadata** — timing, the name of the MCP tool called, whether a query was allowed or denied, and similar product-level signals.
+- For org-scoped events: `{ organization: orgId }` as a group property, so we can understand usage at the org level.
+
+**Canonical event taxonomy** (these are the exact names used, server and client):
+
+| Category | Events |
+|----------|--------|
+| Acquisition | `plugin_installed`, `mcp_onboarding_started` |
+| Device-code flow | `device_link_created`, `device_link_claimed`, `signup_completed` |
+| Provisioning | `org_created`, `endpoint_created`, `agent_created` |
+| Data plane | `mcp_connect`, `first_query` (set once per person), `query_executed`, `denial_hit` |
+| Conversion | `upgrade_viewed`, `checkout_started`, `checkout_completed` |
+| Admin | `agent_revoked` |
+
+## What we never capture
+
+- **SQL text** — query content is never sent. We record that a query was executed, not what it said.
+- **API keys, session JWTs, or tokens** of any kind.
+- **Email addresses in event properties.** Your email is stored on your account; it is not embedded in analytics events.
+- **Row data or query results.**
+- **File paths or local environment details.**
+
+## Identity model
+
+Before you sign up, your `distinct_id` is `device:<uuid>` — fully anonymous. At device-code claim and at web signup, we call `alias(device:<id>, userId)` followed by `identify(userId, {email})` so your person profile gains an email address. After that, events are identified by user ID, not the device UUID.
+
+## Opt out
+
+Set `WADDLING_TELEMETRY=0` in your environment before starting any waddling CLI or MCP server:
+
+```sh
+export WADDLING_TELEMETRY=0
+```
+
+Or add it to `.env.local` in your project. When this variable is set to `0`, no events are captured or sent — the PostHog client is never initialized.
+
+You can also opt out in the browser via your account settings at [app.getwaddling.com/settings](https://app.getwaddling.com/settings).
+
+## What we use it for
+
+- Measuring onboarding conversion (where do people drop off before first query?)
+- Detecting common denial patterns (are misconfigured ACL rules a frequent frustration?)
+- Deciding which plan features get built next (what does the Pro tier actually use?)
+
+We do not sell analytics data, share it with third parties, or use it for ad targeting.

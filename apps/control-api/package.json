@@ -1,0 +1,30 @@
+{
+  "name": "@waddling/control-api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Stage A connectivity-probe scaffold for the waddling control plane on Cloudflare Workers. Stage B ports the real control plane on top of this foundation.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@better-auth/api-key": "1.6.19",
+    "@better-auth/stripe": "1.6.19",
+    "aws4fetch": "^1.0.20",
+    "better-auth": "1.6.19",
+    "hono": "^4",
+    "jose": "^6",
+    "pg": "^8",
+    "stripe": "^18",
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4",
+    "@types/pg": "^8",
+    "typescript": "^5",
+    "wrangler": "^4.101.0"
+  }
+}

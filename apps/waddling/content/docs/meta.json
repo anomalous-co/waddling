@@ -1,0 +1,15 @@
+{
+  "title": "waddling",
+  "pages": [
+    "index",
+    "quickstart",
+    "acl-model",
+    "mcp-tools",
+    "security",
+    "enterprise-setup",
+    "extension-install",
+    "plugin",
+    "lakehouse-maintenance",
+    "telemetry"
+  ]
+}

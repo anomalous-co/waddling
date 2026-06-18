@@ -1,0 +1,21 @@
+{
+  // Standalone Workers tsconfig. We do NOT extend ../../tsconfig.base.json: the
+  // base sets declaration:true (we noEmit) and module:ESNext; this app mirrors the
+  // Stage 0 probe's Workers-appropriate config instead. `include` is scoped to src
+  // so the generated worker-configuration.d.ts at the app root is not double-compiled
+  // alongside @cloudflare/workers-types.
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2022"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.ts"]
+}

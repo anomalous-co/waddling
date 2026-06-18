@@ -1,0 +1,12 @@
+# Local dev overrides for `wrangler dev`. Copy to .dev.vars (gitignored) to use.
+#
+# IMPORTANT: local `wrangler dev` does NOT route through the real Hyperdrive proxy.
+# Setting the variable below points the local Hyperdrive binding at a Postgres you
+# can reach directly (e.g. a PlanetScale connection string or a local Postgres).
+# The AUTHORITATIVE /probe/db result is from the DEPLOYED Worker, not local dev.
+#
+# Binding name is HYPERDRIVE, hence the ..._HYPERDRIVE suffix.
+CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE=postgres://user:password@host:5432/dbname?sslmode=require
+
+# Secrets Store and R2 credentials are NOT settable here — they resolve from the
+# deployed Secrets Store binding. Run the deployed-Worker probes for those.

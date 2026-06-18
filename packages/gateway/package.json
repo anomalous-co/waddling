@@ -1,0 +1,24 @@
+{
+  "name": "@waddling/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@waddling/control-schema": "workspace:*",
+    "@duckdb/node-api": "1.5.3-r.3",
+    "jose": "^6",
+    "pg": "^8.21.0",
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/pg": "^8",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

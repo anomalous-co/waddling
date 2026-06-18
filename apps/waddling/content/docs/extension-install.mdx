@@ -1,0 +1,115 @@
+---
+title: Extension install
+description: Install the birdshot DuckDB extension from the waddling extension repository with a one-liner. For self-hosted and edge deployments.
+---
+
+# Extension install
+
+## Who needs this
+
+Most waddling users **never install birdshot directly** — it runs server-side on the waddling-managed gateway. Your agents connect via `ATTACH 'quack:…'` and birdshot enforces ACLs transparently.
+
+You need to install birdshot yourself if you are:
+
+- Running a **self-hosted waddling gateway** (not managed by waddling)
+- Building an **edge deployment** where a local DuckDB instance needs birdshot enforcement
+- **Evaluating** birdshot locally before deploying the full stack
+
+## One-liner install
+
+```sql
+SET allow_unsigned_extensions = true;
+INSTALL birdshot FROM 'https://ext.getwaddling.com';
+LOAD birdshot;
+```
+
+birdshot is a custom extension, so `allow_unsigned_extensions` is required. The extension is served over HTTPS from Cloudflare R2 (`waddling-ext` bucket, CDN at `ext.getwaddling.com`).
+
+## Supported platforms
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86-64 | `linux_amd64` |
+| Linux ARM64 (Graviton, Snapdragon) | `linux_arm64` |
+| macOS Apple Silicon | `osx_arm64` |
+| macOS Intel | `osx_amd64` |
+| Windows x86-64 | `windows_amd64` |
+
+All binaries match **DuckDB v1.5.3** (the version used by waddling gateways). If you are using a different DuckDB version, the install will fail with a version mismatch error — use `@duckdb/node-api@1.5.3-r.3` or the matching DuckDB CLI.
+
+## Repository layout
+
+The extension repository follows DuckDB's standard custom-repo spec:
+
+```
+https://ext.getwaddling.com/
+└── v1.5.3/
+    ├── linux_amd64/birdshot.duckdb_extension.gz
+    ├── linux_arm64/birdshot.duckdb_extension.gz
+    ├── osx_arm64/birdshot.duckdb_extension.gz
+    ├── osx_amd64/birdshot.duckdb_extension.gz
+    └── windows_amd64/birdshot.duckdb_extension.gz
+```
+
+Gzip-compressed binaries are served; DuckDB's `httpfs` auto-loads for HTTPS fetches.
+
+## Force re-install / upgrade
+
+```sql
+FORCE INSTALL birdshot FROM 'https://ext.getwaddling.com';
+LOAD birdshot;
+```
+
+## Install from the MCP tool
+
+If your agent runs a local governed DuckDB, call:
+
+```json
+// tool: waddling_install_extension
+{}
+```
+
+The server returns the install SQL and a platform-matched note.
+
+## Verify the install
+
+```sql
+SELECT extension_name, extension_version, installed_from
+FROM duckdb_extensions()
+WHERE extension_name = 'birdshot';
+```
+
+```
+┌────────────────┬───────────────────┬────────────────────────────────────┐
+│ extension_name │ extension_version │ installed_from                     │
+├────────────────┼───────────────────┼────────────────────────────────────┤
+│ birdshot       │ 0.1.0             │ https://ext.getwaddling.com            │
+└────────────────┴───────────────────┴────────────────────────────────────┘
+```
+
+## Node.js / Python usage
+
+**Node.js (`@duckdb/node-api`):**
+```typescript
+import { DuckDBInstance } from '@duckdb/node-api';
+
+const db = await DuckDBInstance.create(':memory:', {
+  allow_unsigned_extensions: 'true',
+});
+const conn = await db.connect();
+await conn.run("INSTALL birdshot FROM 'https://ext.getwaddling.com'");
+await conn.run("LOAD birdshot");
+```
+
+**Python (`duckdb`):**
+```python
+import duckdb
+
+conn = duckdb.connect(':memory:', config={'allow_unsigned_extensions': True})
+conn.execute("INSTALL birdshot FROM 'https://ext.getwaddling.com'")
+conn.execute("LOAD birdshot")
+```
+
+## Security note
+
+birdshot is an unsigned extension — it executes with full DuckDB process privileges. Only install from `https://ext.getwaddling.com` (the canonical waddling CDN). The source code is available in the waddling GitHub organization for audit.

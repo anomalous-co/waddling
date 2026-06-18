@@ -1,0 +1,115 @@
+---
+title: Lakehouse maintenance
+description: What waddling automates for your DuckLake — compaction, snapshot retention, orphan cleanup, and what enterprise customers can tune.
+---
+
+# Lakehouse maintenance
+
+DuckLake lakehouses accumulate small Parquet files, inlined row data, and old snapshots over time. Left unattended, this degrades query performance and inflates storage costs. waddling runs scheduled maintenance on every endpoint automatically — you do not need to run any SQL or schedule any jobs.
+
+## What waddling automates
+
+Maintenance runs are scheduled via Cloudflare Cron Triggers and executed through the gateway's control channel. Each run performs the following steps in order:
+
+### 1. Flush inlined data
+
+Small inserts (≤10 rows by default) are stored in the DuckLake catalog rather than as Parquet files. Flushing them converts inlined rows to proper Parquet objects on R2:
+
+```sql
+CALL ducklake_flush_inlined_data('lake');
+```
+
+### 2. Compact small files
+
+Many small Parquet files written by concurrent agents are merged into fewer, larger files. This improves scan performance and reduces R2 request overhead:
+
+```sql
+CALL ducklake_merge_adjacent_files('lake');
+```
+
+Compaction is non-destructive — existing snapshots remain valid and time travel continues to work across compacted files.
+
+### 3. Expire old snapshots
+
+Snapshots older than your plan's retention window are expired. Expiring a snapshot marks it eligible for physical deletion but does not yet delete data files:
+
+```sql
+CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL '<retention>');
+```
+
+Retention by plan:
+
+| Plan | Snapshot retention |
+|------|--------------------|
+| **Free** | 7 days |
+| **Pro** | 90 days |
+| **Enterprise** | 1 year (default) — configurable, see below |
+
+### 4. Delete orphaned files
+
+After snapshots are expired, R2 objects that are no longer referenced by any snapshot are deleted:
+
+```sql
+CALL ducklake_delete_orphaned_files('lake', cleanup_all => true);
+```
+
+Because waddling endpoints use Cloudflare R2, there is no egress charge for the read operations that identify orphaned files before deleting them.
+
+### 5. Catalog vacuum and statistics
+
+The DuckLake Postgres catalog is vacuumed and key tables are analyzed so the query planner has fresh statistics. Health metrics are computed — file count, average file size, snapshot count — and written to the endpoint's status record in the control plane. These appear in the dashboard **Endpoints → detail → Health** panel and are accessible via `waddling_admin_endpoint_status`.
+
+## Viewing maintenance status
+
+In the dashboard → **Endpoints** → endpoint detail → **Health** tab:
+
+- Last maintenance run timestamp
+- File count and average file size (pre/post compaction trend)
+- Snapshot count and oldest retained snapshot
+- Next scheduled run
+
+Via the admin MCP:
+
+```json
+// tool: waddling_admin_endpoint_status
+{ "endpoint_id": "ep_xxxx" }
+```
+
+Returns `maintenance_last_run`, `file_count`, `avg_file_size_bytes`, `snapshot_count`, and `snapshot_oldest_retained`.
+
+## Scheduling
+
+Maintenance jobs are triggered by Cloudflare Cron Triggers and routed through a Cloudflare Queue to the gateway's control channel. The queue provides back-pressure so a backlog of maintenance work does not block query traffic. Default schedule: nightly at 02:00 UTC per endpoint.
+
+## Enterprise tuning
+
+Enterprise plan customers can adjust maintenance parameters per endpoint via the admin MCP tool `waddling_admin_maintain_endpoint` (roadmap — W9):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `retention_days` | 365 | Snapshot retention window (minimum 7) |
+| `min_file_size_bytes` | 10 MB | Files smaller than this are merge candidates |
+| `max_file_size_bytes` | 512 MB | Target maximum after merge |
+| `schedule_cron` | `0 2 * * *` | Cron expression for maintenance window |
+| `dry_run` | false | Simulate without deleting — returns what would be affected |
+
+```json
+// tool: waddling_admin_maintain_endpoint (future W9)
+{
+  "endpoint_id": "ep_xxxx",
+  "retention_days": 730,
+  "dry_run": true
+}
+```
+
+Enterprise customers can also disable automatic maintenance entirely and run it on-demand — useful for lakehouses with strict change-control windows.
+
+## What waddling does NOT touch
+
+- **Your data** — compaction rewrites only fully-committed, non-inlined files. It never alters the logical content of any table.
+- **Active snapshots** — `ducklake_expire_snapshots` with a retention window never expires snapshots that are newer than the retention threshold.
+- **Encrypted lakehouses** — encryption keys stay in the DuckLake catalog; maintenance reads and writes Parquet transparently without ever exposing plaintext keys outside the gateway process.
+
+## Free-tier note
+
+Free tier endpoints run shared maintenance windows. Pro and Enterprise endpoints get isolated, dedicated maintenance runs with full visibility into run logs.

@@ -1,0 +1,25 @@
+{
+  "name": "@waddling/mcp-admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "waddling-mcp-admin": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@waddling/control-schema": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1",
+    "posthog-node": "^3.4.0",
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,164 @@
+---
+title: Claude Code plugin
+description: Install waddling via the Claude Code marketplace, walk through the /waddling:setup onboarding flow, bundle the MCP for Claude Desktop with .mcpb, and learn what the built-in agent can do.
+---
+
+# Claude Code plugin
+
+waddling ships a first-class Claude Code plugin that installs the external MCP server, drives device-code onboarding, and gives your agents the `/waddling:setup` skill — all without touching config files by hand.
+
+## Install via marketplace
+
+One command adds the waddling marketplace and installs the plugin:
+
+```sh
+/plugin marketplace add waddling/claude-plugins
+/plugin install waddling@waddling-plugins
+```
+
+Or pin a specific release:
+
+```sh
+/plugin install waddling@waddling-plugins --ref v0.1.0
+```
+
+**Team auto-registration** — commit `.claude/settings.json` to your repo and every developer gets the plugin on first `claude` launch:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "waddling-plugins": {
+      "source": { "source": "github", "repo": "waddling/claude-plugins" },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": { "waddling@waddling-plugins": true }
+}
+```
+
+## What the plugin bundles
+
+| Component | What it does |
+|-----------|-------------|
+| **MCP server** (`@waddling/mcp@latest`) | All §4a external MCP tools — connect, query, describe, time-travel, whoami, explain |
+| **`/waddling:setup` skill** | Device-code signup, endpoint discovery, first query walkthrough |
+| **Persistent state** | `~/.claude/plugins/data/waddling/state/` — device ID and obtained token survive plugin updates |
+
+The MCP server starts automatically via `npx -y @waddling/mcp@latest` with credentials from your user config (keychain-stored) or environment.
+
+## The /waddling:setup walkthrough
+
+Run `/waddling:setup` (or `/waddling:setup your@email.com`) to onboard:
+
+### Step 1 — Device-code signup
+
+The skill calls the `waddling_signup_start` MCP tool, which:
+
+1. Registers a device ID (`device:<uuid>`) stored at `~/.waddling/device.json`
+2. Returns a short **device code** and a verification URL
+
+```
+Your device code: DUCK-4F2A
+Verify at: https://app.getwaddling.com/link/DUCK-4F2A
+
+Waiting for you to complete signup in the browser...
+```
+
+### Step 2 — Browser signup
+
+Visit the URL, create your account (or sign in). The browser claims the device code and links it to your new user + org.
+
+### Step 3 — Token delivery
+
+The skill polls `waddling_signup_poll` every 5 seconds. Once you complete browser signup:
+
+- The device code is marked claimed
+- Your API key is returned to the CLI **once**, stored in the system keychain
+- The MCP server can now authenticate as your agent
+
+### Step 4 — Confirm connection
+
+```
+waddling_status confirms:
+  org:      acme
+  plan:     free
+  endpoints: 1 running (prod-lake)
+  agent:    analyst (reader)
+```
+
+You're connected. Proceed to `waddling_connect` and run your first query.
+
+> **No browser?** Use `WADDLING_API_KEY=sk_agent_…` as an environment variable instead. The skill detects a pre-set key and skips device-code flow.
+
+## MCP tools available to your agent
+
+Once connected, the agent has access to the full external tool surface:
+
+| Tool | What it does |
+|------|-------------|
+| `waddling_list_endpoints` | Discover accessible endpoints |
+| `waddling_describe` | Schema and column catalog, scoped to your grants |
+| `waddling_connect` | Open a session — returns the `ATTACH` SQL string |
+| `waddling_query` | Execute a governed read or write |
+| `waddling_explain` | Dry-run: access decision without executing |
+| `waddling_time_travel` | Read a DuckLake snapshot at a past version or timestamp |
+| `waddling_whoami` | Identity, active grants, remaining TTL, rate-limit headroom |
+| `waddling_install_extension` | Returns the birdshot one-liner for local governed DuckDB |
+
+Every denial is structured and actionable:
+
+```json
+{ "error": "authorization_denied", "table": "sales.customers", "reason": "column ssn not in allow-list" }
+```
+
+## Claude Desktop — .mcpb bundle
+
+For **Claude Desktop** (the consumer app at claude.ai), install the `.mcpb` bundle instead of the Claude Code plugin:
+
+```sh
+# Download and double-click, or:
+curl -L https://releases.getwaddling.com/waddling-latest.mcpb -o waddling.mcpb
+open waddling.mcpb
+```
+
+The bundle includes the MCP server runtime (Node.js is bundled with Claude Desktop), a minimal `manifest.json`, and an install-time UI for your API key. The device-code flow works identically — click **Connect with DuckBase** in the bundle's onboarding screen.
+
+### Manual config (Claude Desktop or any MCP host)
+
+If you prefer to configure manually without the plugin:
+
+```json
+{
+  "mcpServers": {
+    "waddling": {
+      "command": "npx",
+      "args": ["-y", "@waddling/mcp@latest"],
+      "env": {
+        "WADDLING_API_KEY": "sk_agent_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "WADDLING_URL": "https://app.getwaddling.com"
+      }
+    }
+  }
+}
+```
+
+For the `claude` CLI:
+
+```sh
+claude mcp add waddling -- npx -y @waddling/mcp@latest
+export WADDLING_API_KEY=sk_agent_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+## Keeping the plugin up to date
+
+```sh
+/plugin marketplace update waddling-plugins   # refresh catalog
+/plugin update waddling@waddling-plugins       # pull latest plugin
+/reload-plugins                                # apply in running session
+```
+
+With `"autoUpdate": true` in `extraKnownMarketplaces`, updates apply automatically at session start.
+
+## Telemetry
+
+The plugin and MCP server collect anonymous product analytics to help us improve onboarding and diagnose issues. No SQL, API keys, or personal data is captured. See the [telemetry page](/docs/telemetry) for exactly what is collected and how to opt out.

@@ -1,0 +1,10 @@
+{
+  "name": "cf-stagec-ws-probe-sidecar",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Workspace sidecar (Model B): isolated, encrypted, FIFO DuckDB process. Restores/persists its own encrypted .duckdb via DO-minted presigned R2 URLs (plain Node fetch). No birdshot (gateway-side), no S3 creds.",
+  "dependencies": {
+    "@duckdb/node-api": "1.5.3-r.3"
+  }
+}

@@ -1,0 +1,6 @@
+# Wrangler local state and generated artifacts
+.wrangler/
+.dev.vars
+
+# wrangler types output (regenerate with `wrangler types`)
+worker-configuration.d.ts
