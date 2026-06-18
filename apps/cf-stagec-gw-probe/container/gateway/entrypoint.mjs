@@ -57,42 +57,71 @@ async function main() {
   const dataDir = resolve(STATE_DIR, "data");
   mkdirSync(dataDir, { recursive: true });
 
-  // localData mode: file catalog + local data dir, NO object store / S3 secret —
-  // the no-Postgres/no-R2 path (packages/gateway/src/config.ts § localData).
+  // Boot config is injected as per-process env by the GatewayDO at startProcess. Two modes:
+  //   • REAL lake — the per-org Postgres catalog (DUCKLAKE_CATALOG_DSN) scoped to this
+  //     endpoint's own METADATA_SCHEMA, with s3:// data (DUCKLAKE_DATA_PATH + S3_* creds).
+  //     This is the production path: agent SQL hits real lake tables, gated by birdshot.
+  //   • SELFTEST/demo — no real catalog configured (or GW_SELFTEST_SEED=1): a local-file
+  //     DuckLake + local data dir, plus a seeded memory.main demo lake. Deterministic and
+  //     OFFLINE so the data plane /selftest stays a regression guard, not a live-infra test.
+  const seedDemo =
+    process.env.GW_SELFTEST_SEED === "1" ||
+    (!process.env.DUCKLAKE_CATALOG_DSN && !/^s3:\/\//i.test(process.env.DUCKLAKE_DATA_PATH ?? ""));
+
+  const localDataDir = dataDir.endsWith("/") ? dataDir : `${dataDir}/`;
+  const ducklakeDataPath = process.env.DUCKLAKE_DATA_PATH || localDataDir;
+
   const config = {
     birdshotExtensionPath: BIRDSHOT_EXT,
     quackPort: QUACK_PORT,
     serverToken: process.env.GW_SERVER_TOKEN ?? "gw-probe-server-token",
     ctrlPort: 0, // unused; the forwarder below IS the control surface
-    ducklakeCatalogDsn: "",
-    ducklakeCatalogFile: resolve(STATE_DIR, "lake.ducklake"),
-    ducklakeDataPath: dataDir.endsWith("/") ? dataDir : `${dataDir}/`,
-    localData: true,
-    lakeAlias: "lake",
-    encrypted: false,
-    s3: { endpoint: "", keyId: "", secret: "", region: "auto", useSsl: false, urlStyle: "path" },
+    // postgres catalog (real) vs local-file catalog (demo). seedDemo ⇒ a local file.
+    ducklakeCatalogDsn: process.env.DUCKLAKE_CATALOG_DSN ?? "",
+    ducklakeCatalogFile: seedDemo
+      ? process.env.DUCKLAKE_CATALOG_FILE || resolve(STATE_DIR, "lake.ducklake")
+      : process.env.DUCKLAKE_CATALOG_FILE ?? "",
+    ducklakeDataPath,
+    localData: !/^s3:\/\//i.test(ducklakeDataPath),
+    lakeAlias: process.env.DUCKLAKE_ALIAS || "lake",
+    // Per-endpoint isolation inside a shared org catalog (ignored for a local-file catalog).
+    metadataSchema: process.env.DUCKLAKE_METADATA_SCHEMA ?? "",
+    encrypted: /^(1|true|yes|on)$/i.test(process.env.DUCKLAKE_ENCRYPTED ?? ""),
+    s3: {
+      endpoint: process.env.S3_ENDPOINT ?? "",
+      keyId: process.env.S3_KEY_ID ?? "",
+      secret: process.env.S3_SECRET ?? "",
+      region: process.env.S3_REGION || "auto",
+      useSsl: /^(1|true|yes|on)$/i.test(process.env.S3_USE_SSL ?? ""),
+      urlStyle: process.env.S3_URL_STYLE === "vhost" ? "vhost" : "path",
+    },
   };
 
-  log(`booting gateway: quack:${QUACK_PORT}, lake catalog ${config.ducklakeCatalogFile}`);
+  const catalogDesc = config.ducklakeCatalogFile
+    ? `file:${config.ducklakeCatalogFile}`
+    : `postgres(schema=${config.metadataSchema || "main"})`;
+  log(`booting gateway: quack:${QUACK_PORT}, mode=${seedDemo ? "selftest-demo" : "real-lake"}, catalog=${catalogDesc}, dataPath=${config.ducklakeDataPath}`);
   const rt = await bootDuckRuntime(config);
   log("gateway booted — quack_serve up, birdshot hooks installed pre-serve");
 
-  // ── Seed the minimal lake AFTER boot (trusted control connection) ────────────
-  // Seed in memory.main — the PROVEN federation placement (birdshot.e2e.ts:147-164
-  // + the Rivet PoC seedDemo). quack serves a federated scan on a connection that
-  // defaults to memory.main, so the bare table ref quack pushes down MUST be
-  // resolvable unqualified there. (Seeding in the ducklake fails: birdshot allows
-  // the scan but quack's serving connection can't resolve bare `orders` against the
-  // lake catalog → "Table orders does not exist".) The matching birdshot lake
-  // catalog is therefore 'memory' (set on the snapshot push below), and the grant
-  // is `main.orders`. orders -> ALLOWED; secrets -> FORBIDDEN (no grant).
-  await rt.run("CREATE TABLE IF NOT EXISTS memory.main.orders  (id INTEGER, total INTEGER)");
-  await rt.run("CREATE TABLE IF NOT EXISTS memory.main.secrets (id INTEGER, ssn VARCHAR)");
-  await rt.run("DELETE FROM memory.main.orders");
-  await rt.run("DELETE FROM memory.main.secrets");
-  await rt.run("INSERT INTO memory.main.orders  VALUES (1,100),(2,250),(3,9000)");
-  await rt.run("INSERT INTO memory.main.secrets VALUES (1,'111-22-3333'),(2,'444-55-6666')");
-  log("seeded memory.main.orders (allowed) + memory.main.secrets (forbidden)");
+  if (seedDemo) {
+    // ── Seed the minimal demo lake AFTER boot (trusted control connection) ────────
+    // Seed in memory.main — the PROVEN federation placement (birdshot.e2e.ts:147-164
+    // + the Rivet PoC seedDemo). quack serves a federated scan on a connection that
+    // defaults to memory.main, so the bare table ref quack pushes down MUST be
+    // resolvable unqualified there. (Seeding in the ducklake fails: birdshot allows
+    // the scan but quack's serving connection can't resolve bare `orders` against the
+    // lake catalog → "Table orders does not exist".) The matching birdshot lake
+    // catalog is therefore 'memory' (set on the snapshot push below), and the grant
+    // is `main.orders`. orders -> ALLOWED; secrets -> FORBIDDEN (no grant).
+    await rt.run("CREATE TABLE IF NOT EXISTS memory.main.orders  (id INTEGER, total INTEGER)");
+    await rt.run("CREATE TABLE IF NOT EXISTS memory.main.secrets (id INTEGER, ssn VARCHAR)");
+    await rt.run("DELETE FROM memory.main.orders");
+    await rt.run("DELETE FROM memory.main.secrets");
+    await rt.run("INSERT INTO memory.main.orders  VALUES (1,100),(2,250),(3,9000)");
+    await rt.run("INSERT INTO memory.main.secrets VALUES (1,'111-22-3333'),(2,'444-55-6666')");
+    log("seeded memory.main.orders (allowed) + memory.main.secrets (forbidden)");
+  }
 
   // ── In-container quack CLIENT ────────────────────────────────────────────────
   // workerd has no DuckDB, so the agent's quack client CANNOT live in the Worker.

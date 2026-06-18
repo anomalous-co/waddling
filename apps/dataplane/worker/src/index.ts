@@ -125,8 +125,50 @@ async function withBootRetry<T>(fn: () => Promise<T>, label: string, tries = 15,
 // ── SDK handle shapes ──────────────────────────────────────────────────────────
 interface GatewayHandle {
   exec(cmd: string): Promise<{ stdout: string }>;
-  startProcess(cmd: string, opts?: { cwd?: string }): Promise<unknown>;
+  startProcess(cmd: string, opts?: { cwd?: string; env?: Record<string, string> }): Promise<unknown>;
   containerFetch(url: string, init: RequestInit, port?: number): Promise<Response>;
+}
+
+// Per-endpoint gateway boot config (the trusted side — it holds the lake creds). Sent by
+// control-api on /gw/snapshot, translated to per-process env injected at startProcess so
+// the entrypoint's loadGatewayConfig-shaped reader boots the REAL lake instead of the
+// offline demo. Absent ⇒ the entrypoint falls back to the deterministic selftest seed.
+interface GatewayBoot {
+  serverToken?: string;
+  catalogDsn?: string;        // postgres catalog DSN (real lake)
+  catalogFile?: string;       // local-file catalog (demo/selftest)
+  dataPath?: string;          // 's3://bucket/prefix/' (real) or a local dir
+  metadataSchema?: string;    // per-endpoint isolation inside a shared org catalog
+  alias?: string;             // lake ATTACH alias (default 'lake')
+  encrypted?: boolean;
+  s3?: {
+    endpoint?: string; keyId?: string; secret?: string;
+    region?: string; useSsl?: boolean; urlStyle?: 'path' | 'vhost';
+  };
+}
+
+/** Translate a GatewayBoot descriptor into the entrypoint's per-process env. Only set keys
+ *  that are present — the entrypoint supplies sane defaults and the selftest fallback. */
+function bootEnvFromConfig(boot?: GatewayBoot): Record<string, string> | undefined {
+  if (!boot) return undefined;
+  const env: Record<string, string> = {};
+  const set = (k: string, v: unknown) => { if (v !== undefined && v !== null && v !== '') env[k] = String(v); };
+  set('GW_SERVER_TOKEN', boot.serverToken);
+  set('DUCKLAKE_CATALOG_DSN', boot.catalogDsn);
+  set('DUCKLAKE_CATALOG_FILE', boot.catalogFile);
+  set('DUCKLAKE_DATA_PATH', boot.dataPath);
+  set('DUCKLAKE_METADATA_SCHEMA', boot.metadataSchema);
+  set('DUCKLAKE_ALIAS', boot.alias);
+  if (boot.encrypted) env.DUCKLAKE_ENCRYPTED = 'true';
+  if (boot.s3) {
+    set('S3_ENDPOINT', boot.s3.endpoint);
+    set('S3_KEY_ID', boot.s3.keyId);
+    set('S3_SECRET', boot.s3.secret);
+    set('S3_REGION', boot.s3.region);
+    if (boot.s3.useSsl !== undefined) env.S3_USE_SSL = boot.s3.useSsl ? 'true' : 'false';
+    set('S3_URL_STYLE', boot.s3.urlStyle);
+  }
+  return env;
 }
 interface WsHandle {
   exec(cmd: string): Promise<{ stdout: string; stderr?: string }>;
@@ -138,11 +180,14 @@ interface WsHandle {
 }
 
 // ── gateway helpers ────────────────────────────────────────────────────────────
-async function ensureGateway(gw: GatewayHandle): Promise<{ waitedMs: number }> {
+async function ensureGateway(gw: GatewayHandle, bootEnv?: Record<string, string>): Promise<{ waitedMs: number }> {
   const marker = await withBootRetry(() => gw.exec("test -f /tmp/gw-started && echo yes || echo no"), "gw warmup");
   if (marker.stdout.trim() !== "yes") {
     await gw.exec("touch /tmp/gw-started");
-    await gw.startProcess(BOOT_CMD, { cwd: GW_DIR });
+    // bootEnv carries the per-endpoint lake config (catalog DSN, metadata schema, s3 creds).
+    // A HOT gateway is NOT re-bootstrapped — its config is fixed at first boot, so callers
+    // must gw.destroy() to re-apply changed config (e.g. after deploying a new entrypoint).
+    await gw.startProcess(BOOT_CMD, { cwd: GW_DIR, env: bootEnv });
   }
   const start = Date.now();
   let lastErr = "";
@@ -165,10 +210,11 @@ async function gwFwd(gw: GatewayHandle, path: string, init: RequestInit): Promis
   return { status: r.status, json };
 }
 
-/** Push a birdshot ACL snapshot + RS256 JWKS to a per-endpoint gateway (boots it if cold). */
-async function pushGatewaySnapshot(env: Env, endpointId: string, snapshot: unknown, auth: unknown, lakeCatalog?: string): Promise<{ status: number; json: any }> {
+/** Push a birdshot ACL snapshot + RS256 JWKS to a per-endpoint gateway (boots it if cold,
+ *  injecting bootEnv as the per-process lake config on a cold boot). */
+async function pushGatewaySnapshot(env: Env, endpointId: string, snapshot: unknown, auth: unknown, lakeCatalog?: string, bootEnv?: Record<string, string>): Promise<{ status: number; json: any }> {
   const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
-  await ensureGateway(gw);
+  await ensureGateway(gw, bootEnv);
   return gwFwd(gw, "/ctrl/snapshot", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ snapshot, auth, lakeCatalog: lakeCatalog ?? "memory" }),
@@ -275,9 +321,9 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   // ── gateway control plane (control-api gateway-client) ─────────────────────────
   if (path === "/gw/snapshot" && request.method === "POST") {
-    const { endpointId, snapshot, auth, lakeCatalog } = body;
+    const { endpointId, snapshot, auth, lakeCatalog, gatewayBoot } = body;
     if (!endpointId || !snapshot) return Response.json({ error: "missing endpointId/snapshot" }, { status: 400 });
-    const r = await pushGatewaySnapshot(env, endpointId, snapshot, auth, lakeCatalog);
+    const r = await pushGatewaySnapshot(env, endpointId, snapshot, auth, lakeCatalog, bootEnvFromConfig(gatewayBoot as GatewayBoot | undefined));
     return Response.json(r.json, { status: r.status });
   }
   if (path === "/gw/status") {

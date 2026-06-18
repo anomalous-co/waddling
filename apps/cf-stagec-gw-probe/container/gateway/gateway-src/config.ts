@@ -25,6 +25,14 @@ export interface GatewayConfig {
   localData: boolean;
   /** Alias the lake is ATTACHed as inside DuckDB. */
   lakeAlias: string;
+  /**
+   * Postgres schema that holds THIS endpoint's DuckLake metadata tables (the
+   * `METADATA_SCHEMA` ATTACH option). Empty ⇒ DuckLake's default `main`. This is the
+   * per-endpoint isolation primitive when many endpoints share ONE org-level Postgres
+   * catalog database: distinct schema → distinct DuckLake → no cross-endpoint visibility.
+   * Only meaningful for a postgres catalog; ignored for a local catalog file.
+   */
+  metadataSchema: string;
   /** ENCRYPTED ducklake attach. */
   encrypted: boolean;
 
@@ -79,6 +87,8 @@ export function loadGatewayConfig(): GatewayConfig {
     ducklakeDataPath,
     localData,
     lakeAlias: opt("DUCKLAKE_ALIAS", "lake"),
+    // Per-endpoint metadata schema (postgres catalog only). Empty ⇒ DuckLake default 'main'.
+    metadataSchema: opt("DUCKLAKE_METADATA_SCHEMA", ""),
     encrypted: bool("DUCKLAKE_ENCRYPTED", false),
 
     // S3 creds are required only for an s3:// data path; in local mode they are unused.

@@ -36,6 +36,35 @@ export interface SnapshotRequest {
   /** birdshot auth config (RS256). */
   auth: { issuer: string; audience: string; mode: 'rs256'; jwks: BirdshotJwk[] };
   snapshot: BirdshotSnapshot;
+  /**
+   * Catalog name birdshot resolves agent table refs against (birdshot_set_lake_catalog).
+   * Real lake ⇒ the lake ATTACH alias (e.g. 'lake'); the offline demo ⇒ 'memory'.
+   * Omitted ⇒ the data plane defaults to 'memory' (the demo).
+   */
+  lakeCatalog?: string;
+  /**
+   * Per-endpoint gateway boot config (real lake). The data plane injects this as the
+   * gateway container's per-process env on a COLD boot, so the gateway ATTACHes the
+   * endpoint's real DuckLake (its own METADATA_SCHEMA in the org's Postgres catalog +
+   * s3:// data) instead of the offline demo. Omitted ⇒ the demo seed. This carries lake
+   * credentials to the TRUSTED gateway only — never to the locked workspace.
+   */
+  gatewayBoot?: GatewayBoot;
+}
+
+/** Per-endpoint gateway boot descriptor (mirrors the data plane's GatewayBoot). */
+export interface GatewayBoot {
+  serverToken?: string;
+  catalogDsn?: string;
+  catalogFile?: string;
+  dataPath?: string;
+  metadataSchema?: string;
+  alias?: string;
+  encrypted?: boolean;
+  s3?: {
+    endpoint?: string; keyId?: string; secret?: string;
+    region?: string; useSsl?: boolean; urlStyle?: 'path' | 'vhost';
+  };
 }
 
 export interface BirdshotJwk {

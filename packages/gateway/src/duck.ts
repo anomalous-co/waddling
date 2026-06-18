@@ -15,6 +15,50 @@ function q(s: string): string {
   return "'" + s.replace(/'/g, "''") + "'";
 }
 
+/** Quote a SQL identifier (double-quote, escaping embedded quotes). */
+function qid(s: string): string {
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+/**
+ * Defensively create the Postgres schema that a postgres-catalog DuckLake will use as
+ * its METADATA_SCHEMA, before the ducklake ATTACH. DuckLake auto-creates its metadata
+ * *tables* (CREATE_IF_NOT_EXISTS) but not the enclosing PG *schema*, so a fresh endpoint
+ * whose schema doesn't exist yet would otherwise fail to attach. We do this by ATTACHing
+ * the catalog Postgres directly (DuckDB postgres extension) and running CREATE SCHEMA IF
+ * NOT EXISTS — pushed through to PG — then detaching. Idempotent and cheap. Retries to
+ * tolerate the catalog still warming up (mirrors the ATTACH retry below).
+ */
+async function ensureCatalogSchema(
+  connection: DuckDBConnection,
+  catalogDsn: string,
+  schema: string,
+): Promise<void> {
+  const bootstrapAlias = "_catalog_bootstrap";
+  const maxAttempts = 15;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await connection.run(`ATTACH ${q(catalogDsn)} AS ${bootstrapAlias} (TYPE postgres)`);
+      try {
+        await connection.run(`CREATE SCHEMA IF NOT EXISTS ${bootstrapAlias}.${qid(schema)}`);
+      } finally {
+        await connection.run(`DETACH ${bootstrapAlias}`);
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      // A leftover attach from a failed prior attempt blocks re-ATTACH — try to clear it.
+      try { await connection.run(`DETACH ${bootstrapAlias}`); } catch { /* not attached */ }
+      console.log(
+        `[gateway] ensure catalog schema attempt ${attempt}/${maxAttempts} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * Normalize a DuckDB row tree to JSON-safe values (BigInt → Number, value
  * wrappers → their readable toString()). Mirrors packages/db/src/analytics.ts.
@@ -84,10 +128,26 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   //   * local-file (host-native demo):  'ducklake:<file>' + local-dir data
   // CREATE_IF_NOT_EXISTS defaults true, so the gateway can boot before the seed
   // populates the lake. Retry to tolerate the catalog/store still warming up.
-  const catalogTarget = config.ducklakeCatalogFile
-    ? `ducklake:${config.ducklakeCatalogFile}`
-    : `ducklake:postgres:${config.ducklakeCatalogDsn}`;
+  const isPgCatalog = !config.ducklakeCatalogFile;
+  const catalogTarget = isPgCatalog
+    ? `ducklake:postgres:${config.ducklakeCatalogDsn}`
+    : `ducklake:${config.ducklakeCatalogFile}`;
+
+  // Per-endpoint isolation: when many endpoints share ONE org Postgres catalog DB,
+  // METADATA_SCHEMA scopes this endpoint's DuckLake metadata to its own PG schema so
+  // it can't see another endpoint's tables. DuckLake's CREATE_IF_NOT_EXISTS creates the
+  // DuckLake *metadata tables*, but does NOT promise to create the PG *schema* namespace
+  // they live in — so create it defensively first (the minted role inherits `postgres`,
+  // hence has CREATE). This MUST run in the gateway container: it's the only tier with
+  // raw :5432 egress to the catalog (control-api's Worker reaches Postgres only via its
+  // Hyperdrive binding, pinned to the control DB). Idempotent; a no-op once it exists.
+  const useMetadataSchema = isPgCatalog && config.metadataSchema;
+  if (useMetadataSchema) {
+    await ensureCatalogSchema(connection, config.ducklakeCatalogDsn, config.metadataSchema);
+  }
+
   const opts: string[] = [`DATA_PATH ${q(config.ducklakeDataPath)}`];
+  if (useMetadataSchema) opts.push(`METADATA_SCHEMA ${q(config.metadataSchema)}`);
   if (config.encrypted) opts.push("ENCRYPTED");
   const attachSql = `ATTACH '${catalogTarget}' AS ${config.lakeAlias} (${opts.join(", ")})`;
   {

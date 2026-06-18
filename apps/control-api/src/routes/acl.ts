@@ -35,6 +35,7 @@ import {
   type SnapshotRequest,
   type BirdshotJwk,
 } from '../lib/gateway-client';
+import { resolveGatewayBoot } from '../lib/gateway-boot';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err } from '../lib/cp-shared';
 
 // ── recompile + push helper (ported from acl/recompile.ts) ───────────────────────
@@ -97,24 +98,31 @@ async function recompileAndPush(
   if (endpoint && endpoint.status === 'running') {
     const jwk = await loadJwk();
     const gw = gatewayClientFor(endpoint);
-    const snapshotReq: SnapshotRequest = {
-      endpointId,
-      auth: {
-        issuer: c.env.JWT_ISSUER,
-        audience: `gw:${endpointId}`,
-        mode: 'rs256',
-        jwks: jwk ? [jwk] : [],
-      },
-      snapshot: compiled.snapshot,
-    };
     try {
+      // Carry the endpoint's real lake boot config + birdshot catalog so that if THIS
+      // push is the one that cold-boots the gateway, it ATTACHes the real DuckLake (not
+      // the demo). resolveGatewayBoot may report the managed catalog still provisioning;
+      // skip the push then (the rule is persisted; connect/recompile re-pushes later).
+      const boot = await resolveGatewayBoot(endpointId);
+      const snapshotReq: SnapshotRequest = {
+        endpointId,
+        auth: {
+          issuer: c.env.JWT_ISSUER,
+          audience: `gw:${endpointId}`,
+          mode: 'rs256',
+          jwks: jwk ? [jwk] : [],
+        },
+        snapshot: compiled.snapshot,
+        lakeCatalog: boot.lakeCatalog,
+        gatewayBoot: boot.gatewayBoot,
+      };
       // Best-effort: pushes over the DATAPLANE binding to the per-endpoint GatewayDO.
       // Column + window ACLs ride inside the snapshot (`roleConstraints`); there is no
       // separate constraint push. A failure leaves the rule persisted for the next
       // connect/recompile to re-push.
       await gw.pushSnapshot(snapshotReq);
     } catch {
-      // gateway down — persisted rule re-pushes on next connect/recompile
+      // gateway down / catalog provisioning — persisted rule re-pushes on next connect/recompile
     }
   }
 

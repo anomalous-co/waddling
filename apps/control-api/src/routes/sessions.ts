@@ -56,6 +56,7 @@ import {
   type BirdshotJwk,
 } from '../lib/gateway-client';
 import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
+import { resolveGatewayBoot, CatalogNotReadyError } from '../lib/gateway-boot';
 import type { ConnectResult, QueryResult } from '../lib/types';
 import {
   resolveCaller,
@@ -343,6 +344,22 @@ sessions.post('/', (c) =>
     const { kid, publicJwk, privateJwk } = await loadSigningKey();
     const gw = gatewayClientFor(endpoint);
     const jwks: BirdshotJwk[] = [{ kid, n: publicJwk.n, e: publicJwk.e }];
+
+    // Resolve the endpoint's real lake boot config (catalog DSN + per-endpoint metadata
+    // schema + object-store creds). On a cold gateway the data plane injects this so the
+    // gateway ATTACHes the endpoint's REAL DuckLake; with no real catalog it falls back to
+    // the offline demo (lakeCatalog 'memory'). A still-provisioning managed catalog is a
+    // retryable 503 (the org's PlanetScale DB isn't ready yet).
+    let boot;
+    try {
+      boot = await resolveGatewayBoot(endpointId);
+    } catch (e) {
+      if (e instanceof CatalogNotReadyError) {
+        return err(c, 'catalog_provisioning', 503, e.message);
+      }
+      throw e;
+    }
+
     const snapshotReq: SnapshotRequest = {
       endpointId,
       auth: {
@@ -352,6 +369,8 @@ sessions.post('/', (c) =>
         jwks,
       },
       snapshot: compiled.snapshot,
+      lakeCatalog: boot.lakeCatalog,
+      gatewayBoot: boot.gatewayBoot,
     };
     // connect AWAITS the push (a session must not be minted against a gateway that
     // never received its snapshot + JWKS); a failure surfaces as 500. This is the
