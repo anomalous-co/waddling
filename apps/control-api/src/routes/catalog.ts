@@ -20,6 +20,7 @@ import {
   provisionOrgCatalog,
   reconcileOrgCatalog,
   getPlanetScaleClient,
+  getOrgCatalogDsn,
 } from '../lib/catalog-provision';
 
 const catalog = new Hono<{ Bindings: Env }>();
@@ -56,6 +57,39 @@ catalog.get('/', (c) =>
     const status = await reconcileOrgCatalog(c.env, caller.orgId);
     if (!status) return err(c, 'not_provisioned', 404, 'No managed catalog for this org yet — POST to provision');
     return ok(c, status);
+  }),
+);
+
+/**
+ * POST /lakeprobe — #9 acceptance gate, driven server-side so no catalog DSN ever leaves
+ * the server. Reconciles the caller's org catalog to 'ready', decrypts its DSN, and hands
+ * it to the data plane's /lakeprobe (which boots two ducklake ATTACHes with distinct
+ * METADATA_SCHEMA inside a real gateway container and asserts cross-endpoint isolation, then
+ * drops its probe schemas). Returns only the verdict — never the DSN. Temporary verification
+ * surface; safe to remove once #9 is signed off.
+ */
+catalog.post('/lakeprobe', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const status = await reconcileOrgCatalog(c.env, caller.orgId);
+    if (!status || status.state !== 'ready') {
+      return err(
+        c,
+        'catalog_not_ready',
+        503,
+        `Org catalog state is ${status?.state ?? 'absent'} — provision + wait for 'ready' first`,
+      );
+    }
+    const dsn = await getOrgCatalogDsn(caller.orgId);
+    if (!dsn) return err(c, 'catalog_dsn_unavailable', 503, 'Catalog is ready but DSN could not be decrypted');
+
+    const res = await c.env.DATAPLANE.fetch('https://dataplane/lakeprobe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dsn }),
+    });
+    const json = await res.json().catch(() => ({ error: 'non-json data-plane response' }));
+    return c.json(json as Record<string, unknown>, res.status as 200);
   }),
 );
 

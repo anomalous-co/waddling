@@ -453,7 +453,19 @@ async function main() {
   const bTables = await tablesIn(c, 'lake_b');
   const isolated = aTables.includes('t_only_a') && !aTables.includes('t_only_b')
                 && bTables.includes('t_only_b') && !bTables.includes('t_only_a');
-  console.log('LAKEPROBE_RESULT:' + JSON.stringify({ aTables, bTables, isolated }));
+  // Cleanup so this is safe to run against a REAL org catalog: drop the probe schemas
+  // (CASCADE removes the DuckLake metadata tables they hold). Best-effort.
+  let cleaned = false;
+  try {
+    await c.run('DETACH lake_a'); await c.run('DETACH lake_b');
+    await c.run("ATTACH '" + DSN.replace(/'/g, "''") + "' AS _pg (TYPE postgres)");
+    try {
+      await c.run('DROP SCHEMA IF EXISTS _pg.' + JSON.stringify('ep_probe_a') + ' CASCADE');
+      await c.run('DROP SCHEMA IF EXISTS _pg.' + JSON.stringify('ep_probe_b') + ' CASCADE');
+      cleaned = true;
+    } finally { await c.run('DETACH _pg'); }
+  } catch (e) { /* leave verdict intact; report cleanup miss */ }
+  console.log('LAKEPROBE_RESULT:' + JSON.stringify({ aTables, bTables, isolated, cleaned }));
 }
 main().catch(e => console.log('LAKEPROBE_RESULT:' + JSON.stringify({ error: String((e && e.message) || e) })));
 `.replace("${JSON_DSN}", () => JSON.stringify(dsn));
