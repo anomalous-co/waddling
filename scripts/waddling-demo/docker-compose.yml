@@ -1,0 +1,183 @@
+# waddling self-contained demo
+# Usage: docker compose -f scripts/waddling-demo/docker-compose.yml up
+#
+# Services start order: postgres → minio → gateway → app → mcp-external → demo-agent
+# Seed: run 'docker compose ... run --rm seed' after first up to load synthetic data.
+
+services:
+  # ── Control-plane Postgres ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: waddling
+      POSTGRES_PASSWORD: waddling
+      POSTGRES_DB: waddling
+    ports:
+      - '5470:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U waddling']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── MinIO (R2 stand-in) ────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ':9001'
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── DuckDB Gateway ──────────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: ../..
+      dockerfile: scripts/waddling-demo/Dockerfile.gateway
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      # NOTE: env names here must match packages/gateway/src/config.ts exactly.
+      DATABASE_URL: postgres://waddling:waddling@postgres:5432/waddling
+      # DuckLake postgres catalog DSN — DuckDB's postgres connector accepts the
+      # libpq URI form; same DSN the seed uses to create the lake.
+      DUCKLAKE_CATALOG_DSN: postgres://waddling:waddling@postgres:5432/waddling
+      DUCKLAKE_DATA_PATH: s3://waddling-lake/
+      DUCKLAKE_ALIAS: lake
+      S3_ENDPOINT: minio:9000
+      S3_KEY_ID: minioadmin
+      S3_SECRET: minioadmin
+      S3_REGION: us-east-1
+      S3_USE_SSL: 'false'
+      S3_URL_STYLE: path
+      QUACK_PORT: '9500'
+      CTRL_PORT: '9510'
+      GW_SERVER_TOKEN: demo-server-token-change-in-prod
+      # JWKS for verifying agent session JWTs (Better Auth jwt plugin publishes here).
+      JWKS_URL: http://app:3100/api/auth/jwks
+      JWT_ISSUER: http://app:3100
+      SKIP_ENV_VALIDATION: '1'
+    ports:
+      - '9500:9500'  # quack wire protocol
+      - '9510:9510'  # gateway control channel
+    healthcheck:
+      # ctrl-server serves GET /gw/health (see packages/gateway/src/ctrl-server.ts).
+      test: ['CMD-SHELL', 'curl -sf http://localhost:9510/gw/health || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ── Control Plane (Next.js app) ────────────────────────────────────────────
+  app:
+    build:
+      context: ../..
+      dockerfile: scripts/waddling-demo/Dockerfile.app
+      args:
+        SKIP_ENV_VALIDATION: '1'
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://waddling:waddling@postgres:5432/waddling
+      BETTER_AUTH_SECRET: demo-better-auth-secret-change-in-prod
+      BETTER_AUTH_URL: http://app:3100
+      NEXT_PUBLIC_APP_URL: http://localhost:3100
+      STRIPE_SECRET_KEY: sk_test_placeholder
+      STRIPE_WEBHOOK_SECRET: whsec_placeholder
+      STRIPE_PRICE_PRO: price_pro
+      STRIPE_PRICE_ENTERPRISE: price_enterprise
+      JWT_ISSUER: http://app:3100
+      JWT_AUDIENCE_PREFIX: gw
+      GATEWAY_INTERNAL_URL: http://gateway:9510
+      SKIP_ENV_VALIDATION: '1'
+      PORT: '3100'
+    ports:
+      - '3100:3100'
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://localhost:3100/api/healthz || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  # ── External MCP Server ────────────────────────────────────────────────────
+  mcp-external:
+    build:
+      context: ../..
+      dockerfile: scripts/waddling-demo/Dockerfile.mcp-external
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      WADDLING_URL: http://app:3100
+      WADDLING_API_KEY: sk_agent_analyst_demo  # deterministic analyst key seeded by seed.ts
+      MCP_HTTP_PORT: '8810'
+    ports:
+      - '8810:8810'
+
+  # ── Demo Agent (scripted walkthrough) ────────────────────────────────────────
+  demo-agent:
+    build:
+      context: ./agent
+      dockerfile: ../Dockerfile.agent
+    depends_on:
+      app:
+        condition: service_healthy
+      mcp-external:
+        condition: service_started
+      gateway:
+        condition: service_healthy
+    environment:
+      WADDLING_URL: http://app:3100
+      WADDLING_API_KEY: sk_agent_analyst_demo
+      WADDLING_ADMIN_TOKEN: sk_agent_admin_demo
+      ETLBOT_API_KEY: sk_agent_etlbot_demo
+      MCP_EXTERNAL_URL: http://mcp-external:8810
+    restart: 'no'
+
+  # ── Seed (one-shot; run manually or as a separate compose profile) ──────────
+  seed:
+    build:
+      context: ../..
+      dockerfile: scripts/waddling-demo/Dockerfile.app
+      args:
+        SKIP_ENV_VALIDATION: '1'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: ['node', '--loader', 'tsx/esm', 'scripts/waddling-demo/seed.ts']
+    environment:
+      DATABASE_URL: postgres://waddling:waddling@postgres:5432/waddling
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      BETTER_AUTH_SECRET: demo-better-auth-secret-change-in-prod
+      BETTER_AUTH_URL: http://app:3100
+      SKIP_ENV_VALIDATION: '1'
+    restart: 'no'
+    profiles:
+      - seed
+
+volumes:
+  postgres_data:
+  minio_data:

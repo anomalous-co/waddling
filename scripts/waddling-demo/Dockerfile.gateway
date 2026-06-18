@@ -1,0 +1,67 @@
+# Dockerfile.gateway — multi-stage build for the waddling DuckDB gateway.
+# Build context: repo root (../../ relative to scripts/waddling-demo/)
+#
+# PREREQUISITES:
+#   The birdshot extension binary must be built before running docker compose:
+#     make -C birdshot
+#   Binary expected at: birdshot/build/release/extension/birdshot/birdshot.duckdb_extension
+#
+# If the binary is missing, the gateway will print a clear error at runtime and exit.
+
+FROM node:20-slim AS base
+RUN npm install -g pnpm@10.24.0
+# Install curl for healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+# ── deps stage ─────────────────────────────────────────────────────────────────
+FROM base AS deps
+WORKDIR /app
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY .npmrc* ./
+
+COPY packages/control-schema/package.json ./packages/control-schema/
+COPY packages/gateway/package.json ./packages/gateway/
+
+RUN pnpm install --frozen-lockfile --ignore-scripts
+
+# ── source stage ──────────────────────────────────────────────────────────────
+FROM deps AS builder
+WORKDIR /app
+
+COPY packages/control-schema/ ./packages/control-schema/
+COPY packages/gateway/ ./packages/gateway/
+# Both package tsconfigs extend the workspace-root base config.
+COPY tsconfig.base.json ./
+
+# Build the gateway TypeScript
+RUN pnpm --filter @waddling/gateway build
+
+# ── runtime stage ─────────────────────────────────────────────────────────────
+FROM node:20-slim AS runner
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+ENV NODE_ENV=production
+
+# Copy built gateway
+COPY --from=builder /app/packages/gateway/dist/ ./packages/gateway/dist/
+COPY --from=builder /app/packages/gateway/package.json ./packages/gateway/
+COPY --from=builder /app/packages/control-schema/ ./packages/control-schema/
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+
+# Copy the birdshot extension binary — the LINUX/arm64 build produced by
+# scripts/waddling-demo/build-birdshot-linux.sh (the gateway container is Linux
+# and cannot LOAD the host's Mach-O build at birdshot/build/...).
+# Build it first:  bash scripts/waddling-demo/build-birdshot-linux.sh
+# If it does not exist, this COPY fails with a clear error.
+COPY birdshot/build-linux/birdshot.duckdb_extension \
+     /opt/birdshot/birdshot.duckdb_extension
+
+ENV BIRDSHOT_EXTENSION_PATH=/opt/birdshot/birdshot.duckdb_extension
+
+EXPOSE 9500 9510
+
+CMD ["node", "packages/gateway/dist/index.js"]

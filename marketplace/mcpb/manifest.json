@@ -1,0 +1,56 @@
+{
+  "manifest_version": "0.4",
+  "name": "waddling",
+  "display_name": "DuckBase",
+  "version": "0.1.0",
+  "description": "Govern your agents' lakehouse access: dynamic ACLs, instant revoke, full audit trail.",
+  "long_description": "Connect analytics agents to DuckLake endpoints with per-agent column, row, and time-window ACL rules enforced at the gateway. Revoke any agent instantly. Every query audited. No API key required at install — guided onboarding on first use.",
+  "author": {
+    "name": "DuckBase",
+    "email": "hi@getwaddling.com",
+    "url": "https://app.getwaddling.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/waddling/claude-plugin"
+  },
+  "homepage": "https://app.getwaddling.com",
+  "documentation": "https://app.getwaddling.com/docs",
+  "license": "MIT",
+  "keywords": ["duckdb", "waddling", "ducklake", "lakehouse", "analytics", "acl"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "WADDLING_URL": "${user_config.waddling_url}",
+        "WADDLING_STATE": "${HOME}/.waddling",
+        "WADDLING_TELEMETRY": "${user_config.telemetry_opt_out}"
+      }
+    }
+  },
+  "tools_generated": true,
+  "user_config": {
+    "waddling_url": {
+      "type": "string",
+      "title": "DuckBase URL",
+      "description": "DuckBase control-plane URL. Leave at default unless self-hosting.",
+      "default": "https://app.getwaddling.com",
+      "required": false
+    },
+    "telemetry_opt_out": {
+      "type": "string",
+      "title": "Disable telemetry",
+      "description": "Set to '0' to opt out of anonymous usage telemetry. SQL, API keys, JWTs, and email addresses are never captured regardless of this setting.",
+      "default": "",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": { "node": ">=20.0.0" }
+  },
+  "privacy_policies": ["https://app.getwaddling.com/privacy"]
+}

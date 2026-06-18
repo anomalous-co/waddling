@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "waddling": {
+      "command": "npx",
+      "args": ["-y", "@waddling/mcp@latest"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "WADDLING_URL": "${user_config.waddling_url}",
+        "WADDLING_STATE": "${CLAUDE_PLUGIN_DATA}/state",
+        "WADDLING_ADMIN_TOKEN": "${WADDLING_ADMIN_TOKEN}",
+        "WADDLING_TELEMETRY": "${WADDLING_TELEMETRY}"
+      }
+    }
+  }
+}

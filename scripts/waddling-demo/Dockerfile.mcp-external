@@ -1,0 +1,48 @@
+# Dockerfile.mcp-external — multi-stage build for the waddling external MCP server.
+# Build context: repo root (../../ relative to scripts/waddling-demo/)
+
+FROM node:20-slim AS base
+RUN npm install -g pnpm@10.24.0
+
+# ── deps stage ─────────────────────────────────────────────────────────────────
+FROM base AS deps
+WORKDIR /app
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY .npmrc* ./
+
+COPY packages/control-schema/package.json ./packages/control-schema/
+COPY packages/mcp-external/package.json ./packages/mcp-external/
+
+RUN pnpm install --frozen-lockfile --ignore-scripts
+
+# ── source stage ──────────────────────────────────────────────────────────────
+FROM deps AS builder
+WORKDIR /app
+
+COPY packages/control-schema/ ./packages/control-schema/
+COPY packages/mcp-external/ ./packages/mcp-external/
+# Package tsconfigs extend the workspace-root base config.
+COPY tsconfig.base.json ./
+
+RUN pnpm --filter @waddling/mcp build
+
+# ── runtime stage ─────────────────────────────────────────────────────────────
+FROM node:20-slim AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV MCP_HTTP_PORT=8810
+
+COPY --from=builder /app/packages/mcp-external/dist/ ./packages/mcp-external/dist/
+COPY --from=builder /app/packages/mcp-external/package.json ./packages/mcp-external/
+COPY --from=builder /app/packages/control-schema/ ./packages/control-schema/
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+
+EXPOSE 8810
+
+# --http makes it listen on $PORT (default 8810) for remote hosts; without it the
+# server runs in stdio mode and nothing binds the port (the demo agent connects
+# over HTTP to :8810/mcp).
+CMD ["node", "packages/mcp-external/dist/index.js", "--http"]

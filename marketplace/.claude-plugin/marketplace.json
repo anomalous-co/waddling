@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "waddling",
+  "description": "Official DuckBase plugin marketplace. Govern AI-agent lakehouse access with dynamic ACLs, instant revoke, and full audit.",
+  "owner": { "name": "DuckBase", "email": "hi@getwaddling.com" },
+  "plugins": [
+    {
+      "name": "waddling",
+      "source": "./plugins/waddling",
+      "description": "Govern your agents' lakehouse access: dynamic ACLs, instant revoke, full audit",
+      "category": "databases",
+      "defaultEnabled": false
+    }
+  ]
+}

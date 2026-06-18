@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "waddling",
+  "displayName": "DuckBase",
+  "version": "0.1.0",
+  "description": "Govern your agents' lakehouse access: dynamic ACLs, instant revoke, full audit. Connect analytics agents to DuckLake endpoints with per-agent column/row/time-window rules enforced at the gateway. Revoke any agent instantly. Every query audited.",
+  "author": { "name": "DuckBase", "email": "hi@getwaddling.com" },
+  "homepage": "https://app.getwaddling.com/docs",
+  "repository": "https://github.com/waddling/claude-plugin",
+  "license": "MIT",
+  "keywords": ["duckdb", "waddling", "ducklake", "lakehouse", "analytics", "acl"],
+  "defaultEnabled": false,
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "waddling_url": {
+      "type": "string",
+      "title": "DuckBase URL",
+      "description": "DuckBase control-plane URL. Leave at default unless self-hosting.",
+      "default": "https://app.getwaddling.com"
+    }
+  }
+}

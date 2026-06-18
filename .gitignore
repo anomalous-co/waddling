@@ -1,0 +1,50 @@
+# dependencies
+node_modules/
+
+# next.js build output (default + per-instance distDirs)
+.next/
+.next-*/
+apps/*/.next/
+apps/*/.next-*/
+
+# pglite data stores (each instance's authoritative database)
+pgdata-*/
+
+# logs / debug
+*.log
+.pnpm-debug.log*
+
+# env
+.env*
+
+# misc
+.DS_Store
+*.tsbuildinfo
+
+# separate repos / reference material (own git repos + large build artifacts)
+/birdshot/
+/references/
+
+# cloudflare wrangler local state
+.wrangler/
+**/.wrangler/
+
+# local data stores / databases
+.data/
+**/.data/
+*.db
+*.duckdb
+
+# uncompressed duckdb extension binaries
+# (the gateway image's binary is committed as the .gz under apps/, which this does NOT match)
+*.duckdb_extension
+
+# compiled JS — this repo is TypeScript/ESM (.ts/.mjs); any .js is build output
+*.js
+
+# local demo / scratch runtime state (pgdata, minio, seeded lake data)
+**/.local/
+**/.local-diag/
+*.parquet
+*.ducklake
+*.ducklake.wal

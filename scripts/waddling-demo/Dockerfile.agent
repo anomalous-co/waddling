@@ -1,0 +1,24 @@
+# Dockerfile.agent — build context is scripts/waddling-demo/agent/
+# (compose: context: ./agent, dockerfile: ../Dockerfile.agent)
+
+FROM node:20-slim AS base
+RUN npm install -g pnpm@10.24.0
+
+# ── deps stage ─────────────────────────────────────────────────────────────────
+FROM base AS deps
+WORKDIR /agent
+COPY package.json ./
+# No lockfile for standalone agent package; use --no-frozen-lockfile
+RUN pnpm install --no-frozen-lockfile
+
+# ── runner stage ──────────────────────────────────────────────────────────────
+FROM node:20-slim AS runner
+WORKDIR /agent
+
+ENV NODE_ENV=production
+
+COPY --from=deps /agent/node_modules ./node_modules
+COPY --from=deps /agent/package.json ./
+COPY . .
+
+CMD ["node", "--loader", "tsx/esm", "index.ts"]

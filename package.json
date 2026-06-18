@@ -1,0 +1,29 @@
+{
+  "name": "pglite-sandbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Two-user PGlite x DuckDB-quack federated analytics web app (Next.js, pnpm workspace)",
+  "license": "ISC",
+  "packageManager": "pnpm@10.24.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "bash scripts/waddling-demo/run-local.sh",
+    "dev:fresh": "FRESH=1 bash scripts/waddling-demo/run-local.sh",
+    "dev:a": "PORT=3000 NEXT_DIST_DIR=.next-a PG_PORT=5432 AUTH_PG_PORT=5442 BASE_URL=http://localhost:3000 BETTER_AUTH_SECRET=instance-a-secret-0123456789abcdef BIRDSHOT_EXTENSION_PATH=../../birdshot/build/release/extension/birdshot/birdshot.duckdb_extension DATA_DIR=../../pgdata-a INSTANCE=A QUACK_PORT=9494 QUACK_TOKEN=token-a PEER_QUACK_PORT=9495 PEER_QUACK_TOKEN=token-b pnpm --filter web dev",
+    "dev:b": "PORT=3001 NEXT_DIST_DIR=.next-b PG_PORT=5433 AUTH_PG_PORT=5443 BASE_URL=http://localhost:3001 BETTER_AUTH_SECRET=instance-b-secret-fedcba9876543210 BIRDSHOT_EXTENSION_PATH=../../birdshot/build/release/extension/birdshot/birdshot.duckdb_extension DATA_DIR=../../pgdata-b INSTANCE=B QUACK_PORT=9495 QUACK_TOKEN=token-b PEER_QUACK_PORT=9494 PEER_QUACK_TOKEN=token-a pnpm --filter web dev",
+    "build": "pnpm --filter web build",
+    "start:a": "PORT=3000 PG_PORT=5432 AUTH_PG_PORT=5442 BASE_URL=http://localhost:3000 DATA_DIR=../../pgdata-a INSTANCE=A QUACK_PORT=9494 QUACK_TOKEN=token-a PEER_QUACK_PORT=9495 PEER_QUACK_TOKEN=token-b pnpm --filter web start",
+    "start:b": "PORT=3001 PG_PORT=5433 AUTH_PG_PORT=5443 BASE_URL=http://localhost:3001 DATA_DIR=../../pgdata-b INSTANCE=B QUACK_PORT=9495 QUACK_TOKEN=token-b PEER_QUACK_PORT=9494 PEER_QUACK_TOKEN=token-a pnpm --filter web start",
+    "typecheck": "pnpm -r typecheck",
+    "db:boot": "pnpm --filter @pglite-sandbox/db boot",
+    "demo:federation": "bash scripts/federation-demo.sh",
+    "dev:waddling": "pnpm --filter @waddling/app dev",
+    "db:migrate": "tsx scripts/migrate.ts"
+  },
+  "dependencies": {
+    "@cloudflare/workers-types": "^4.20260617.1",
+    "wrangler": "^4.101.0"
+  }
+}
