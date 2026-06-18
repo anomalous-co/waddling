@@ -148,13 +148,13 @@ export async function reconcileOrgCatalog(env: Env, orgId: string): Promise<OrgC
     const db = await client.getDatabase(row.ps_database);
     if (db.state !== 'ready') return toStatus(row); // still warming up
 
-    // Cluster is up — mint the connection material and seal the DSN.
-    const pw = await client.createPassword(row.ps_database);
+    // Cluster is up — mint a Postgres role and seal the DSN.
+    const role = await client.createRole(row.ps_database);
     const dsn = buildCatalogDsn({
-      hostname: pw.hostname,
-      username: pw.username,
-      password: pw.plainText,
-      database: PG_DATABASE,
+      hostname: role.hostname,
+      username: role.username,
+      password: role.plainText,
+      database: role.database || PG_DATABASE,
     });
     const sealed: SealedSecret = getCrypto().sealJson({ dsn });
     const updated = await queryOne<CatalogRow>(

@@ -37,15 +37,18 @@ export interface PsDatabase {
   kind?: string;
 }
 
-/** A freshly-minted branch password = the Postgres connection material (shown once). */
-export interface PsPassword {
+/** A freshly-minted Postgres ROLE = the connection material (shown once). PlanetScale
+ *  Postgres uses roles (NOT the MySQL/Vitess `passwords` endpoint, which 405s here). */
+export interface PsRole {
   /** access_host_url — the Postgres host (port 5432, sslmode verify-full). */
   hostname: string;
   username: string;
   /** Plaintext password — returned ONLY on create; seal it immediately. */
   plainText: string;
-  /** PlanetScale password public id (for later rotation/deletion). */
-  publicId: string;
+  /** The Postgres database to connect to (database_name in the response). */
+  database: string;
+  /** PlanetScale role id (for later reset/deletion). */
+  id: string;
 }
 
 export class PlanetScaleError extends Error {
@@ -63,16 +66,32 @@ export class PlanetScaleClient {
   constructor(private readonly cfg: PlanetScaleApiConfig) {}
 
   private async call<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${PS_API_BASE}${path}`, {
-      method,
-      headers: {
-        // Colon-joined service token — PlanetScale's documented format (NOT Bearer).
-        authorization: `${this.cfg.tokenId}:${this.cfg.token}`,
-        'content-type': 'application/json',
-        accept: 'application/json',
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    // Bounded — a slow/hung PlanetScale call must surface as an error, never hang the
+    // Worker (the runtime cancels a hung request → opaque 1101).
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 20_000);
+    let res: Response;
+    try {
+      res = await fetch(`${PS_API_BASE}${path}`, {
+        method,
+        headers: {
+          // Colon-joined service token — PlanetScale's documented format (NOT Bearer).
+          authorization: `${this.cfg.tokenId}:${this.cfg.token}`,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      throw new PlanetScaleError(
+        `PlanetScale ${method} ${path} failed: ${e instanceof Error ? e.message : String(e)}`,
+        0,
+        '',
+      );
+    } finally {
+      clearTimeout(t);
+    }
     const text = await res.text();
     if (!res.ok) {
       throw new PlanetScaleError(
@@ -110,28 +129,27 @@ export class PlanetScaleClient {
   }
 
   /**
-   * Mint a branch password = the Postgres connection material. The plaintext is
-   * returned ONLY here; the caller seals it at once. Defaults to the 'main' branch
-   * and an admin-capable role (the gateway needs DDL to create the DuckLake catalog).
+   * Mint a Postgres ROLE = the connection material. The plaintext password is returned
+   * ONLY here; the caller seals it at once. Inherits `postgres` so the gateway has the
+   * CREATE/DDL privileges DuckLake needs to build its metadata catalog. Defaults to the
+   * 'main' branch. (PlanetScale Postgres uses `/roles`, not the MySQL `/passwords`.)
    */
-  async createPassword(
+  async createRole(
     database: string,
-    opts?: { branch?: string; role?: string; name?: string },
-  ): Promise<PsPassword> {
+    opts?: { branch?: string; name?: string; inheritedRoles?: string[] },
+  ): Promise<PsRole> {
     const branch = opts?.branch ?? 'main';
     const raw = await this.call<Record<string, any>>(
       'POST',
-      `/organizations/${enc(this.cfg.organization)}/databases/${enc(database)}/branches/${enc(branch)}/passwords`,
-      { role: opts?.role ?? 'admin', name: opts?.name ?? `waddling-gateway` },
+      `/organizations/${enc(this.cfg.organization)}/databases/${enc(database)}/branches/${enc(branch)}/roles`,
+      { name: opts?.name ?? 'waddling-gateway', inherited_roles: opts?.inheritedRoles ?? ['postgres'] },
     );
-    // The API uses access_host_url for the connectable host; older shapes expose
-    // `hostname`. Accept either.
-    const hostname = String(raw.access_host_url ?? raw.hostname ?? '');
     return {
-      hostname,
+      hostname: String(raw.access_host_url ?? raw.hostname ?? ''),
       username: String(raw.username ?? ''),
-      plainText: String(raw.plain_text ?? raw.plainText ?? ''),
-      publicId: String(raw.id ?? raw.public_id ?? ''),
+      plainText: String(raw.password ?? raw.plain_text ?? ''),
+      database: String(raw.database_name ?? 'postgres'),
+      id: String(raw.id ?? ''),
     };
   }
 }
