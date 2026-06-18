@@ -61,8 +61,14 @@ const GW_DIR = "/opt/gateway";
 const BOOT_CMD = `node --import tsx ${GW_DIR}/entrypoint.mjs`;
 
 // ── DO classes ─────────────────────────────────────────────────────────────────
-// GatewayDO: bare Sandbox subclass, driven entirely via SDK methods (proven in #2).
-export class GatewayDO extends Sandbox<Env> {}
+// GatewayDO: the TRUSTED gateway. enableInternet=true so all egress ports leave the
+// container — needed for the real catalog (ducklake:postgres on :5432) + R2 (:443).
+// The gateway is the trusted side (holds lake creds); only the WORKSPACE is locked
+// down (enableInternet=false + allowlist). Without this flag the SDK default would
+// (per Stage-0 research) pass only 80/443/DNS, so 5432 would falsely appear blocked.
+export class GatewayDO extends Sandbox<Env> {
+  enableInternet = true;
+}
 
 // WorkspaceSandbox: the agent's locked workspace, with deny-by-default egress. The
 // egress fields are carried verbatim from the proven ws/hop probes; the allowlist is
@@ -317,6 +323,53 @@ async function runProbe(env: Env): Promise<Response> {
   }
 }
 
+// ── Stage D egress GATE: can raw Postgres :5432 leave a GatewayDO container? ─────
+// The gateway's trusted connection ATTACHes `ducklake:postgres:<dsn>` — raw PG wire on
+// :5432 — for the real per-endpoint (per-org PlanetScale) catalog. CF container egress
+// historically passes only HTTP 80/443+DNS (the finding that forced quack onto :443),
+// so 5432 from this container is unproven and gates the whole real-lake/provisioning
+// design. Dials the host from inside the SAME gateway container image the data plane
+// uses, so the result transfers 1:1. Run against a real PlanetScale PG host:
+//   GET /egress?pgHost=us-east-4.pg.psdb.cloud&pgPort=5432
+const R2_ENDPOINT_FOR_PROBE = "https://866403f7ed22a791871b45539ac6fbd7.r2.cloudflarestorage.com";
+async function egressProbe(env: Env, url: URL): Promise<Response> {
+  const pgHost = url.searchParams.get("pgHost");
+  const pgPort = Number(url.searchParams.get("pgPort") ?? "5432");
+  if (!pgHost) return Response.json({ error: "pass ?pgHost=<postgres host>&pgPort=5432" }, { status: 400 });
+  const gw = getSandbox(env.GATEWAY, GW_ID) as unknown as GatewayHandle;
+  await withBootRetry(() => gw.exec("echo ready"), "gw egress warmup");
+
+  // base64-pipe the inline JS to dodge shell quoting.
+  const dialJs =
+    `const net=require('net');` +
+    `const s=net.connect({host:${JSON.stringify(pgHost)},port:${pgPort}},()=>{console.log('CONNECTED');s.destroy();process.exit(0)});` +
+    `s.setTimeout(8000,()=>{console.log('TIMEOUT');try{s.destroy()}catch(e){}process.exit(0)});` +
+    `s.on('error',e=>{console.log('ERROR:'+(e.code||e.message))});`;
+  const dial = await gw.exec(`echo ${btoa(dialJs)} | base64 -d | node`);
+  const pgRaw = dial.stdout.trim();
+
+  const r2Js = `fetch(${JSON.stringify(R2_ENDPOINT_FOR_PROBE)}).then(r=>console.log('R2:'+r.status)).catch(e=>console.log('R2ERR:'+(e.code||e.message)))`;
+  const r2 = await gw.exec(`echo ${btoa(r2Js)} | base64 -d | node`);
+  const r2Raw = r2.stdout.trim();
+
+  const pgConnected = /^CONNECTED/.test(pgRaw);
+  const pgEgressLeaves = pgConnected || /^ERROR:ECONNREFUSED/.test(pgRaw);
+  return Response.json({
+    gate: "stage-d-egress-5432",
+    pgHost, pgPort,
+    pg: {
+      raw: pgRaw,
+      egressLeavesContainer: pgEgressLeaves,
+      verdict: pgConnected
+        ? "5432 egress WORKS — ducklake:postgres (per-org PlanetScale) is viable from the container"
+        : /^ERROR:ECONNREFUSED/.test(pgRaw)
+          ? "reached host, no listener (egress works; check host:port)"
+          : "5432 BLOCKED (timeout/unreachable) — ducklake:postgres NOT viable as-is",
+    },
+    r2: { raw: r2Raw, reachableOver443: /^R2:\d/.test(r2Raw) },
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -330,8 +383,15 @@ export default {
         );
       }
     }
+    if (url.pathname === "/egress") {
+      try {
+        return await egressProbe(env, url);
+      } catch (e) {
+        return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+      }
+    }
     return new Response(
-      "Stage C/D full :443 loop probe (workspace quack:443 → private gateway DO → birdshot). GET /probe to run.\n",
+      "Stage C/D full :443 loop probe. GET /probe (full loop) or GET /egress?pgHost=<h>&pgPort=5432 (Stage D 5432 gate).\n",
       { status: 200 },
     );
   },

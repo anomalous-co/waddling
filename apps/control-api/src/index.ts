@@ -30,6 +30,7 @@ import { billing } from "./routes/billing";
 import { acl } from "./routes/acl";
 import { sessions } from "./routes/sessions";
 import { deviceLink } from "./routes/device-link";
+import { catalog } from "./routes/catalog";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -371,6 +372,7 @@ app.route("/api/cp/billing", billing);
 app.route("/api/cp/acl", acl);
 app.route("/api/cp/sessions", sessions);
 app.route("/api/cp/device-link", deviceLink);
+app.route("/api/cp/catalog", catalog);
 
 app.get("/", (c) =>
   c.text(

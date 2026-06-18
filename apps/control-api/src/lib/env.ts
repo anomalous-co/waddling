@@ -21,6 +21,10 @@ export interface Env {
 
   // ── Worker secret (set via `wrangler secret put`, NOT in vars) ───────────
   BETTER_AUTH_SECRET: string;
+  // PlanetScale API service token SECRET half (per-org managed Postgres catalog
+  // provisioning). The id half + org/cluster/region are non-secret vars below.
+  // Unset ⇒ the managed-postgres catalog path is disabled (getPlanetScaleClient → null).
+  PLANETSCALE_SERVICE_TOKEN?: string;
   // Optional dedicated key for endpoint-credential encryption. Falls back to
   // BETTER_AUTH_SECRET (mirrors the original getSecretEncryptionKey()).
   WADDLING_SECRET_KEY?: string;
@@ -51,6 +55,15 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_PRICE_PRO: string;
   STRIPE_PRICE_ENTERPRISE: string;
+
+  // ── PlanetScale (per-org managed Postgres catalog) — non-secret vars ──────
+  // The service-token id half (public), the org slug that owns provisioned DBs, the
+  // Postgres cluster size, and an optional region. The token SECRET half is a Worker
+  // secret above. All optional: unset ⇒ managed-postgres catalog disabled.
+  PLANETSCALE_SERVICE_TOKEN_ID?: string;
+  PLANETSCALE_ORG?: string;
+  PLANETSCALE_CLUSTER_SIZE?: string;
+  PLANETSCALE_REGION?: string;
 
   // ── R2 (Model B: presigned URLs, no native binding) ──────────────────────
   R2_ENDPOINT: string;

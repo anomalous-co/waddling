@@ -73,6 +73,16 @@
     "STRIPE_PRICE_PRO": "price_placeholder_pro",
     "STRIPE_PRICE_ENTERPRISE": "price_placeholder_ent",
 
+    // PlanetScale per-org managed Postgres catalog. PLACEHOLDERs — replace with the
+    // real service-token id + org slug + cluster size to enable. The token SECRET half
+    // is a Worker secret: `wrangler secret put PLANETSCALE_SERVICE_TOKEN`. Until that
+    // secret is set, getPlanetScaleClient() returns null and /api/cp/catalog 503s
+    // (managed-postgres catalog disabled) — safe to deploy unconfigured.
+    "PLANETSCALE_SERVICE_TOKEN_ID": "PLACEHOLDER_ps_token_id",
+    "PLANETSCALE_ORG": "PLACEHOLDER_ps_org_slug",
+    "PLANETSCALE_CLUSTER_SIZE": "PS-10",
+    "PLANETSCALE_REGION": "us-east",
+
     // (GATEWAY_INTERNAL_URL removed: the gateway now lives in the waddling-dataplane
     // worker's GatewayDO, reached over the DATAPLANE service binding — see services.)
 

@@ -69,7 +69,14 @@ const wsDoId = (workspaceId: string, agentId: string): string => `${workspaceId}
 const workspaceObjectKey = (workspaceId: string, agentId: string): string => `workspace/${workspaceId}/db/${agentId}.duckdb`;
 
 // ── DO classes ─────────────────────────────────────────────────────────────────
-export class GatewayDO extends Sandbox<Env> {}
+// GatewayDO: the TRUSTED gateway. enableInternet=true so ALL egress ports leave the
+// container — the production catalog is ducklake:postgres on :5432 (raw PG wire) plus
+// R2 on :443. The gateway holds the lake creds and is the trusted side; only the
+// WORKSPACE is locked down (enableInternet=false + deny-by-default allowlist + the one
+// quack:443 tunnel). The SDK default would pass only 80/443/DNS, blocking the catalog.
+export class GatewayDO extends Sandbox<Env> {
+  enableInternet = true;
+}
 
 export class WorkspaceSandbox extends Sandbox<Env> {
   enableInternet = false;
