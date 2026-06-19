@@ -168,7 +168,10 @@ export function DuckScene({ className, embed = true }: DuckSceneProps) {
       renderTarget.setSize(rw2, rh2);
       mergePass.uniforms['uSourceRes'].value.set(rw2, rh2);
       composer.setSize(rw2, rh2);
-      mergePass.uniforms['uResolution'].value.set(w, h);
+      // uResolution must match the drawing buffer (device pixels), not CSS px —
+      // the merge shader divides gl_FragCoord (device px) by it. On HiDPI the
+      // mismatch stretches the top/right third past the texture edge.
+      mergePass.uniforms['uResolution'].value.set(w * pr2, h * pr2);
     };
     window.addEventListener('resize', onResize);
     // Initialize the merge pass's uniforms on the actual (cloned) pass material.
