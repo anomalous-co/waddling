@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import type { Metadata } from 'next';
 import { PLANS } from '@/lib/plans';
+import { appUrl } from '@/lib/site';
 
 // PLANS shape (from @waddling/control-schema via @/lib/types):
 // Plan = { name:'free'|'pro'|'enterprise'; priceId:string; entitlements:{endpoints:number;agents:number;dynamicAcl:boolean;adminMcp:boolean;auditRetentionDays:number} }
@@ -20,7 +21,7 @@ const PLAN_COPY = [
     period: 'forever',
     tagline: 'Audit and monitor. No credit card.',
     cta: 'start free',
-    ctaHref: '/dashboard',
+    ctaHref: appUrl('/dashboard'),
     highlight: false,
     features: [
       '1 endpoint · 2 agents',
@@ -40,7 +41,7 @@ const PLAN_COPY = [
     period: 'seat / month',
     tagline: 'Full dynamic ACL for your agents.',
     cta: 'start pro trial',
-    ctaHref: '/dashboard?plan=pro',
+    ctaHref: appUrl('/dashboard?plan=pro'),
     highlight: true,
     features: [
       'Up to 5 endpoints',

@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { appUrl } from '@/lib/site';
 import { GiCorkHat, GiPirateHat, GiMagicHat, GiPointyHat } from 'react-icons/gi';
 import { FaHardHat } from 'react-icons/fa';
 import { LakePond, type PondDuck } from '@/components/lake-pond';
@@ -201,7 +202,7 @@ export function PersonaRows({ invite = true }: { invite?: boolean }) {
               </p>
             </div>
             <Link
-              href="/dashboard"
+              href={appUrl('/dashboard')}
               className="shrink-0 bg-emerald-500 hover:bg-emerald-400 text-[#0c0a09] font-mono font-semibold text-sm px-5 py-2.5 rounded transition-colors"
             >
               start free →

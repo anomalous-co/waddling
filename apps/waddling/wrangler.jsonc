@@ -6,10 +6,16 @@
   // nodejs_compat: required by @opennextjs/cloudflare. global_fetch_strictly_public:
   // OpenNext's recommended flag so the worker's own asset/route fetches resolve publicly.
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
-  // Production origin: app.getwaddling.com (custom domain on the getwaddling.com
-  // zone). Same registrable domain as api.getwaddling.com so the auth cookie is
-  // first-party same-site — see control-api's COOKIE_DOMAIN/WEB_ORIGIN.
+  // One worker, two custom domains (host-split by src/middleware.ts):
+  //   • getwaddling.com      — marketing (landing, docs, blog, customers,
+  //                            pricing, enterprise, memory)
+  //   • app.getwaddling.com  — the product (sign-in/up, dashboard, /link); the
+  //                            only host that makes credentialed API calls, so it
+  //                            alone is control-api's WEB_ORIGIN.
+  // Both sit on the getwaddling.com zone → same registrable domain as
+  // api.getwaddling.com, so the auth cookie is first-party same-site.
   "routes": [
+    { "pattern": "getwaddling.com", "custom_domain": true },
     { "pattern": "app.getwaddling.com", "custom_domain": true }
   ],
   "assets": {

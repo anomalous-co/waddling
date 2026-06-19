@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import type { Metadata } from 'next';
+import { appUrl } from '@/lib/site';
 import { LakeScene } from '@/components/lake-scene';
 import { SkyScene } from '@/components/sky-scene';
 import { PersonaRows } from './customers/customers-content';
@@ -209,7 +210,7 @@ LIMIT 500;
           </p>
           <div className="flex justify-center gap-4 flex-wrap">
             <Link
-              href="/dashboard"
+              href={appUrl('/dashboard')}
               className="bg-emerald-500 hover:bg-emerald-400 text-[#0c0a09] font-mono font-semibold px-6 py-3 rounded transition-colors"
             >
               start free

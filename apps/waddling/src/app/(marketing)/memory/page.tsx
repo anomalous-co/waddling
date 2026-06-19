@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import type { Metadata } from 'next';
+import { appUrl } from '@/lib/site';
 import { DuckScene } from '@/components/duck-scene';
 import { SingleDuckScene } from '@/components/single-duck-scene';
 
@@ -184,7 +185,7 @@ ORDER BY a.ts DESC;
           </p>
           <div className="flex justify-center gap-4 flex-wrap">
             <Link
-              href="/dashboard"
+              href={appUrl('/dashboard')}
               className="bg-emerald-500 hover:bg-emerald-400 text-[#0c0a09] font-mono font-semibold px-6 py-3 rounded transition-colors"
             >
               start free

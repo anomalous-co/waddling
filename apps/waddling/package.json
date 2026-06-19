@@ -7,7 +7,7 @@
     "build": "next build --webpack",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "cf:build": "NEXT_PUBLIC_CONTROL_API_URL=${NEXT_PUBLIC_CONTROL_API_URL:-https://api.getwaddling.com} opennextjs-cloudflare build",
+    "cf:build": "NEXT_PUBLIC_CONTROL_API_URL=${NEXT_PUBLIC_CONTROL_API_URL:-https://api.getwaddling.com} NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL:-https://getwaddling.com} NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-https://app.getwaddling.com} opennextjs-cloudflare build",
     "preview": "pnpm cf:build && opennextjs-cloudflare preview",
     "deploy": "pnpm cf:build && opennextjs-cloudflare deploy",
     "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts"

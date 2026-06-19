@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { ThemeToggle } from '@/components/theme-toggle';
+import { appUrl } from '@/lib/site';
 
 const LINKS = [
   { href: '/docs', label: 'docs' },
@@ -36,7 +37,7 @@ export function MarketingNav() {
           ))}
           <ThemeToggle className="text-zinc-400 hover:text-zinc-50 hover:bg-zinc-800" />
           <Link
-            href="/dashboard"
+            href={appUrl('/dashboard')}
             className="bg-zinc-100 text-zinc-900 px-3 py-1.5 rounded font-mono text-sm hover:bg-zinc-50 transition-colors"
           >
             sign in
@@ -72,7 +73,7 @@ export function MarketingNav() {
             </Link>
           ))}
           <Link
-            href="/dashboard"
+            href={appUrl('/dashboard')}
             onClick={() => setOpen(false)}
             className="bg-zinc-100 text-zinc-900 px-3 py-1.5 rounded font-mono text-sm hover:bg-zinc-50 transition-colors text-center"
           >
