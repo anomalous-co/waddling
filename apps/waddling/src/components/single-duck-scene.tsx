@@ -140,6 +140,10 @@ export function SingleDuckScene({ className }: Props) {
       mergePass.uniforms['uResolution'].value.set(w, h);
     };
     window.addEventListener('resize', onResize);
+    // ShaderPass clones SHADER.uniforms, so the uResolution written to the shared
+    // singleton above never reaches the render material. Seed the cloned uniforms
+    // once at startup, otherwise the first frame divides by (1,1) → all black.
+    onResize();
 
     const duckData: { gridX: number; gridY: number; gridZ: number; scale: number; offsetY: number; rotSpeed: number; angle: number }[] = [];
     let duckMeshes: THREE.InstancedMesh | null = null;

@@ -171,6 +171,11 @@ export function DuckScene({ className, embed = true }: DuckSceneProps) {
       mergePass.uniforms['uResolution'].value.set(w, h);
     };
     window.addEventListener('resize', onResize);
+    // Initialize the merge pass's uniforms on the actual (cloned) pass material.
+    // ShaderPass clones MERGED_SHADER.uniforms, so the uResolution written to the
+    // shared singleton above never reaches the render material — without this the
+    // first frame divides gl_FragCoord by (1,1) and the whole scene samples black.
+    onResize();
 
     // ── Load STL ──
     let duckData: { gridX: number; gridY: number; gridZ: number; scale: number; offsetY: number; rotSpeed: number; wobbleAmp: number; wobbleSpeed: number; angle: number }[] = [];
