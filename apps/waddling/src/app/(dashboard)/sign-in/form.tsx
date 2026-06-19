@@ -1,10 +1,16 @@
 'use client';
 
-import { useState, FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
+import { Loader2 } from 'lucide-react';
 import { authClient } from '@/lib/auth-client';
-import { Input, Label, Button } from '@/components/dashboard/ui';
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
+import { Field, FieldLabel, FieldGroup } from '@/components/ui/field';
+import { BrandMark } from '@/components/brand-mark';
 
 export function SignInForm() {
   const router = useRouter();
@@ -32,75 +38,68 @@ export function SignInForm() {
   };
 
   return (
-    <div className="min-h-screen bg-neutral-950 flex items-center justify-center px-4">
-      <div className="w-full max-w-sm">
-        {/* Logo */}
-        <div className="text-center mb-8">
-          <span className="font-mono font-bold text-xl text-blue-400">
-            waddling
-          </span>
-          <p className="text-neutral-500 text-sm mt-1">
-            Dynamic ACLs for AI agents
-          </p>
+    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+      <div className="flex w-full max-w-sm flex-col gap-6">
+        <div className="flex flex-col items-center gap-2">
+          <BrandMark />
+          <p className="text-sm text-muted-foreground">Dynamic ACLs for AI agents</p>
         </div>
 
-        <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-6">
-          <h1 className="text-base font-semibold text-neutral-100 mb-5">
-            Sign in
-          </h1>
+        <Card>
+          <CardHeader>
+            <CardTitle>Sign in</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={(e) => void submit(e)}>
+              <FieldGroup className="gap-4">
+                <Field>
+                  <FieldLabel htmlFor="email">Email</FieldLabel>
+                  <Input
+                    id="email"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    required
+                    autoComplete="email"
+                    placeholder="you@example.com"
+                  />
+                </Field>
 
-          <form onSubmit={(e) => void submit(e)} className="space-y-4">
-            <div>
-              <Label htmlFor="email">Email</Label>
-              <Input
-                id="email"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                required
-                autoComplete="email"
-                placeholder="you@example.com"
-              />
-            </div>
-            <div>
-              <Label htmlFor="password">Password</Label>
-              <Input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                autoComplete="current-password"
-                placeholder="••••••••"
-              />
-            </div>
+                <Field>
+                  <FieldLabel htmlFor="password">Password</FieldLabel>
+                  <Input
+                    id="password"
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                    autoComplete="current-password"
+                    placeholder="••••••••"
+                  />
+                </Field>
 
-            {error && (
-              <p className="text-xs text-red-400 rounded border border-red-900 bg-red-950/40 px-3 py-2">
-                {error}
-              </p>
-            )}
+                {error ? (
+                  <Alert variant="destructive">
+                    <AlertTitle>Sign-in failed</AlertTitle>
+                    <AlertDescription>{error}</AlertDescription>
+                  </Alert>
+                ) : null}
 
-            <Button
-              variant="primary"
-              className="w-full"
-              type="submit"
-              loading={loading}
-            >
-              Sign in
-            </Button>
-          </form>
+                <Button type="submit" disabled={loading} className="w-full">
+                  {loading ? <Loader2 data-icon="inline-start" className="animate-spin" /> : null}
+                  Sign in
+                </Button>
+              </FieldGroup>
+            </form>
 
-          <p className="text-center text-xs text-neutral-500 mt-4">
-            No account?{' '}
-            <Link
-              href="/sign-up"
-              className="text-blue-400 hover:text-blue-300"
-            >
-              Create one
-            </Link>
-          </p>
-        </div>
+            <p className="mt-4 text-center text-xs text-muted-foreground">
+              No account?{' '}
+              <Link href="/sign-up" className="text-primary hover:underline">
+                Create one
+              </Link>
+            </p>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );

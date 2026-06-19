@@ -10,7 +10,7 @@ export default function MarketingLayout({ children }: { children: ReactNode }) {
       <footer className="border-t border-zinc-800 px-6 py-10 mt-20">
         <div className="mx-auto max-w-6xl flex flex-col sm:flex-row items-start justify-between gap-8">
           <div>
-            <div className="font-mono font-bold text-zinc-50 mb-1">waddling</div>
+            <div className="font-coiny text-lg text-zinc-50 mb-1">waddling</div>
             <div className="text-xs text-zinc-500 font-mono">dynamic ACLs for AI agents on your lakehouse</div>
           </div>
           <div className="flex flex-wrap gap-x-10 gap-y-8 text-sm font-mono text-zinc-400">

@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { ThemeToggle } from '@/components/theme-toggle';
+import { BrandMark } from '@/components/brand-mark';
 import { appUrl } from '@/lib/site';
 
 const LINKS = [
@@ -19,8 +20,8 @@ export function MarketingNav() {
   return (
     <nav className="border-b border-zinc-800 bg-zinc-950/80 backdrop-blur-sm">
       <div className="px-6 py-4 flex items-center justify-between">
-        <Link href="/" className="flex items-center gap-2">
-          <span className="font-mono font-bold text-zinc-50 text-lg tracking-tight">waddling</span>
+        <Link href="/" className="flex items-end gap-2">
+          <BrandMark className="text-zinc-50" />
           <span className="text-xs font-mono text-zinc-500 border border-zinc-700 rounded px-1.5 py-0.5">beta</span>
         </Link>
 

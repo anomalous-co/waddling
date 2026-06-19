@@ -1,11 +1,80 @@
 'use client';
 
-import { type ReactNode, useState, useEffect } from 'react';
+import { type ReactNode, Fragment, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
+import {
+  Building2,
+  ChevronsUpDown,
+  Database,
+  Plus,
+  Check,
+  LogOut,
+  Settings,
+  CreditCard,
+  Plug,
+  LayoutDashboard,
+  Bot,
+  ShieldCheck,
+  Radio,
+  ScrollText,
+  BarChart3,
+  NotebookText,
+  Table2,
+  Sun,
+  Moon,
+  Monitor,
+  User,
+  Palette,
+} from 'lucide-react';
+import { useTheme } from 'fumadocs-ui/provider/base';
 import { authClient } from '@/lib/auth-client';
-import { ToastProvider } from '@/components/dashboard/toast';
-import { ThemeToggle } from '@/components/theme-toggle';
+import { DataLakeIcon } from '@/components/data-lake-icon';
+import { BrandMark } from '@/components/brand-mark';
+import { fetchCp } from '@/components/dashboard/fetch';
+import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Separator } from '@/components/ui/separator';
+import { Toaster } from '@/components/ui/sonner';
+import { TooltipProvider } from '@/components/ui/tooltip';
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarRail,
+  SidebarTrigger,
+} from '@/components/ui/sidebar';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuGroup,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+} from '@/components/ui/dropdown-menu';
+import {
+  Breadcrumb,
+  BreadcrumbList,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from '@/components/ui/breadcrumb';
 
 interface UserInfo {
   id: string;
@@ -20,136 +89,366 @@ interface Org {
   slug: string;
 }
 
-const NAV = [
-  { href: '/dashboard', label: 'Overview', icon: '◈' },
-  { href: '/dashboard/endpoints', label: 'Endpoints', icon: '⬡' },
-  { href: '/dashboard/agents', label: 'Agents', icon: '⬟' },
-  { href: '/dashboard/acl', label: 'ACL Rules', icon: '⬗' },
-  { href: '/dashboard/notebooks', label: 'Notebooks', icon: '◧' },
-  { href: '/dashboard/views', label: 'Views', icon: '◫' },
-  { href: '/dashboard/audit', label: 'Audit Log', icon: '◎' },
-  { href: '/dashboard/usage', label: 'Usage', icon: '◑' },
-  { href: '/dashboard/billing', label: 'Billing', icon: '◇' },
-  { href: '/dashboard/settings', label: 'Settings', icon: '◉' },
+interface EndpointSummary {
+  id: string;
+  name: string;
+  slug: string;
+  status: string;
+}
+
+// Grouped primary nav. Billing + Settings live in the user menu; the onboarding
+// flow is the header "Connect" action.
+const NAV_GROUPS = [
+  {
+    label: 'Platform',
+    items: [
+      { href: '/dashboard', label: 'Overview', icon: LayoutDashboard },
+      { href: '/dashboard/endpoints', label: 'Endpoints', icon: DataLakeIcon },
+      { href: '/dashboard/agents', label: 'Agents', icon: Bot },
+      { href: '/dashboard/acl', label: 'Access', icon: ShieldCheck },
+    ],
+  },
+  {
+    label: 'Operations',
+    items: [
+      { href: '/dashboard/sessions', label: 'Sessions', icon: Radio },
+      { href: '/dashboard/audit', label: 'Audit', icon: ScrollText },
+      { href: '/dashboard/usage', label: 'Usage', icon: BarChart3 },
+    ],
+  },
+  {
+    label: 'Workspace',
+    items: [
+      { href: '/dashboard/notebooks', label: 'Notebooks', icon: NotebookText },
+      { href: '/dashboard/views', label: 'Views', icon: Table2 },
+    ],
+  },
 ] as const;
 
-function OrgSwitcher({ initialActiveOrgId }: { initialActiveOrgId?: string }) {
+const SEGMENT_LABELS: Record<string, string> = {
+  dashboard: 'Overview',
+  endpoints: 'Endpoints',
+  agents: 'Agents',
+  acl: 'Access',
+  sessions: 'Sessions',
+  audit: 'Audit',
+  usage: 'Usage',
+  notebooks: 'Notebooks',
+  views: 'Views',
+  billing: 'Billing',
+  settings: 'Organization',
+  account: 'Account',
+  onboarding: 'Connect',
+  new: 'New',
+};
+
+function isActive(pathname: string, href: string): boolean {
+  return href === '/dashboard'
+    ? pathname === '/dashboard'
+    : pathname.startsWith(href);
+}
+
+function UserMenu({
+  user,
+  activeOrgId,
+}: {
+  user: UserInfo;
+  activeOrgId?: string;
+}) {
+  const router = useRouter();
+  const { theme, setTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
   const [orgs, setOrgs] = useState<Org[]>([]);
   const [activeOrg, setActiveOrg] = useState<Org | null>(null);
-  const [open, setOpen] = useState(false);
-  const [loaded, setLoaded] = useState(false);
 
-  // Load org list once the switcher is opened
-  const loadOrgs = () => {
-    if (loaded) return;
-    setLoaded(true);
-    void authClient.organization
-      .list()
-      .then((res) => {
-        const list = (res.data ?? []) as Org[];
-        setOrgs(list);
-        // Find the active org by the id passed from the server session
-        if (initialActiveOrgId) {
-          const found = list.find((o) => o.id === initialActiveOrgId);
-          if (found) setActiveOrg(found);
-        } else if (list.length > 0) {
-          // fallback: first org
-          setActiveOrg(list[0] ?? null);
-        }
-      });
-  };
+  useEffect(() => {
+    let cancelled = false;
+    void authClient.organization.list().then((res) => {
+      if (cancelled) return;
+      const list = (res.data ?? []) as Org[];
+      setOrgs(list);
+      const found = activeOrgId
+        ? list.find((o) => o.id === activeOrgId)
+        : undefined;
+      setActiveOrg(found ?? list[0] ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeOrgId]);
 
   const switchOrg = async (org: Org) => {
     await authClient.organization.setActive({ organizationId: org.id });
-    setOpen(false);
-    // Hard navigate so all server components + client useEffect fetches
-    // re-execute with the new active org. router.refresh() only re-runs
-    // server components but preserves client state, leaving stale data.
     window.location.assign('/dashboard');
   };
 
-  // Load orgs on first render so activeOrg label is shown immediately
-  useEffect(() => {
-    loadOrgs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const signOut = async () => {
+    await authClient.signOut();
+    router.push('/sign-in');
+  };
+  const initial = (user.name || user.email).charAt(0).toUpperCase();
 
   return (
-    <div className="relative">
-      <button
-        onClick={() => {
-          loadOrgs();
-          setOpen(!open);
-        }}
-        className="w-full flex items-center gap-2 px-3 py-2 rounded border border-neutral-700 bg-neutral-800 hover:bg-neutral-700 transition-colors text-left"
-      >
-        <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
-        <span className="text-sm text-neutral-200 truncate flex-1">
-          {activeOrg?.name ?? 'Select org'}
-        </span>
-        <span className="text-neutral-500 text-xs">{open ? '▲' : '▼'}</span>
-      </button>
-      {open && (
-        <div className="absolute top-full left-0 right-0 mt-1 rounded border border-neutral-700 bg-neutral-800 shadow-lg z-20">
-          {orgs.map((org) => (
-            <button
-              key={org.id}
-              onClick={() => void switchOrg(org)}
-              className={[
-                'w-full text-left px-3 py-2 text-sm hover:bg-neutral-700 transition-colors',
-                org.id === activeOrg?.id
-                  ? 'text-neutral-100 font-medium'
-                  : 'text-neutral-400',
-              ].join(' ')}
+    <SidebarMenu>
+      <SidebarMenuItem>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <SidebarMenuButton
+              size="lg"
+              className="data-[state=open]:bg-sidebar-accent"
             >
-              {org.name}
-            </button>
-          ))}
-          <div className="border-t border-neutral-700 px-3 py-2">
-            <button
-              onClick={() => {
-                setOpen(false);
-                window.location.assign('/dashboard/settings?create=org');
-              }}
-              className="text-xs text-blue-400 hover:text-blue-300 cursor-pointer"
-            >
-              + Create new org
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
+              <Avatar className="size-8 rounded-md">
+                {user.image ? (
+                  <AvatarImage
+                    src={user.image}
+                    alt={user.name}
+                    className="rounded-md"
+                  />
+                ) : null}
+                <AvatarFallback className="rounded-md">{initial}</AvatarFallback>
+              </Avatar>
+              <div className="grid flex-1 text-left leading-tight">
+                <span className="truncate font-semibold">{user.name}</span>
+                <span className="truncate text-xs text-muted-foreground">
+                  {user.email}
+                </span>
+              </div>
+              <ChevronsUpDown className="ml-auto text-muted-foreground" />
+            </SidebarMenuButton>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="end"
+            side="top"
+            className="w-(--radix-dropdown-menu-trigger-width) min-w-56"
+          >
+            <DropdownMenuLabel className="flex flex-col gap-0.5">
+              <span className="truncate font-medium">{user.name}</span>
+              <span className="truncate text-xs font-normal text-muted-foreground">
+                {user.email}
+              </span>
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              <DropdownMenuItem asChild>
+                <Link href="/dashboard/account">
+                  <User data-icon="inline-start" />
+                  Account
+                </Link>
+              </DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Building2 data-icon="inline-start" />
+                  Organization
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  {orgs.map((org) => (
+                    <DropdownMenuItem
+                      key={org.id}
+                      onClick={() => void switchOrg(org)}
+                    >
+                      <Building2 data-icon="inline-start" />
+                      <span className="truncate">{org.name}</span>
+                      {org.id === activeOrg?.id ? (
+                        <Check data-icon="inline-end" className="ml-auto" />
+                      ) : null}
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem asChild>
+                    <Link href="/dashboard/settings">
+                      <Settings data-icon="inline-start" />
+                      Organization settings
+                    </Link>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem asChild>
+                    <Link href="/dashboard/settings?create=org">
+                      <Plus data-icon="inline-start" />
+                      Create organization
+                    </Link>
+                  </DropdownMenuItem>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+              <DropdownMenuItem asChild>
+                <Link href="/dashboard/billing">
+                  <CreditCard data-icon="inline-start" />
+                  Billing
+                </Link>
+              </DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Palette data-icon="inline-start" />
+                  Theme
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  <DropdownMenuRadioGroup
+                    value={mounted ? (theme ?? 'system') : undefined}
+                    onValueChange={setTheme}
+                  >
+                    <DropdownMenuRadioItem value="light">
+                      <Sun data-icon="inline-start" />
+                      Light
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="dark">
+                      <Moon data-icon="inline-start" />
+                      Dark
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="system">
+                      <Monitor data-icon="inline-start" />
+                      System
+                    </DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            </DropdownMenuGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => void signOut()}>
+              <LogOut data-icon="inline-start" />
+              Sign out
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </SidebarMenuItem>
+    </SidebarMenu>
   );
 }
 
-function NavItem({
-  href,
-  label,
-  icon,
+function AppSidebar({
+  user,
+  activeOrgId,
 }: {
-  href: string;
-  label: string;
-  icon: string;
+  user: UserInfo;
+  activeOrgId?: string;
 }) {
   const pathname = usePathname();
-  const active =
-    href === '/dashboard'
-      ? pathname === '/dashboard'
-      : pathname.startsWith(href);
+  return (
+    <Sidebar
+      collapsible="icon"
+      className="top-(--header-height) !h-[calc(100svh-var(--header-height))] [--dl-gap:var(--sidebar)]"
+    >
+      <SidebarContent>
+        {NAV_GROUPS.map((group) => (
+          <SidebarGroup key={group.label}>
+            <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  return (
+                    <SidebarMenuItem key={item.href}>
+                      <SidebarMenuButton
+                        asChild
+                        isActive={isActive(pathname, item.href)}
+                        tooltip={item.label}
+                      >
+                        <Link href={item.href}>
+                          <Icon />
+                          <span>{item.label}</span>
+                        </Link>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                })}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ))}
+      </SidebarContent>
+      <SidebarFooter>
+        <UserMenu user={user} activeOrgId={activeOrgId} />
+      </SidebarFooter>
+      <SidebarRail />
+    </Sidebar>
+  );
+}
+
+function EndpointSwitcher() {
+  const router = useRouter();
+  const [endpoints, setEndpoints] = useState<EndpointSummary[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchCp<{ endpoints: EndpointSummary[] }>('/api/cp/endpoints').then(
+      (res) => {
+        if (!cancelled && res.ok) setEndpoints(res.data.endpoints ?? []);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
-    <Link
-      href={href}
-      className={[
-        'flex items-center gap-2.5 px-3 py-2 rounded text-sm transition-colors',
-        active
-          ? 'bg-neutral-800 text-neutral-100'
-          : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50',
-      ].join(' ')}
-    >
-      <span className="w-4 text-center opacity-70">{icon}</span>
-      {label}
-    </Link>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className="gap-2">
+          <Database data-icon="inline-start" />
+          <span className="hidden max-w-32 truncate sm:inline">
+            {endpoints.length ? `${endpoints.length} endpoints` : 'Endpoints'}
+          </span>
+          <ChevronsUpDown data-icon="inline-end" className="text-muted-foreground" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-64">
+        <DropdownMenuLabel>Data lakes</DropdownMenuLabel>
+        <DropdownMenuGroup>
+          {endpoints.map((ep) => (
+            <DropdownMenuItem
+              key={ep.id}
+              onClick={() => router.push(`/dashboard/endpoints/${ep.id}`)}
+            >
+              <span
+                className={cn(
+                  'size-2 rounded-full',
+                  ep.status === 'running' ? 'bg-green-500' : 'bg-muted-foreground',
+                )}
+              />
+              <span className="truncate">{ep.name}</span>
+              <span className="ml-auto text-xs text-muted-foreground">
+                {ep.status}
+              </span>
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem asChild>
+          <Link href="/dashboard/endpoints/new">
+            <Plus data-icon="inline-start" />
+            New endpoint
+          </Link>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function Breadcrumbs({ pathname }: { pathname: string }) {
+  const segments = pathname.split('/').filter(Boolean);
+  const crumbs = segments.map((seg, i) => ({
+    href: '/' + segments.slice(0, i + 1).join('/'),
+    label: SEGMENT_LABELS[seg] ?? seg,
+    last: i === segments.length - 1,
+  }));
+
+  return (
+    <Breadcrumb>
+      <BreadcrumbList>
+        {crumbs.map((c) => (
+          <Fragment key={c.href}>
+            <BreadcrumbItem>
+              {c.last ? (
+                <BreadcrumbPage>{c.label}</BreadcrumbPage>
+              ) : (
+                <BreadcrumbLink asChild>
+                  <Link href={c.href}>{c.label}</Link>
+                </BreadcrumbLink>
+              )}
+            </BreadcrumbItem>
+            {c.last ? null : <BreadcrumbSeparator />}
+          </Fragment>
+        ))}
+      </BreadcrumbList>
+    </Breadcrumb>
   );
 }
 
@@ -162,68 +461,43 @@ export function DashboardShell({
   activeOrgId?: string;
   children: ReactNode;
 }) {
-  const router = useRouter();
-
-  const signOut = async () => {
-    await authClient.signOut();
-    router.push('/sign-in');
-  };
+  const pathname = usePathname();
 
   return (
-    <ToastProvider>
-    <div className="flex min-h-screen bg-neutral-950 text-neutral-100">
-      {/* Sidebar */}
-      <aside className="w-56 flex-shrink-0 flex flex-col border-r border-neutral-800 bg-neutral-950">
-        {/* Logo */}
-        <div className="px-4 py-4 border-b border-neutral-800">
-          <Link href="/dashboard" className="flex items-center gap-2">
-            <span className="text-blue-400 font-mono font-bold text-base">
-              waddling
-            </span>
-          </Link>
-        </div>
-
-        {/* Org switcher */}
-        <div className="px-3 pt-3 pb-2">
-          <OrgSwitcher initialActiveOrgId={activeOrgId} />
-        </div>
-
-        {/* Nav */}
-        <nav className="flex-1 px-2 py-2 space-y-0.5 overflow-y-auto">
-          {NAV.map((item) => (
-            <NavItem key={item.href} {...item} />
-          ))}
-        </nav>
-
-        {/* User footer */}
-        <div className="border-t border-neutral-800 px-3 py-3">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-full bg-neutral-700 flex items-center justify-center text-xs font-medium text-neutral-300 flex-shrink-0">
-              {user.name.charAt(0).toUpperCase()}
+    <TooltipProvider delayDuration={200}>
+      <div className="[--header-height:calc(--spacing(14))]">
+        <SidebarProvider className="flex flex-col">
+          <header className="sticky top-0 z-50 flex h-(--header-height) shrink-0 items-center gap-2 border-b border-border bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+            <Link href="/dashboard" className="flex shrink-0 items-center">
+              <BrandMark iconClassName="size-5" textClassName="text-lg" />
+            </Link>
+            <Separator orientation="vertical" className="mr-1 h-4 shrink-0" />
+            <SidebarTrigger className="-ml-1 shrink-0" />
+            <Separator orientation="vertical" className="mr-1 h-4 shrink-0" />
+            <div className="min-w-0 flex-1 overflow-hidden">
+              <Breadcrumbs pathname={pathname} />
             </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-neutral-300 truncate">
-                {user.name}
-              </p>
-              <p className="text-xs text-neutral-600 truncate">{user.email}</p>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <EndpointSwitcher />
+              <Button asChild size="sm">
+                <Link href="/dashboard/onboarding">
+                  <Plug data-icon="inline-start" />
+                  <span className="hidden sm:inline">Connect</span>
+                </Link>
+              </Button>
             </div>
-            <ThemeToggle className="text-neutral-600 hover:text-neutral-300 hover:bg-neutral-800" />
-            <button
-              onClick={() => void signOut()}
-              title="Sign out"
-              className="text-neutral-600 hover:text-neutral-300 transition-colors text-xs cursor-pointer"
-            >
-              ⏻
-            </button>
+          </header>
+          <div className="flex flex-1">
+            <AppSidebar user={user} activeOrgId={activeOrgId} />
+            <SidebarInset className="min-w-0">
+              <div className="flex min-w-0 flex-1 flex-col gap-4 p-6">
+                {children}
+              </div>
+            </SidebarInset>
           </div>
-        </div>
-      </aside>
-
-      {/* Main */}
-      <main className="flex-1 min-w-0 overflow-y-auto">
-        <div className="max-w-5xl mx-auto px-6 py-6">{children}</div>
-      </main>
-    </div>
-    </ToastProvider>
+        </SidebarProvider>
+      </div>
+      <Toaster />
+    </TooltipProvider>
   );
 }

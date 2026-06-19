@@ -2,6 +2,19 @@ import './globals.css';
 import { RootProvider } from 'fumadocs-ui/provider/next';
 import type { ReactNode } from 'react';
 import { PostHogSetup } from '@/lib/posthog-client';
+import { Geist } from "next/font/google";
+import localFont from "next/font/local";
+import { cn } from "@/lib/utils";
+
+const geist = Geist({subsets:['latin'],variable:'--font-sans'});
+
+// Coiny (SIL OFL) — the rounded display face used for the "waddling" wordmark.
+const coiny = localFont({
+  src: './fonts/Coiny-Regular.ttf',
+  weight: '400',
+  display: 'swap',
+  variable: '--font-coiny',
+});
 
 export const metadata = {
   title: 'waddling — Dynamic ACLs for AI agents',
@@ -11,7 +24,7 @@ export const metadata = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning className={cn("font-sans", geist.variable, coiny.variable)}>
       <body className="flex flex-col min-h-screen">
         {/* PostHogSetup is a no-op passthrough when NEXT_PUBLIC_POSTHOG_KEY is unset */}
         <PostHogSetup>
