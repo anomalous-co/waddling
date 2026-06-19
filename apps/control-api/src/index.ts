@@ -11,6 +11,7 @@
 // the whole probe surface.
 
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { AwsClient } from "aws4fetch";
 import { Pool } from "pg";
 import type { Env } from "./lib/env";
@@ -44,6 +45,29 @@ function errMessage(e: unknown): string {
 // ambient env on workerd) and are idempotent — only the first request in a warm
 // isolate does work. The crypto secret uses WADDLING_SECRET_KEY with a
 // BETTER_AUTH_SECRET fallback (mirrors the original getSecretEncryptionKey()).
+// ─── CORS (cross-origin browser dashboard) ───────────────────────────────────
+// The UI render plane runs on its own origin (WEB_ORIGIN) and calls /api/cp/* +
+// /api/auth/* here cross-origin WITH credentials, so each non-simple request is
+// preflighted. Credentialed CORS forbids `Access-Control-Allow-Origin: *`, so we
+// ECHO the request origin only when it is in WEB_ORIGIN (comma-separated allowlist).
+// Registered FIRST and scoped to /api/* so an OPTIONS preflight short-circuits here
+// (Hono's cors answers it without next()) and never opens a DB/auth pool below.
+// Unset WEB_ORIGIN ⇒ no allowlist ⇒ no ACAO header (same-origin / service-binding
+// callers are unaffected; cross-origin browsers are correctly blocked).
+app.use("/api/*", (c, next) => {
+  const allow = (c.env.WEB_ORIGIN ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return cors({
+    origin: (origin) => (allow.includes(origin) ? origin : null),
+    credentials: true,
+    allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+    maxAge: 600,
+  })(c, next);
+});
+
 app.use("*", async (c, next) => {
   initCrypto(c.env.WADDLING_SECRET_KEY ?? c.env.BETTER_AUTH_SECRET);
   initDataplane(c.env.DATAPLANE);

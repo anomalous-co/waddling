@@ -43,6 +43,21 @@ export interface Env {
   // own base URL in this deployment.
   APP_URL?: string;
 
+  // The render-plane (UI) Worker's browser origin, e.g. https://app.getwaddling.com.
+  // The dashboard now runs on its own origin and calls /api/cp/* + /api/auth/* here
+  // cross-origin, so this origin must be echoed in CORS Access-Control-Allow-Origin
+  // (credentialed CORS forbids `*`) and added to Better Auth's trustedOrigins.
+  // Comma-separated to allow more than one (e.g. a preview origin). Unset ⇒ no
+  // cross-origin CORS is emitted (same-origin / service-binding only).
+  WEB_ORIGIN?: string;
+
+  // Registrable parent domain for the session cookie, e.g. ".getwaddling.com", so
+  // the cookie set by this API origin is also sent to the UI origin (same-site,
+  // first-party). Set ONLY when the UI + API are subdomains of one registrable
+  // domain. Unset ⇒ host-only cookie (correct for single-origin or service-binding
+  // SSR, where the cookie is forwarded explicitly and domain scoping is moot).
+  COOKIE_DOMAIN?: string;
+
   // One-key-per-agent session policy (original read process.env at module load;
   // there is no ambient env on workerd, so it moves to a per-request c.env read).
   // 'reject' refuses a second concurrent connect; anything else ⇒ 'supersede'.

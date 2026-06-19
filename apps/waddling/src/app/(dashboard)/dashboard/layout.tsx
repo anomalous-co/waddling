@@ -1,6 +1,5 @@
 import { redirect } from 'next/navigation';
-import { headers } from 'next/headers';
-import { auth } from '@/lib/auth';
+import { getServerSession } from '@/lib/control-api-server';
 import { DashboardShell } from '@/components/dashboard/shell';
 import type { ReactNode } from 'react';
 
@@ -9,9 +8,9 @@ export default async function DashboardLayout({
 }: {
   children: ReactNode;
 }) {
-  const session = await auth.api.getSession({
-    headers: await headers(),
-  });
+  // Session is resolved by the control-api auth plane (inbound cookie forwarded),
+  // not an in-process Better Auth instance — this render plane holds no DB binding.
+  const session = await getServerSession();
 
   if (!session) {
     const url = '/sign-in?next=/dashboard';

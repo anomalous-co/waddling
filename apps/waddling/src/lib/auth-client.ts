@@ -13,10 +13,15 @@ import {
 } from 'better-auth/client/plugins';
 import { apiKeyClient } from '@better-auth/api-key/client';
 import { stripeClient } from '@better-auth/stripe/client';
-import { getBetterAuthUrl } from './env';
+import { CONTROL_API_BASE } from './control-api';
 
+// Better Auth's HTTP surface (/api/auth/*) was lifted into the control-api Worker.
+// Point the client at that origin; it appends the default `/api/auth` basePath.
+// Empty ⇒ undefined ⇒ Better Auth falls back to the current origin (single-origin
+// local dev). The session cookie is shared cross-subdomain (configured server-side
+// in control-api: crossSubDomainCookies + SameSite=None; Secure).
 export const authClient = createAuthClient({
-  baseURL: getBetterAuthUrl(),
+  baseURL: CONTROL_API_BASE || undefined,
   plugins: [
     organizationClient(),
     adminClient(),

@@ -21,6 +21,15 @@
   ],
   // Control-plane database: PlanetScale Postgres reached through Hyperdrive
   // (port 5432, caching disabled). The Worker reads env.HYPERDRIVE.connectionString.
+  // Production origin: api.getwaddling.com (custom domain on the getwaddling.com
+  // zone). Same registrable domain as the UI's app.getwaddling.com, so the session
+  // cookie is first-party same-site (Domain=.getwaddling.com, SameSite=Lax) — the
+  // shape every browser accepts without third-party-cookie blocking. The
+  // *.workers.dev URL stays reachable too, but the auth/cookie/CORS config below
+  // is keyed to the custom domain.
+  "routes": [
+    { "pattern": "api.getwaddling.com", "custom_domain": true }
+  ],
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
@@ -66,10 +75,16 @@
     "R2_ENDPOINT": "https://866403f7ed22a791871b45539ac6fbd7.r2.cloudflarestorage.com",
     "R2_BUCKET": "waddling-ws-probe",
     "R2_REGION": "auto",
-    "BETTER_AUTH_URL": "https://waddling-control-api.mirri.workers.dev",
-    "JWT_ISSUER": "https://waddling-control-api.mirri.workers.dev",
+    "BETTER_AUTH_URL": "https://api.getwaddling.com",
+    "JWT_ISSUER": "https://api.getwaddling.com",
     "JWT_AUDIENCE_PREFIX": "waddling",
-    "MCP_RESOURCE_URL": "https://waddling-control-api.mirri.workers.dev",
+    "MCP_RESOURCE_URL": "https://api.getwaddling.com",
+    // Cross-origin dashboard support: the UI render plane runs on app.getwaddling.com
+    // and calls /api/cp/* + /api/auth/* here. WEB_ORIGIN is echoed in credentialed
+    // CORS (no `*`) and added to Better Auth trustedOrigins. COOKIE_DOMAIN makes the
+    // session cookie first-party across the two subdomains (SameSite=Lax + Secure).
+    "WEB_ORIGIN": "https://app.getwaddling.com",
+    "COOKIE_DOMAIN": ".getwaddling.com",
     "STRIPE_SECRET_KEY": "sk_test_placeholder_b1",
     "STRIPE_WEBHOOK_SECRET": "whsec_placeholder_b1",
     "STRIPE_PRICE_PRO": "price_placeholder_pro",

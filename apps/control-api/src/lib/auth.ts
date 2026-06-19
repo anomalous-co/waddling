@@ -48,9 +48,37 @@ function construct(env: Env, pool: Pool) {
   // billing isn't set up yet. Flips to true automatically when real keys are deployed.
   const stripeConfigured = !!env.STRIPE_SECRET_KEY && !/placeholder/i.test(env.STRIPE_SECRET_KEY);
 
+  // Cross-origin browser support for the split UI/API deployment. The dashboard
+  // runs on WEB_ORIGIN and calls this API cross-origin with credentials, so:
+  //   • WEB_ORIGIN must be a trustedOrigin (Better Auth rejects unknown origins);
+  //   • the session cookie needs SameSite=None;Secure to ride a cross-SITE request,
+  //     OR a Domain=.parent cookie to stay first-party same-site across subdomains.
+  // When COOKIE_DOMAIN is set (UI+API are subdomains of one registrable domain),
+  // use a Domain cookie + SameSite=Lax (first-party, works in every browser incl.
+  // Safari). Without it, fall back to SameSite=None;Secure (cross-site third-party
+  // cookie — needed for distinct sites, but blocked by Safari/ITP). Unset WEB_ORIGIN
+  // ⇒ host-only Lax cookie (single-origin / service-binding SSR), the original shape.
+  const webOrigins = (env.WEB_ORIGIN ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const cookieDomain = env.COOKIE_DOMAIN?.trim() || undefined;
+  const crossOrigin = webOrigins.length > 0;
+
   return betterAuth({
     baseURL: env.BETTER_AUTH_URL,
     secret: env.BETTER_AUTH_SECRET,
+    trustedOrigins: webOrigins,
+    advanced: crossOrigin
+      ? {
+          crossSubDomainCookies: cookieDomain
+            ? { enabled: true, domain: cookieDomain }
+            : { enabled: false },
+          defaultCookieAttributes: cookieDomain
+            ? { sameSite: 'lax', secure: true }
+            : { sameSite: 'none', secure: true },
+        }
+      : undefined,
     // Better Auth owns this Pool (separate from db.ts's pool against the same
     // Hyperdrive binding). Built fresh PER REQUEST and closed after (see buildAuth) —
     // a Pool cached across requests makes Better Auth's Kysely connection wrapper hang

@@ -1,4 +1,10 @@
 import { createMDX } from 'fumadocs-mdx/next';
+import { initOpenNextCloudflareForDev } from '@opennextjs/cloudflare';
+
+// Makes Cloudflare bindings (env, Hyperdrive, etc.) available under `next dev`
+// via getCloudflareContext(), matching the workerd runtime the OpenNext build
+// targets. No-op for the production build/preview path.
+initOpenNextCloudflareForDev();
 
 // PostHog reverse-proxy host (Stream C — FUNNEL).
 // Default to us.i.posthog.com so the destination is never 'undefined/ingest/…'
@@ -13,13 +19,10 @@ const config = {
   async rewrites() {
     return {
       beforeFiles: [
-        // OAuth authorization-server discovery at the root path. The mcp plugin
-        // serves it under /api/auth/.well-known/…; MCP clients (Claude) probe the
-        // ROOT well-known, so map it through. (RFC 8414 / MCP authorization spec.)
-        {
-          source: '/.well-known/oauth-authorization-server',
-          destination: '/api/auth/.well-known/oauth-authorization-server',
-        },
+        // NOTE: the root /.well-known/oauth-authorization-server rewrite was
+        // removed — Better Auth's /api/auth surface (incl. its MCP OAuth
+        // discovery) now lives in the control-api Worker, so MCP clients probe
+        // the API origin's well-known, not this render plane.
         {
           source: '/ingest/static/:path*',
           destination: `${POSTHOG_HOST}/static/:path*`,

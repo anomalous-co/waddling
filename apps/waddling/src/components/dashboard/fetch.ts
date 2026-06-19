@@ -35,12 +35,16 @@ export type CpResult<T> =
   | { ok: true; data: T }
   | { ok: false; error: string; code?: string; status: number };
 
+// The /api/cp/* routes now live in the standalone control-api Worker, not this
+// app — prefix every call with its origin (cpUrl). Same-origin when unset.
+import { cpUrl } from '@/lib/control-api';
+
 export async function fetchCp<T>(
   path: string,
   init?: RequestInit,
 ): Promise<CpResult<T>> {
   try {
-    const res = await fetch(path, {
+    const res = await fetch(cpUrl(path), {
       credentials: 'include',
       headers: {
         'Content-Type': 'application/json',

@@ -12,6 +12,7 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { fetchCp, cpPost } from './fetch';
+import { cpUrl } from '@/lib/control-api';
 import type {
   EndpointSummary,
   AgentSummary,
@@ -23,7 +24,6 @@ import type {
 /** Live gateway session opened "as" a chosen agent. */
 export interface Connection {
   sessionId: string;
-  sessionJwt: string;
   endpointId: string;
   agentId: string;
   /** "schema.table" refs the agent may touch — used for autocomplete + status. */
@@ -115,7 +115,6 @@ export function useGatewayConnection(): GatewayConnection {
       }
       const c: Connection = {
         sessionId: res.data.sessionId,
-        sessionJwt: res.data.sessionJwt,
         endpointId: ep,
         agentId: ag,
         grantedTables: res.data.granted.tables.map((t) => `${t.schema}.${t.table}`),
@@ -132,11 +131,13 @@ export function useGatewayConnection(): GatewayConnection {
     c: Connection,
     sql: string,
   ): Promise<{ status: number; body: Record<string, unknown> }> {
-    const r = await fetch(`/api/cp/sessions/${c.sessionId}/query`, {
+    // The session JWT lives only in the data plane now; the server routes by the
+    // sessionId in the path. The browser sends just the SQL.
+    const r = await fetch(cpUrl(`/api/cp/sessions/${c.sessionId}/query`), {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sql, sessionJwt: c.sessionJwt }),
+      body: JSON.stringify({ sql }),
     });
     return { status: r.status, body: (await r.json()) as Record<string, unknown> };
   }

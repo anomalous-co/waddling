@@ -10,6 +10,7 @@
  * Inline-styled (no dashboard component imports) to keep /link self-contained.
  */
 import { useState, type FormEvent } from 'react';
+import { cpUrl } from '@/lib/control-api';
 
 interface OrgOption {
   id: string;
@@ -39,7 +40,7 @@ export function ClaimForm({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/cp/device-link/claim', {
+      const res = await fetch(cpUrl('/api/cp/device-link/claim'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ code, orgId, agentName }),

@@ -7,19 +7,13 @@
  *   - signed in, has org → render the claim form (pick org, name the agent)
  *   - signed in, no org  → prompt to create an org first
  *
- * Does NOT import or edit any dashboard files — orgs are read directly from the
- * Better-Auth `member`/`organization` tables. Styling mirrors the sign-in page.
+ * Does NOT import or edit any dashboard files — the user's orgs come from the
+ * control-api auth plane (Better Auth organization/list). Styling mirrors the
+ * sign-in page.
  */
 import { redirect } from 'next/navigation';
-import { headers } from 'next/headers';
-import { auth } from '@/lib/auth';
-import { query } from '@/lib/db';
+import { getServerSession, listOrgs } from '@/lib/control-api-server';
 import { ClaimForm } from './claim-form';
-
-interface OrgOption {
-  id: string;
-  name: string;
-}
 
 export default async function LinkPage({
   searchParams,
@@ -27,28 +21,16 @@ export default async function LinkPage({
   searchParams: Promise<{ code?: string }>;
 }) {
   const { code = '' } = await searchParams;
-  const session = await auth.api.getSession({ headers: await headers() });
+  // Session + org list come from the control-api auth plane (inbound cookie
+  // forwarded); this render plane holds no DB binding of its own.
+  const session = await getServerSession();
 
   if (!session?.user) {
     const next = `/link${code ? `?code=${encodeURIComponent(code)}` : ''}`;
     redirect(`/sign-in?next=${encodeURIComponent(next)}`);
   }
 
-  // Read the user's orgs straight from Better Auth's tables (no dashboard dep).
-  let orgs: OrgOption[] = [];
-  try {
-    const res = await query<{ id: string; name: string }>(
-      `SELECT o.id, o.name
-         FROM "organization" o
-         JOIN "member" m ON m."organizationId" = o.id
-        WHERE m."userId" = $1
-        ORDER BY o.name ASC`,
-      [session.user.id],
-    );
-    orgs = res.rows;
-  } catch {
-    orgs = [];
-  }
+  const orgs = await listOrgs();
 
   return (
     <div className="min-h-screen bg-neutral-950 flex items-center justify-center px-4">

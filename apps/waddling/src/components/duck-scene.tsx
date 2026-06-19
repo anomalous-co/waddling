@@ -186,7 +186,9 @@ export function DuckScene({ className, embed = true }: DuckSceneProps) {
       geometry.center();
       geometry.computeVertexNormals();
       geometry.computeBoundingBox();
-      const halfDepth = (geometry.boundingBox.max.z - geometry.boundingBox.min.z) / 2;
+      // computeBoundingBox() just populated boundingBox — non-null here.
+      const bbox = geometry.boundingBox!;
+      const halfDepth = (bbox.max.z - bbox.min.z) / 2;
 
       const material = new THREE.MeshStandardMaterial({ color: '#ffcc44', roughness: 0.35, metalness: 0.05 });
       const count = gridSize ** 3;

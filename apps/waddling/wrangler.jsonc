@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "waddling-web",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-06-18",
+  // nodejs_compat: required by @opennextjs/cloudflare. global_fetch_strictly_public:
+  // OpenNext's recommended flag so the worker's own asset/route fetches resolve publicly.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  // Production origin: app.getwaddling.com (custom domain on the getwaddling.com
+  // zone). Same registrable domain as api.getwaddling.com so the auth cookie is
+  // first-party same-site — see control-api's COOKIE_DOMAIN/WEB_ORIGIN.
+  "routes": [
+    { "pattern": "app.getwaddling.com", "custom_domain": true }
+  ],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": { "enabled": true },
+
+  // ── SSR auth/session seam (resolved) ─────────────────────────────────────────
+  // Two render-plane routes read the session at the server (the dashboard layout
+  // gate + /link). They no longer open an in-process DB / Better Auth instance;
+  // src/lib/control-api-server.ts forwards the inbound Cookie to the control-api
+  // auth plane. It PREFERS this CONTROL_API service binding (worker-to-worker, no
+  // public hop, domain-independent) and falls back to NEXT_PUBLIC_CONTROL_API_URL
+  // when the binding is absent (single-origin local dev). So this worker needs NO
+  // Hyperdrive / DB binding of its own.
+  "services": [
+    { "binding": "CONTROL_API", "service": "waddling-control-api" }
+  ]
+
+  // Build-time (NOT wrangler vars — NEXT_PUBLIC_* is inlined by `next build`):
+  //   NEXT_PUBLIC_CONTROL_API_URL = https://api.<zone>   (the control-api origin;
+  //   browser bundle for /api/cp/* + /api/auth/*, and the SSR helper's fallback
+  //   when the CONTROL_API service binding is unavailable).
+}

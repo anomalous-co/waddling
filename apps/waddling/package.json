@@ -4,17 +4,22 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "cf:build": "opennextjs-cloudflare build",
+    "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts"
   },
   "dependencies": {
-    "@better-auth/api-key": "latest",
-    "@better-auth/stripe": "latest",
+    "@better-auth/api-key": "^1.6.19",
+    "@better-auth/stripe": "^1.6.19",
+    "@opennextjs/cloudflare": "^1.19.11",
     "@posthog/next": "^0.4.95",
     "@types/three": "^0.184.1",
     "@waddling/control-schema": "workspace:*",
-    "better-auth": "^1.6.18",
+    "better-auth": "^1.6.19",
     "fumadocs-core": "latest",
     "fumadocs-mdx": "latest",
     "fumadocs-ui": "latest",
@@ -40,6 +45,7 @@
     "@types/react-dom": "^19",
     "tailwindcss": "^4",
     "typescript": "^5",
-    "vitest": "^3"
+    "vitest": "^3",
+    "wrangler": "^4.102.0"
   }
 }
