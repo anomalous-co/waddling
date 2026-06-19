@@ -14,8 +14,13 @@
   //                            alone is control-api's WEB_ORIGIN.
   // Both sit on the getwaddling.com zone → same registrable domain as
   // api.getwaddling.com, so the auth cookie is first-party same-site.
+  // app.getwaddling.com is a Custom Domain (wrangler owns its DNS record). The
+  // apex already has a proxied A/AAAA record on the zone, so it is attached as a
+  // Worker ROUTE instead — a route binds to the existing proxied record rather
+  // than creating one, avoiding the 409 a custom-domain attach hits on a name
+  // that already has DNS.
   "routes": [
-    { "pattern": "getwaddling.com", "custom_domain": true },
+    { "pattern": "getwaddling.com/*", "zone_name": "getwaddling.com" },
     { "pattern": "app.getwaddling.com", "custom_domain": true }
   ],
   "assets": {
