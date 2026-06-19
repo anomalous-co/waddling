@@ -96,6 +96,64 @@ async function dpFetch(
   return { status: res.status, json };
 }
 
+/**
+ * Record one query: count usage + persist the gateway's birdshot audit decision(s).
+ *
+ * birdshot logs every authorize/authenticate decision (table + allow/deny + the SQL)
+ * on the quack path; this drains the per-endpoint gateway's log and writes each as a
+ * `source='gateway'` audit_event. Usage is a separate, exact count (one query ran —
+ * independent of how many tables it touched, or whether it was allowed). The audit
+ * drain is endpoint-GLOBAL, so it may sweep up records from other agents' concurrent
+ * queries on the same endpoint — each is attributed to ITS own agent via the record's
+ * `user` ('agent:<id>'), which is correct. Best-effort: callers run this in waitUntil
+ * and swallow errors so it never affects the query response.
+ */
+async function recordQueryAudit(
+  sess: { org_id: string; agent_id: string; endpoint_id: string },
+): Promise<void> {
+  // Usage — exactly one query ran in this session.
+  await query(
+    `INSERT INTO waddling.usage_event (org_id, agent_id, endpoint_id, kind, quantity)
+       VALUES ($1, $2, $3, 'query', 1)`,
+    [sess.org_id, sess.agent_id, sess.endpoint_id],
+  );
+
+  // Drain birdshot's audit log from the per-endpoint gateway and persist each record.
+  const drained = await gatewayClientFor().drainAudit(sess.endpoint_id);
+  const records = drained?.records ?? [];
+  if (records.length === 0) return;
+
+  const tuples: string[] = [];
+  const params: unknown[] = [];
+  let n = 1;
+  for (const rec of records) {
+    if (rec.event !== 'authorize' && rec.event !== 'authenticate') continue;
+    // user = 'agent:<agentId>' → the principal birdshot enforced as.
+    const agentId = rec.user?.startsWith('agent:') ? rec.user.slice('agent:'.length) : rec.user || null;
+    // ts comes from birdshot as epoch MICROSECONDS (preserve the real access time).
+    tuples.push(
+      `($${n++}, to_timestamp($${n++}::double precision / 1e6), 'gateway', $${n++}, $${n++}, $${n++}, $${n++}, $${n++}, $${n++})`,
+    );
+    params.push(
+      sess.org_id,
+      rec.tsUs,
+      rec.event,
+      agentId,
+      sess.endpoint_id,
+      rec.decision || null,
+      rec.reason || null,
+      rec.query || null,
+    );
+  }
+  if (tuples.length === 0) return;
+  await query(
+    `INSERT INTO waddling.audit_event
+       (org_id, ts, source, event, agent_id, endpoint_id, decision, reason, query)
+     VALUES ${tuples.join(', ')}`,
+    params,
+  );
+}
+
 // One-key-per-agent runtime policy (agent-auth.md §cardinality). Claude gives the
 // server no per-conversation id, so the credential IS the agent instance: a key may
 // hold at most one live session.
@@ -750,6 +808,7 @@ sessions.post('/:id/query', (c) =>
     });
 
     // Cold/hibernated workspace → caller must reconnect (re-push snapshot + reconfigure).
+    // The query never reached the gateway, so there is nothing to record.
     if (r.status === 409 && r.json?.error === 'needs_configure') {
       return c.json(
         {
@@ -760,6 +819,17 @@ sessions.post('/:id/query', (c) =>
         409,
       );
     }
+
+    // The query reached the gateway (allowed, denied, or errored at the workspace) →
+    // count it + drain birdshot's audit decision(s). Best-effort, AFTER the response
+    // (waitUntil) so it never adds latency or fails the query; a denial is the most
+    // important audit row, so this runs before the deny/error branches below too.
+    let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
+    try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
+    const recording = recordQueryAudit(sess).catch((e) => {
+      console.log(`[sessions] recordQueryAudit failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+    if (exCtx) exCtx.waitUntil(recording);
 
     // The sidecar returns HTTP 500 with an error string on a birdshot denial. Map it to
     // the structured authorization_denied shape the agent surface knows (so mcp-external

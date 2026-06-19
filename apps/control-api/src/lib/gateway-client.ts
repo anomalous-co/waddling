@@ -199,6 +199,36 @@ export class GatewayClient {
       `/gw/status?endpointId=${encodeURIComponent(endpointId)}`,
     );
   }
+
+  /**
+   * Drain the per-endpoint gateway's birdshot audit log. Returns the authorize /
+   * authenticate records logged on the quack/workspace path since the last drain
+   * (DESTRUCTIVE — each record once). Cold gateway ⇒ empty. control-api persists
+   * these as `source='gateway'` audit rows so queries show in the dashboard.
+   */
+  drainAudit(endpointId: string): Promise<{ records: GatewayAuditRecord[]; count: number }> {
+    return this.send<{ records: GatewayAuditRecord[]; count: number }>(
+      'POST',
+      '/gw/audit-drain',
+      { endpointId },
+    );
+  }
+}
+
+/** One drained birdshot audit record (free-text fields already b64-decoded by the gateway). */
+export interface GatewayAuditRecord {
+  /** birdshot NowUs() — epoch MICROSECONDS. */
+  tsUs: number;
+  /** 'authorize' | 'authenticate'. */
+  event: string;
+  /** quack per-connection session id (NOT the control-plane jti). */
+  sid: string;
+  /** JWT `sub` — 'agent:<agentId>'. */
+  user: string;
+  /** 'allow' | 'deny' | ''. */
+  decision: string;
+  reason: string;
+  query: string;
 }
 
 /**

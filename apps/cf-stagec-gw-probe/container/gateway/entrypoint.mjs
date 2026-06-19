@@ -248,6 +248,43 @@ async function main() {
       return;
     }
 
+    // ── Audit drain (trusted connection) ───────────────────────────────────────
+    // birdshot's audit log is process-GLOBAL (State::Get() is a singleton; the
+    // Authorize hook on the quack serving connection appends to the same deque this
+    // trusted connection drains). So this returns the authorize/authenticate records
+    // for queries that came in over the quack/workspace path — the ones the dashboard
+    // needs. DESTRUCTIVE: each record is returned exactly once. Free-text fields are
+    // base64url in the blob (sid/user/reason/query); decode to clean JSON here.
+    if (path === "/ctrl/audit-drain" && method === "POST") {
+      const dec = (s) => {
+        try { return Buffer.from(String(s), "base64url").toString("utf8"); } catch { return ""; }
+      };
+      const CAP = 10000;
+      const reader = await rt.connection.runAndReadAll(`SELECT birdshot_log_drain(${CAP}) AS blob`);
+      const blob = String(reader.getRowObjects()[0]?.blob ?? "");
+      const records = [];
+      for (const line of blob.split("\n")) {
+        if (!line) continue;
+        // ts_us \t event \t sidB64 \t userB64 \t decision \t reasonB64 \t queryB64
+        const c = line.split("\t");
+        records.push({
+          tsUs: Number(c[0]) || 0,
+          event: c[1] ?? "",
+          sid: dec(c[2]),
+          user: dec(c[3]),
+          decision: c[4] ?? "",
+          reason: dec(c[5]),
+          query: dec(c[6]),
+        });
+      }
+      // The drain is capped; a full batch means more may be pending (next drain gets
+      // them) OR the buffer overflowed and oldest records were dropped — flag it.
+      if (records.length >= CAP) log(`audit-drain hit cap ${CAP} — possible buffer overflow / backlog`);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ records, count: records.length }));
+      return;
+    }
+
     // ── Data load (trusted connection): index HN stories into the real lake ─────
     // Runs on rt.connection (which ATTACHed the lake with the S3 secret), so the parquet
     // lands in the lake's DATA_PATH (R2). NOT an agent path — this is the trusted loader

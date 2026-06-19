@@ -340,6 +340,25 @@ async function route(request: Request, env: Env): Promise<Response> {
     const r = await gwFwd(gw, "/ctrl/status", { method: "GET" });
     return Response.json(r.json, { status: r.status });
   }
+  if (path === "/gw/audit-drain" && request.method === "POST") {
+    // Drain the per-endpoint gateway's birdshot audit log → authorize/authenticate
+    // records for quack-path queries (control-api persists them as audit rows). We do
+    // NOT boot a cold gateway: if it died, nothing has run since, so there is nothing
+    // to drain → empty.
+    const { endpointId } = body;
+    if (!endpointId) return Response.json({ error: "missing endpointId" }, { status: 400 });
+    const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
+    try {
+      const r = await gwFwd(gw, "/ctrl/audit-drain", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      return Response.json(r.json, { status: r.status });
+    } catch {
+      return Response.json({ records: [], count: 0, note: "gateway cold — nothing to drain" });
+    }
+  }
   if (path === "/gw/revoke" && request.method === "POST") {
     // Forward-only jti/user/session denylist on the PER-ENDPOINT gateway. The denylist
     // is in-memory on the gateway's trusted control connection, so we forward to the
