@@ -26,7 +26,7 @@ function qid(s: string): string {
  * straight from the lake, so the data stays durable in the lake/object store. Idempotent
  * (CREATE OR REPLACE); a fresh local-file demo lake has no tables and this is a no-op.
  */
-async function restoreLakeViews(connection: DuckDBConnection, alias: string): Promise<void> {
+export async function restoreLakeViews(connection: DuckDBConnection, alias: string): Promise<void> {
   try {
     const reader = await connection.runAndReadAll(
       `SELECT table_name FROM duckdb_tables() WHERE database_name = ${q(alias)} AND schema_name = 'main'`,

@@ -874,6 +874,34 @@ async function route(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true, legacyDestroyed: legacy, ...r }, { status: 200 });
   }
 
+  // ── governed ETL: authorize-then-execute a lake WRITE on the trusted gateway ────
+  // A lake write (CTAS / read_source ingest) can't go through the workspace (sealed,
+  // no egress) or the gated quack serving path (serves the memory catalog only — a
+  // CTAS there wouldn't persist to DuckLake). It runs on the gateway replica's TRUSTED
+  // connection, gated by birdshot_authorize first (same hook quack uses), then executed
+  // — so the write persists to the lake. The director GUARANTEES the chosen replica is
+  // armed with the current snapshot before serving, same fail-safe as a read query.
+  if (path === "/gw/load" && request.method === "POST") {
+    const { sql, lakeToken } = body;
+    const endpointId = body.endpointId ?? body.datalakeId;
+    if (!endpointId || !sql || !lakeToken) {
+      return Response.json({ error: "missing datalakeId/sql/lakeToken" }, { status: 400 });
+    }
+    const pool = getPool(env, endpointId);
+    const picked = await pool.pickReplica(endpointId);
+    if (!picked.replicaKey) return Response.json({ error: picked.error ?? "no gateway replica" }, { status: 503 });
+    const gw = getSandbox(env.GATEWAY, picked.replicaKey, { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
+    try {
+      const r = await gwFwd(gw, "/governed-load", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: lakeToken, sql }),
+      });
+      return Response.json(r.json, { status: r.status });
+    } finally {
+      try { await pool.release(picked.replicaKey); } catch { /* best-effort load bookkeeping */ }
+    }
+  }
+
   // ── workspace lifecycle (control-api configure; mcp-external query/run) ─────────
   if (path === "/configure" && request.method === "POST") {
     // control-api migrated endpointId → datalakeId (the gateway DO is keyed gw:<datalakeId>,

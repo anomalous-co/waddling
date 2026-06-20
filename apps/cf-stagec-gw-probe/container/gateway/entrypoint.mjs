@@ -37,7 +37,34 @@ import {
   birdshotRevoke,
   birdshotStatus,
   normalize,
+  restoreLakeViews,
 } from "./gateway-src/duck.ts";
+
+// Monotonic counter for private authz session ids on the trusted connection
+// (governed-load). Each call gets a fresh sid so concurrent loads never share a
+// birdshot session/principal.
+let etlSeq = 0;
+
+// Reject anything beyond a single SQL statement BEFORE authz, so the string we
+// authorize is byte-identical to the string we execute (no TOCTOU surface). A
+// `;` inside a single-quoted literal does not count. birdshot ALSO denies
+// multi-statement at authorize — this is the belt to that suspenders.
+function isSingleStatement(sql) {
+  let inStr = false;
+  const s = String(sql);
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "'") {
+      if (inStr && s[i + 1] === "'") { i++; continue; } // escaped '' inside a literal
+      inStr = !inStr;
+    } else if (ch === ";" && !inStr) {
+      // a trailing `;` (only whitespace after it) is a benign terminator, not a second statement.
+      if (s.slice(i + 1).trim() === "") return true;
+      return false;
+    }
+  }
+  return true;
+}
 
 const QUACK_PORT = Number(process.env.QUACK_PORT ?? 9500);
 const FWD_PORT = Number(process.env.FORWARDER_PORT ?? 8080);
@@ -468,6 +495,85 @@ async function main() {
         // signal. "deny" + a thrown query = a genuine authorization denial.
         authorizeDecision: decision,
       }));
+      return;
+    }
+
+    // ── Governed ETL: authorize on the same hook quack uses, then execute on the
+    //    TRUSTED connection that owns the lake (so the write PERSISTS to DuckLake).
+    //
+    // The gated quack path serves only the `memory` catalog (read-through views), so a
+    // CTAS through it cannot persist a LAKE write. But authorization and durable
+    // execution are separable: `birdshot_authorize` is the literal production authz
+    // function (duck.ts SET quack_authorization_function), and the trusted control
+    // connection already persists to the lake (proven by /ctrl/load-hn). So:
+    //   1. authenticate the agent JWT into a PRIVATE session on rt.connection,
+    //   2. authorize the EXACT sql with birdshot_authorize(sid, sql) — denies happen
+    //      from the PARSE LITERAL, before any read_source fetch (no SSRF window),
+    //   3. only on allow, run the byte-identical string on rt.connection. Same
+    //      connection ⇒ authz catalog context ≡ execution catalog context (USE lake +
+    //      birdshot_set_lake_catalog both resolve bare `main.x` into the lake).
+    // Single-statement is enforced pre-authz AND by birdshot, so the authorized string
+    // is exactly the executed string.
+    if (path === "/governed-load" && method === "POST") {
+      const body = await readJson(req);
+      const { token, sql } = body;
+      if (!token || !sql) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing token/sql" }));
+        return;
+      }
+      const reply = (status, obj) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(obj));
+      };
+      if (!isSingleStatement(sql)) {
+        reply(200, { ok: false, phase: "reject", error: "only a single SQL statement is allowed" });
+        return;
+      }
+      const sid = `etl-${++etlSeq}`;
+      const lit = (s) => String(s).replace(/'/g, "''");
+      // 1. Authenticate the JWT (RS256 vs the snapshot's JWKS) into session `sid`.
+      let authed = false;
+      try {
+        const r = await rt.connection.runAndReadAll(`SELECT birdshot_authenticate('${sid}', '${lit(token)}', '') AS ok`);
+        authed = r.getRowObjects()[0]?.ok === true;
+      } catch (e) {
+        reply(200, { ok: false, phase: "authenticate", error: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+      if (!authed) {
+        reply(200, { ok: false, phase: "authenticate", error: "token rejected" });
+        return;
+      }
+      // 2. Authorize the exact statement. DENY ⇒ stop here — nothing executes, no fetch.
+      let allowed = false;
+      try {
+        const r = await rt.connection.runAndReadAll(`SELECT birdshot_authorize('${sid}', '${lit(sql)}') AS ok`);
+        allowed = r.getRowObjects()[0]?.ok === true;
+      } catch (e) {
+        reply(200, { ok: false, phase: "authorize", error: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+      if (!allowed) {
+        reply(200, { ok: false, phase: "authorize", authorizeDecision: "deny", error: "not authorized for this statement" });
+        return;
+      }
+      // 3. Execute the byte-identical string on the trusted connection (owns the lake
+      //    attach + S3 secret + egress). Bare `main.x` → lake via `USE lake`.
+      let execError = null;
+      try {
+        await rt.run(sql);
+      } catch (e) {
+        execError = e instanceof Error ? e.message : String(e);
+      }
+      if (execError) {
+        reply(200, { ok: false, phase: "execute", authorizeDecision: "allow", error: execError });
+        return;
+      }
+      // 4. Refresh read-through views so any newly-created lake table is queryable
+      //    through the gated quack path immediately.
+      try { await restoreLakeViews(rt.connection, rt.config.lakeAlias); } catch { /* best-effort */ }
+      reply(200, { ok: true, phase: "done", authorizeDecision: "allow" });
       return;
     }
 
