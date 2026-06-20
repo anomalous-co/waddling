@@ -13,6 +13,7 @@
  */
 import { queryOne } from './db';
 import { compileEndpointPolicy } from './effective-policy';
+import { bumpPolicyVersion } from './policy-version';
 import type { CompileResult } from './policy-compiler';
 import { gatewayClientFor, type SnapshotRequest, type BirdshotJwk } from './gateway-client';
 import { resolveGatewayBoot } from './gateway-boot';
@@ -89,8 +90,14 @@ export async function recompileAndPush(
 
   const compiled = await compileEndpointPolicy(datalakeId, new Date());
 
+  // Cache the compiled version on the datalake row (migration 013) so the refresh
+  // alarm (Step 11) can poll one column. Best-effort + non-throwing. Computed from
+  // the same jwks the push below uses, so the cached version matches what landed.
+  const jwk = await loadJwk();
+  const jwksArr = jwk ? [jwk] : undefined;
+  const version = await bumpPolicyVersion(datalakeId, compiled.snapshot, jwksArr);
+
   if (endpoint && endpoint.status === 'running') {
-    const jwk = await loadJwk();
     const gw = gatewayClientFor(endpoint);
     try {
       const boot = await resolveGatewayBoot(c.env, datalakeId);
@@ -100,7 +107,7 @@ export async function recompileAndPush(
           issuer: c.env.JWT_ISSUER,
           audience: `gw:${datalakeId}`,
           mode: 'rs256',
-          jwks: jwk ? [jwk] : [],
+          jwks: jwksArr ?? [],
         },
         snapshot: compiled.snapshot,
         lakeCatalog: boot.lakeCatalog,

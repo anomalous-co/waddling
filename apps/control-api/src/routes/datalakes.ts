@@ -20,6 +20,9 @@ import { getCrypto } from '../lib/secret-crypto';
 import { gatewayClientFor, GatewayError } from '../lib/gateway-client';
 import { recompileAndPush } from '../lib/gateway-push';
 import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
+import { compileEndpointPolicy } from '../lib/effective-policy';
+import { policyVersionFor, grantVersionFor, authVersionFor, bumpPolicyVersion } from '../lib/policy-version';
+import { loadSigningKey } from '../lib/session-jwt';
 import { provisionOrgCatalog } from '../lib/catalog-provision';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import type { DescribeResult, TableInfo, DatalakeStatus, DatalakeSummary, DatalakeDetail, DatalakeRuntime } from '../lib/types';
@@ -426,6 +429,65 @@ datalakes.post('/:id/refresh-policy', (c) =>
       constraints: (compiled.snapshot.roleConstraints ?? []).length,
       activeAgents: compiled.activeAgentIds.length,
       snapshot: compiled.snapshot,
+    });
+  }),
+);
+
+// ── GET /:id/policy — versioned compiled policy (Step 9, the dynamic-ACL keystone) ──
+//
+// Returns the endpoint's FULL compiled birdshot snapshot (every agent) PLUS a stable
+// content-hash `version` (grantVersion-authVersion). This is what the GatewayPoolDO
+// refresh alarm (Step 11) polls: it fetches this endpoint, compares `version` to the
+// last-applied version, and re-applies the snapshot ONLY when it changed. So ACL
+// edits (even direct DB edits that bypassed recompileAndPush) propagate within the
+// alarm interval — with zero birdshot C++ changes and no per-query Postgres coupling.
+//
+// The `version` mixes grants + the JWKS kid/n/e so JWKS rotation re-pushes too (a new
+// signing key would leave the gateway rejecting JWTs signed by the new kid). Org-scoped
+// (agent key OR dashboard user) — read-only, no escalation: it only returns what the
+// caller's own grants are compiled from. `?includeJwks=true` exposes the public JWK
+// (kid/n/e only — never the private key) so the alarm can re-arm a cold gateway.
+datalakes.get('/:id/policy', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c, true, true);
+    const id = c.req.param('id');
+    const ep = await loadOwned(id, caller.orgId);
+    if (!ep) return err(c, 'datalake_not_found', 404);
+
+    const u = new URL(c.req.url);
+    const includeJwks = u.searchParams.get('includeJwks') === 'true';
+
+    const compiled = await compileEndpointPolicy(id, new Date());
+    const snapshot = compiled.snapshot;
+
+    // Load the current signing key (kid/n/e) for the auth version + the optional
+    // includeJwks payload. Best-effort: a missing JWKS (jwt plugin not yet minted)
+    // yields authVersion='no-jwks' and no jwks field — the alarm treats that as
+    // "unarmed" and re-pushes once a key exists.
+    let jwks: { kid: string; n: string; e: string } | undefined;
+    try {
+      const sk = await loadSigningKey();
+      jwks = { kid: sk.kid, n: sk.publicJwk.n, e: sk.publicJwk.e };
+    } catch {
+      /* jwt plugin not initialized — jwks stays undefined */
+    }
+    const jwksArr = jwks ? [jwks] : undefined;
+
+    // Bump the cached policy_version column (migration 013) so the refresh alarm
+    // can poll one column. bumpPolicyVersion returns the version string.
+    const version = await bumpPolicyVersion(id, snapshot, jwksArr);
+    return ok(c, {
+      datalakeId: id,
+      version,
+      grantVersion: grantVersionFor(snapshot),
+      authVersion: authVersionFor(jwksArr),
+      compiledAt: new Date().toISOString(),
+      auth: jwks
+        ? { issuer: c.env.JWT_ISSUER, audience: `gw:${id}`, mode: 'rs256' as const }
+        : undefined,
+      jwks: includeJwks ? jwksArr : undefined,
+      snapshot,
+      activeAgents: compiled.activeAgentIds.length,
     });
   }),
 );
