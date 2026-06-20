@@ -46,6 +46,18 @@ ENV BIRDSHOT_EXTENSION_PATH=/opt/birdshot/birdshot.duckdb_extension
 WORKDIR /opt/gateway
 COPY gateway/package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund
+
+# ── pre-bake DuckDB extensions (cold-start optimization) ─────────────────────
+# Cold boot was dominated by the gateway downloading quack/httpfs/ducklake/postgres/fts
+# from the network on every start. Bake them into a fixed extension_directory at BUILD
+# time; bootDuckRuntime opens DuckDB with the SAME DUCKDB_EXTENSION_DIR, so its INSTALLs
+# are local cache hits (no network). Needs network+DNS to the DuckDB extension repos at
+# build (resolves in local docker + CF build infra). Uses the just-installed node-api so
+# the cached version/platform path matches the runtime.
+ENV DUCKDB_EXTENSION_DIR=/opt/duckdb-extensions
+COPY gateway/prebake-extensions.mjs ./prebake-extensions.mjs
+RUN node prebake-extensions.mjs
+
 COPY gateway/gateway-src/ ./gateway-src/
 COPY gateway/entrypoint.mjs ./entrypoint.mjs
 

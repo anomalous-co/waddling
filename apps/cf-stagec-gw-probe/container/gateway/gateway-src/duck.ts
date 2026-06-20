@@ -149,8 +149,13 @@ async function bootstrapQuackboardSchema(connection: DuckDBConnection): Promise<
 export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntime> {
   // A lake gateway opens ':memory:' (durable data lives in the ATTACHed lake); a quackboard
   // opens its durable .duckdb file directly, so quack serves the agent-coordination tables.
+  // Open with the build-time extension cache (prebake-extensions.mjs bakes quack/httpfs/
+  // ducklake/postgres/fts here), so the INSTALLs below are local cache hits, not network
+  // downloads — the single biggest cold-boot win. Same dir + same node-api version as the
+  // build ⇒ the <dir>/v<ver>/<platform>/ path matches.
   const instance = await DuckDBInstance.create(config.databasePath, {
     allow_unsigned_extensions: "true",
+    extension_directory: process.env.DUCKDB_EXTENSION_DIR || "/opt/duckdb-extensions",
   });
   const connection = await instance.connect();
 
@@ -249,6 +254,8 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   if (config.encrypted) opts.push("ENCRYPTED");
   const attachSql = `ATTACH '${catalogTarget}' AS ${config.lakeAlias} (${opts.join(", ")})`;
   {
+    // Backoff grows from 250ms (was a flat 2s): a responsive catalog that needs ONE retry
+    // costs 250ms, not 2s, while a genuinely cold catalog still gets ~20s of total patience.
     const maxAttempts = 15;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -261,7 +268,7 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
         console.log(
           `[gateway] ATTACH ducklake attempt ${attempt}/${maxAttempts} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, Math.min(250 * 2 ** (attempt - 1), 3000)));
       }
     }
     if (lastErr) throw lastErr;

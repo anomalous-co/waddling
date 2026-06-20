@@ -142,9 +142,10 @@ export class GatewayClient {
     method: 'GET' | 'POST',
     path: string,
     body?: unknown,
+    timeoutMs?: number,
   ): Promise<T> {
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
+    const t = setTimeout(() => ctrl.abort(), timeoutMs ?? this.timeoutMs);
     try {
       // The data plane is private (service-binding-only); the binding IS the trust
       // boundary, so no bearer token is sent. The host is ignored by the binding.
@@ -181,7 +182,11 @@ export class GatewayClient {
     // WIRE CONTRACT: the deployed dataplane reads `endpointId` (value = the datalake id).
     // Keep the internal field `datalakeId`, remap to `endpointId` on the wire.
     const { datalakeId, ...rest } = req;
-    return this.send<GatewayAck>('POST', '/gw/snapshot', { endpointId: datalakeId, ...rest });
+    // pushSnapshot can trigger a COLD gateway boot (image provision + DuckDB init + lake
+    // ATTACH). Even with extensions pre-baked that exceeds the default 10s, so a too-short
+    // timeout aborts mid-boot AND the abort kills the in-flight boot → it never warms (a
+    // vicious cycle). Give the boot room to finish in one connect.
+    return this.send<GatewayAck>('POST', '/gw/snapshot', { endpointId: datalakeId, ...rest }, 45_000);
   }
 
   /**
