@@ -121,6 +121,10 @@ function sendJson(res, status, body) {
 async function init(body) {
   if (!body.key) throw new Error("init: missing workspace key");
   if (body.presignedPut) presignedPut = body.presignedPut;
+  // Capture cold/warm BEFORE the boot block flips `booted`. A warm container is
+  // already locked from its first cold boot, and lock_configuration is irreversible,
+  // so re-running the lock SET below on a reconnect 500s `/init`. Only lock on cold boot.
+  const freshBoot = !booted;
 
   if (!booted) {
     // Restore the encrypted file from R2 over plain Node fetch BEFORE ATTACH. The DO
@@ -186,7 +190,7 @@ async function init(body) {
   // Defense-in-depth: prevent the agent toggling any further config. Done last so all
   // SETs above are applied. disabled_filesystems is already irreversible on its own;
   // this also pins autoload/unsigned/etc.
-  if (body.lockConfiguration !== false) {
+  if (freshBoot && body.lockConfiguration !== false) {
     await conn.run("SET lock_configuration=true;");
   }
 }

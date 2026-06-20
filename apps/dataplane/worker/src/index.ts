@@ -117,6 +117,10 @@ export class WorkspaceSandbox extends Sandbox<Env> {
   enableInternet = false;
   interceptHttps = true;
   allowedHosts: string[] = [];
+  // Short idle window: a stuck/locked workspace cold-boots fresh quickly, and dev
+  // iteration doesn't wait on a long warm-reuse tail. The /init lock is now cold-boot
+  // only (idempotent on reconnect), so this is a latency knob, not a correctness one.
+  sleepAfter = "1m";
 }
 
 // The one allowlisted quack:443 egress from a workspace is intercepted and handed here;
