@@ -444,6 +444,17 @@ export async function applySnapshot(
     await c.run(`SELECT ${fn}(${q(p.role)}, ${q(p.pattern)})`);
   }
   await c.run("SELECT birdshot_commit_config()");
+
+  // Re-expose lake tables as read-through views. The per-replica `memory.main` views
+  // quack serves are created at boot (restoreLakeViews in bootDuckRuntime), so a table
+  // loaded AFTER this replica booted — e.g. a governed ETL that ran on a PEER replica and
+  // persisted to the shared DuckLake — is invisible here until the views are refreshed.
+  // applySnapshot runs on every snapshot re-arm (pickReplica guarantees it before serving),
+  // so refreshing here makes a freshly-loaded table queryable on whichever replica serves
+  // the next read. No-op for a quackboard (it serves its own durable catalog, no lake views).
+  if (!rt.config.quackboard) {
+    await restoreLakeViews(c, rt.config.lakeAlias);
+  }
 }
 
 /** Instant revocation → in-memory denylist; next query for the subject denied. */
