@@ -27,7 +27,7 @@
     "directory": ".open-next/assets",
     "binding": "ASSETS"
   },
-  "observability": { "enabled": true },
+  "observability": { "enabled": true, "head_sampling_rate": 1, "logs": { "enabled": true, "head_sampling_rate": 1, "persist": true, "invocation_logs": true } },
 
   // ── SSR auth/session seam (resolved) ─────────────────────────────────────────
   // Two render-plane routes read the session at the server (the dashboard layout

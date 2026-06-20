@@ -19,6 +19,11 @@
   "compatibility_flags": [
     "nodejs_compat"
   ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "head_sampling_rate": 1, "persist": true, "invocation_logs": true }
+  },
   // Control-plane database: PlanetScale Postgres reached through Hyperdrive
   // (port 5432, caching disabled). The Worker reads env.HYPERDRIVE.connectionString.
   // Production origin: api.getwaddling.com (custom domain on the getwaddling.com
