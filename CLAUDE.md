@@ -5,6 +5,8 @@ Dynamic agent access-control for DuckDB. Agents connect their DuckDB instances t
 ## Conventions
 
 - **Git commits**: do NOT add a `Co-Authored-By` trailer (or any co-author/attribution line) to commit messages. Write the message body and stop.
+- **ALWAYS run package scripts as `pnpm run <script>`, never `pnpm <script>`.** pnpm reserves bare subcommands (`deploy`, `rebuild`, `start`, `test`, …) for its own built-ins, so `pnpm deploy`/`pnpm rebuild` silently invoke the WRONG thing (pnpm's deploy/rebuild) instead of the package.json script — a costly, repeated failure. The `run` is mandatory: `pnpm run deploy`, `pnpm run rebuild`, `pnpm run cf:build`, etc.
+  - Dataplane image dedup: `wrangler deploy` skips pushing an image whose tag already exists, so source-only changes to a container (gateway-src/entrypoint, ws-probe sidecar) don't ship. Use `pnpm run rebuild` (`apps/dataplane/worker/scripts/rebuild-image.sh`) which clears the BuildKit cache and forces a fresh push.
 
 ## Architecture
 
