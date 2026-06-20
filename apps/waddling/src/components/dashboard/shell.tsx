@@ -52,6 +52,7 @@ import {
   SidebarProvider,
   SidebarRail,
   SidebarTrigger,
+  useSidebar,
 } from '@/components/ui/sidebar';
 import {
   DropdownMenu,
@@ -323,6 +324,8 @@ function AppSidebar({
   activeOrgId?: string;
 }) {
   const pathname = usePathname();
+  const { state } = useSidebar();
+  const collapsed = state === 'collapsed';
   return (
     <Sidebar
       collapsible="icon"
@@ -356,7 +359,7 @@ function AppSidebar({
           </SidebarGroup>
         ))}
       </SidebarContent>
-      <SidebarFooter className="flex flex-col items-center gap-1">
+      <SidebarFooter className={cn('flex items-center gap-0', collapsed ? 'flex-col gap-1' : 'flex-row')}>
         <UserMenu user={user} activeOrgId={activeOrgId} />
         <SidebarTrigger className="shrink-0" />
       </SidebarFooter>
