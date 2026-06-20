@@ -955,4 +955,95 @@ sessions.post('/:id/query', (c) =>
   }),
 );
 
+/** Mint a fresh RS256 session JWT (same agent principal) to use as the gateway lakeToken.
+ *  Mirrors the connect mint: `id`/`sub` = agent:<id> is birdshot's principal; the gateway
+ *  verifies it against the JWKS pushed at connect. Used by the ETL path, which does not
+ *  retain the connect JWT (it is never stored in plaintext). */
+async function mintLakeToken(env: Env, agentId: string, datalakeId: string, mode: string): Promise<string> {
+  const { kid, privateJwk } = await loadSigningKey();
+  const key = (await importJWK(privateJwk, 'RS256')) as CryptoKey;
+  const principal = `agent:${agentId}`;
+  return new SignJWT({ id: principal, mode, cap: CAPABILITY.connect })
+    .setProtectedHeader({ alg: 'RS256', kid })
+    .setSubject(principal)
+    .setIssuer(env.JWT_ISSUER)
+    .setAudience(`gw:${datalakeId}`)
+    .setIssuedAt()
+    .setJti(crypto.randomUUID())
+    .setExpirationTime(`${SESSION_TTL_SECONDS}s`)
+    .sign(key);
+}
+
+const EtlSchema = z.object({ sql: z.string().min(1) });
+
+/** POST /:id/etl → a GOVERNED lake WRITE (CTAS / read_source ingest). Unlike /query — which
+ *  runs in the sealed, no-egress workspace and federates lake reads through quack — an ETL
+ *  statement needs egress AND a durable lake write, neither of which the workspace nor the
+ *  gated quack serving path (memory catalog only) can do. It runs on the gateway replica's
+ *  TRUSTED connection, but only AFTER birdshot_authorize (the same hook quack uses) allows the
+ *  exact statement — denies happen from the parse literal, before any read_source fetch. The
+ *  session JWT (minted fresh, same principal) is the lakeToken; the director guarantees the
+ *  chosen replica is armed with this agent's snapshot grants. */
+sessions.post('/:id/etl', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c, false, true);
+    const id = c.req.param('id');
+    const { sql } = await parseBody(c, EtlSchema);
+
+    const sess = await queryOne<{
+      id: string; org_id: string; agent_id: string; datalake_id: string; status: string;
+    }>(
+      `SELECT id, org_id, agent_id, datalake_id, status
+         FROM waddling.agent_session WHERE id = $1`,
+      [id],
+    );
+    if (!sess) return err(c, 'session_not_found', 404);
+    assertOrg(caller, sess.org_id);
+    if (caller.agentId && caller.agentId !== sess.agent_id) {
+      return err(c, 'forbidden', 403, 'An agent may only run ETL on its own session');
+    }
+    if (sess.status !== 'active') {
+      return err(c, 'session_not_active', 409, `Session status is ${sess.status} — reconnect`);
+    }
+
+    const identity = await resolveAgentIdentity(sess.agent_id);
+    const lakeToken = await mintLakeToken(c.env, sess.agent_id, sess.datalake_id, identity.mode);
+    const r = await dpFetch(c.env, '/gw/load', {
+      datalakeId: sess.datalake_id,
+      sql,
+      lakeToken,
+    });
+
+    // Best-effort audit AFTER the response (waitUntil) — never adds latency or fails the call.
+    let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
+    try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
+    const recording = recordQueryAudit(sess).catch((e) => {
+      console.log(`[sessions] recordEtlAudit failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+    if (exCtx) exCtx.waitUntil(recording);
+
+    if (r.status !== 200) {
+      return err(c, 'etl_failed', 502, `data plane /gw/load → ${r.status}: ${JSON.stringify(r.json)}`);
+    }
+    // /governed-load → { ok, phase, authorizeDecision, error? }.
+    const j = (r.json ?? {}) as { ok?: boolean; phase?: string; authorizeDecision?: string; error?: string };
+    if (j.ok !== true) {
+      if (j.phase === 'authorize' || j.authorizeDecision === 'deny') {
+        return c.json(
+          { error: 'authorization_denied', reason: j.error ?? 'not authorized for this statement' },
+          403,
+        );
+      }
+      if (j.phase === 'authenticate') {
+        return c.json(
+          { error: 'needs_connect', reason: 'Session token rejected — call waddling_connect again, then retry.' },
+          409,
+        );
+      }
+      return err(c, 'etl_failed', 500, j.error ?? 'governed load failed');
+    }
+    return ok(c, { ok: true, phase: j.phase ?? 'done', authorizeDecision: j.authorizeDecision ?? 'allow' });
+  }),
+);
+
 export { sessions };

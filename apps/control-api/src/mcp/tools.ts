@@ -158,6 +158,24 @@ const runQuery: McpTool['handler'] = async (args, ctx) => {
   }
 };
 
+const runEtl: McpTool['handler'] = async (args, ctx) => {
+  try {
+    const sessionId = str(args.session_id);
+    const sql = str(args.sql);
+    if (!sessionId) return failErr(new Error('session_id is required'));
+    if (!sql) return failErr(new Error('sql is required'));
+    const r = await ctx.loopback(`/api/cp/sessions/${encodeURIComponent(sessionId)}/etl`, {
+      method: 'POST',
+      body: { sql },
+    });
+    if (!r.ok) return failFrom(r);
+    const d = r.data as { ok: boolean; phase: string; authorizeDecision: string };
+    return ok({ ok: d.ok, phase: d.phase, authorize_decision: d.authorizeDecision });
+  } catch (e) {
+    return failErr(e);
+  }
+};
+
 const whoami: McpTool['handler'] = async (args, ctx) => {
   try {
     const sessionId = str(args.session_id);
@@ -260,6 +278,28 @@ export const TOOLS: McpTool[] = [
       required: ['session_id', 'sql'],
     },
     handler: runQuery,
+  },
+  {
+    name: 'waddling_etl',
+    description:
+      'Run a GOVERNED data-load (ETL) for an open session: a single CREATE TABLE … AS SELECT … or ' +
+      'INSERT … that ingests from an external source (e.g. read_json/read_csv/read_parquet over https) ' +
+      'INTO the lake. Use this — not waddling_query — when the statement writes to the lake or reads ' +
+      'from a URL: it executes on the gateway (which has egress) after birdshot authorizes the exact ' +
+      'statement. You need the `create` (or `write`) capability on the target schema AND a source ' +
+      'policy allowing the URL host. Reference the lake target by bare `<schema>.<table>` (e.g. ' +
+      '`CREATE TABLE staging.hn AS SELECT * FROM read_json(\'https://host/path\')`). Denials return ' +
+      "{ error:'authorization_denied', reason } from the parse literal, before any fetch. Returns " +
+      '{ ok, phase, authorize_decision }; query the loaded table afterward with waddling_query.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'session_id from waddling_connect.' },
+        sql: { type: 'string', description: 'A single governed load statement (CTAS/INSERT) ingesting into the lake.' },
+      },
+      required: ['session_id', 'sql'],
+    },
+    handler: runEtl,
   },
   {
     name: 'waddling_whoami',

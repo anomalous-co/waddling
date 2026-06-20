@@ -25,8 +25,10 @@ const SERVER_INSTRUCTIONS =
   'waddling governs AI-agent access to analytics datalakes. Start with ' +
   'waddling_list_datalakes, then waddling_describe to learn the catalog you may see, ' +
   'waddling_connect to open a session, waddling_query to run governed SQL (reference the ' +
-  'lake as lake.<schema>.<table>). Use waddling_whoami to check grants WITHOUT triggering ' +
-  "a denial. Denials are structured { error, table, reason } — read `reason` and self-correct.";
+  'lake as lake.<schema>.<table>). To LOAD data into the lake from an external source ' +
+  '(CTAS/INSERT over read_json/read_csv/read_parquet), use waddling_etl — it runs on the ' +
+  'gateway with egress after birdshot authorizes the statement. Use waddling_whoami to check ' +
+  "grants WITHOUT triggering a denial. Denials are structured { error, table, reason } — read `reason` and self-correct.";
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
