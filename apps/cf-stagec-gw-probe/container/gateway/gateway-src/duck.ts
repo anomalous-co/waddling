@@ -161,6 +161,15 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   // httpfs underlies quack's wire transport — needed for both lake and quackboard.
   await connection.run("INSTALL httpfs;");
   if (config.quackboard) {
+    // Discover and USE the actual database name so quack's per-request connections +
+    // birdshot's bind-walk resolve unqualified table refs against the same catalog.
+    // MUST come BEFORE table creation so tables land in the right DB.
+    const dbReader = await connection.runAndReadAll("SELECT database_name FROM duckdb_databases() WHERE internal = false ORDER BY database_name");
+    const dbName = String((dbReader.getRowObjects()[0] as any)?.database_name ?? "memory");
+    console.log(`[gateway] quackboard database name: ${dbName}, lakeAlias=${config.lakeAlias || "(empty)"}`);
+    await connection.run(`USE ${qid(dbName)}`);
+    // Override the config so applySnapshot sets the correct birdshot lake catalog.
+    config.lakeAlias = dbName;
     // FTS powers quackboard recall (BM25) + pub/sub matching; no lake catalog/object store.
     await connection.run("INSTALL fts; LOAD fts;");
     // Create the shared coordination tables on the un-gated control connection, before the
@@ -180,6 +189,7 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   // A quackboard has no lake: skip the S3 secret, the ducklake ATTACH, and the read-through
   // views entirely. quack serves the opened database's own tables (restored from R2). The
   // birdshot hooks + quack_serve below still run, so ACLs are enforced.
+  // (Quackboard config (USE + lakeAlias) was already handled above before schema creation.)
   if (!config.quackboard) {
   // S3 / R2 / MinIO secret. PROVIDER config = explicit static creds.
   // MinIO: USE_SSL false + URL_STYLE path; R2: USE_SSL true + vhost.
