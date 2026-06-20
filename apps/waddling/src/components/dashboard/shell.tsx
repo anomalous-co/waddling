@@ -26,6 +26,7 @@ import {
   Monitor,
   User,
   Palette,
+  Link2,
 } from 'lucide-react';
 import { useTheme } from 'fumadocs-ui/provider/base';
 import { authClient } from '@/lib/auth-client';
@@ -89,7 +90,7 @@ interface Org {
   slug: string;
 }
 
-interface EndpointSummary {
+interface DatalakeSummary {
   id: string;
   name: string;
   slug: string;
@@ -103,8 +104,9 @@ const NAV_GROUPS = [
     label: 'Platform',
     items: [
       { href: '/dashboard', label: 'Overview', icon: LayoutDashboard },
-      { href: '/dashboard/endpoints', label: 'Endpoints', icon: DataLakeIcon },
+      { href: '/dashboard/datalakes', label: 'Data Lakes', icon: DataLakeIcon },
       { href: '/dashboard/agents', label: 'Agents', icon: Bot },
+      { href: '/dashboard/connected', label: 'Connected', icon: Link2 },
       { href: '/dashboard/acl', label: 'Access', icon: ShieldCheck },
     ],
   },
@@ -127,8 +129,9 @@ const NAV_GROUPS = [
 
 const SEGMENT_LABELS: Record<string, string> = {
   dashboard: 'Overview',
-  endpoints: 'Endpoints',
+  datalakes: 'Data Lakes',
   agents: 'Agents',
+  connected: 'Connected agents',
   acl: 'Access',
   sessions: 'Sessions',
   audit: 'Audit',
@@ -362,15 +365,15 @@ function AppSidebar({
   );
 }
 
-function EndpointSwitcher() {
+function DatalakeSwitcher() {
   const router = useRouter();
-  const [endpoints, setEndpoints] = useState<EndpointSummary[]>([]);
+  const [datalakes, setDatalakes] = useState<DatalakeSummary[]>([]);
 
   useEffect(() => {
     let cancelled = false;
-    void fetchCp<{ endpoints: EndpointSummary[] }>('/api/cp/endpoints').then(
+    void fetchCp<{ datalakes: DatalakeSummary[] }>('/api/cp/datalakes').then(
       (res) => {
-        if (!cancelled && res.ok) setEndpoints(res.data.endpoints ?? []);
+        if (!cancelled && res.ok) setDatalakes(res.data.datalakes ?? []);
       },
     );
     return () => {
@@ -384,7 +387,9 @@ function EndpointSwitcher() {
         <Button variant="outline" size="sm" className="gap-2">
           <Database data-icon="inline-start" />
           <span className="hidden max-w-32 truncate sm:inline">
-            {endpoints.length ? `${endpoints.length} endpoints` : 'Endpoints'}
+            {datalakes.length
+              ? `${datalakes.length} data lakes`
+              : 'Data lakes'}
           </span>
           <ChevronsUpDown data-icon="inline-end" className="text-muted-foreground" />
         </Button>
@@ -392,29 +397,29 @@ function EndpointSwitcher() {
       <DropdownMenuContent align="end" className="w-64">
         <DropdownMenuLabel>Data lakes</DropdownMenuLabel>
         <DropdownMenuGroup>
-          {endpoints.map((ep) => (
+          {datalakes.map((dl) => (
             <DropdownMenuItem
-              key={ep.id}
-              onClick={() => router.push(`/dashboard/endpoints/${ep.id}`)}
+              key={dl.id}
+              onClick={() => router.push(`/dashboard/datalakes/${dl.id}`)}
             >
               <span
                 className={cn(
                   'size-2 rounded-full',
-                  ep.status === 'running' ? 'bg-green-500' : 'bg-muted-foreground',
+                  dl.status === 'running' ? 'bg-green-500' : 'bg-muted-foreground',
                 )}
               />
-              <span className="truncate">{ep.name}</span>
+              <span className="truncate">{dl.name}</span>
               <span className="ml-auto text-xs text-muted-foreground">
-                {ep.status}
+                {dl.status}
               </span>
             </DropdownMenuItem>
           ))}
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuItem asChild>
-          <Link href="/dashboard/endpoints/new">
+          <Link href="/dashboard/datalakes/new">
             <Plus data-icon="inline-start" />
-            New endpoint
+            New data lake
           </Link>
         </DropdownMenuItem>
       </DropdownMenuContent>
@@ -469,7 +474,9 @@ export function DashboardShell({
         <SidebarProvider className="flex flex-col">
           <header className="sticky top-0 z-50 flex h-(--header-height) shrink-0 items-center gap-2 border-b border-border bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60">
             <Link href="/dashboard" className="flex shrink-0 items-center">
-              <BrandMark iconClassName="size-5" textClassName="text-lg" />
+              <BrandMark
+                align="center"
+              />
             </Link>
             <Separator orientation="vertical" className="mr-1 h-4 shrink-0" />
             <SidebarTrigger className="-ml-1 shrink-0" />
@@ -478,7 +485,7 @@ export function DashboardShell({
               <Breadcrumbs pathname={pathname} />
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
-              <EndpointSwitcher />
+              <DatalakeSwitcher />
               <Button asChild size="sm">
                 <Link href="/dashboard/onboarding">
                   <Plug data-icon="inline-start" />
