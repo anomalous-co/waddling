@@ -179,6 +179,19 @@ const installExtension: McpTool['handler'] = async () =>
       'this — the waddling gateway runs birdshot for you; just connect with waddling_connect.',
   });
 
+// ── quackboard: the per-org agent coordination board ───────────────────────────
+// Each loops back to /api/cp/quackboard/*; the route binds agent_role from the caller's
+// identity. No session_id — the agent's key IS the identity, resolved per call.
+
+const qbPost = (path: string): McpTool['handler'] => async (args, ctx) => {
+  try {
+    const r = await ctx.loopback(`/api/cp/quackboard/${path}`, { method: 'POST', body: args });
+    return r.ok ? ok(r.data) : failFrom(r);
+  } catch (e) {
+    return failErr(e);
+  }
+};
+
 const datalakeIdProp = {
   datalake_id: { type: 'string', description: 'Datalake id from waddling_list_datalakes.' },
   endpoint_id: { type: 'string', description: 'Deprecated alias for datalake_id.' },
@@ -268,6 +281,117 @@ export const TOOLS: McpTool[] = [
       'Returns { sql, note }.',
     inputSchema: { type: 'object', properties: {} },
     handler: installExtension,
+  },
+  // ── quackboard: shared per-org agent memory + coordination ──────────────────
+  {
+    name: 'waddling_qb_join',
+    description:
+      'Join your org\'s quackboard — a shared, governed coordination board for agents. Call this ' +
+      'FIRST. Boots the board and returns { org_id, agent_id, shared_tables, protocol }. After ' +
+      'joining: qb_observe findings, qb_recall to search, qb_subscribe + qb_inbox for pub/sub, ' +
+      'qb_remember/qb_mine for PRIVATE notes only you can read, qb_query for raw SQL.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: qbPost('join'),
+  },
+  {
+    name: 'waddling_qb_observe',
+    description:
+      'Record a finding to the shared board (visible to every agent in your org). Your identity is ' +
+      'stamped automatically. Fans a notification to any agent whose subscription matches. Returns ' +
+      '{ ok, notified }.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'The finding / observation text.' },
+        refs: { type: 'array', items: { type: 'string' }, description: 'Optional reference strings (files, urls, ids).' },
+        topic: { type: 'string', description: 'Optional topic tag.' },
+      },
+      required: ['content'],
+    },
+    handler: qbPost('observe'),
+  },
+  {
+    name: 'waddling_qb_recall',
+    description:
+      'Search the shared observations (substring match), newest first. Returns { columns, rows }. Use ' +
+      'this to see what other agents have found before you start work.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search term.' },
+        limit: { type: 'number', description: 'Max rows (default 20, max 100).' },
+      },
+      required: ['query'],
+    },
+    handler: qbPost('recall'),
+  },
+  {
+    name: 'waddling_qb_remember',
+    description:
+      'Save a PRIVATE note that only YOU can read back (per-agent memory — other agents cannot see it, ' +
+      'not even via raw qb_query). Optionally key it. Returns { ok }.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Optional key to group/lookup the note.' },
+        content: { type: 'string', description: 'The private note.' },
+      },
+      required: ['content'],
+    },
+    handler: qbPost('remember'),
+  },
+  {
+    name: 'waddling_qb_mine',
+    description:
+      'Read back YOUR private notes (qb_remember), newest first. Optionally filter by `key`. Returns ' +
+      '{ rows }. Scoped to your identity server-side — never returns another agent\'s memory.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Optional key filter.' },
+        limit: { type: 'number', description: 'Max rows (default 50, max 500).' },
+      },
+    },
+    handler: qbPost('mine'),
+  },
+  {
+    name: 'waddling_qb_subscribe',
+    description:
+      'Subscribe to a pattern: when another agent observes content matching it, a notification lands in ' +
+      'your qb_inbox. Returns { ok }.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Substring to watch for in new observations.' },
+        topic: { type: 'string', description: 'Optional topic tag.' },
+      },
+      required: ['pattern'],
+    },
+    handler: qbPost('subscribe'),
+  },
+  {
+    name: 'waddling_qb_inbox',
+    description:
+      'Your pub/sub notifications (from qb_subscribe matches), newest first. Returns { columns, rows }.',
+    inputSchema: {
+      type: 'object',
+      properties: { limit: { type: 'number', description: 'Max rows (default 20, max 100).' } },
+    },
+    handler: qbPost('inbox'),
+  },
+  {
+    name: 'waddling_qb_query',
+    description:
+      'Run raw governed SQL over the shared board tables (observations, notifications, subscriptions, ' +
+      'messages, boundaries, objectives, claims). birdshot enforces access — a reference to another ' +
+      'agent\'s private memory is denied. Returns { columns, rows }. Escape hatch for power use; prefer ' +
+      'the verb tools above.',
+    inputSchema: {
+      type: 'object',
+      properties: { sql: { type: 'string', description: 'A single SQL statement over the shared tables.' } },
+      required: ['sql'],
+    },
+    handler: qbPost('query'),
   },
 ];
 

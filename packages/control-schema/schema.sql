@@ -160,6 +160,37 @@ BEGIN
   END IF;
 END $$;
 
+-- ── ACL policies (per-subject allowlists for NON-catalog resources; migration 012+) ──
+-- read_source/copy URIs, INSTALL/LOAD extension names, ATTACH targets — gated by
+-- birdshot_add_{source,dest,ext,attach}_policy, NOT table RefMatch. A policy only
+-- WIDENS what an already-CONSTANT literal may match (un-pinnable resource = DENY).
+CREATE TABLE IF NOT EXISTS waddling.acl_policy (
+  id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  org_id       TEXT NOT NULL,
+  datalake_id  TEXT REFERENCES waddling.datalake(id) ON DELETE CASCADE,  -- NULL = all
+  subject_kind TEXT NOT NULL DEFAULT 'agent'
+                 CHECK (subject_kind IN ('agent','user','org')),
+  agent_id     TEXT REFERENCES waddling.agent(id) ON DELETE CASCADE,
+  user_id      TEXT,                                   -- → auth.user.id (no FK: cross-schema)
+  policy_kind  TEXT NOT NULL
+                 CHECK (policy_kind IN ('source','dest','extension','attach')),
+  capability   TEXT NOT NULL
+                 CHECK (capability IN (
+                   'read_source','copy_to','copy_from','attach','install','load'
+                 )),
+  pattern      TEXT NOT NULL,                          -- host/domain or extension name
+  expires_at   TIMESTAMPTZ,
+  created_by   TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT acl_policy_subject_resolvable CHECK (
+    (subject_kind = 'agent' AND agent_id IS NOT NULL) OR
+    (subject_kind = 'user'  AND user_id  IS NOT NULL) OR
+    (subject_kind = 'org')
+  )
+);
+CREATE INDEX IF NOT EXISTS acl_policy_lookup_idx
+  ON waddling.acl_policy (datalake_id, subject_kind, user_id, agent_id);
+
 -- ── Agent sessions (live ATTACH sessions; NOT Better Auth session) ──
 CREATE TABLE IF NOT EXISTS waddling.agent_session (
   id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,

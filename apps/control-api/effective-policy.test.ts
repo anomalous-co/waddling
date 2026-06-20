@@ -22,10 +22,16 @@
 import { describe, it, expect } from 'vitest';
 import {
   deriveEffectiveRules,
+  deriveEffectivePolicies,
   type AclRuleRowFull,
+  type AclPolicyRowFull,
   type DelegationRow,
 } from './src/lib/effective-policy';
-import { compilePolicy } from './src/lib/policy-compiler';
+import {
+  compilePolicy,
+  type AclRuleRow,
+  type AclPolicyRow,
+} from './src/lib/policy-compiler';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -224,10 +230,24 @@ describe('deriveEffectiveRules', () => {
     expect(rows[0].verb).toBe('read');
   });
 
-  // Test 4b — deny with non-birdshot capability is dropped.
-  it('deny: non-read/write capability deny is dropped in Phase 1', () => {
+  // Test 4b — deny of a catalog capability (create) IS carried (Phase 3); deny of
+  // a non-catalog policy capability (read_source) is dropped (birdshot allowlists
+  // have no deny — a missing pattern IS the deny).
+  it('deny: catalog capability (create) deny is carried through', () => {
     const rows = deriveEffectiveRules(
       [makeGrant({ effect: 'deny', capability: 'create', verb: 'read' })],
+      [],
+      'agent1',
+      NOW,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].effect).toBe('deny');
+    expect(rows[0].capability).toBe('create');
+  });
+
+  it('deny: policy capability (read_source) deny is dropped', () => {
+    const rows = deriveEffectiveRules(
+      [makeGrant({ effect: 'deny', capability: 'read_source', verb: 'read' })],
       [],
       'agent1',
       NOW,
@@ -356,11 +376,24 @@ describe('deriveEffectiveRules', () => {
     expect(rows[0].expires_at).toBe('2026-09-01T00:00:00Z');
   });
 
-  // Test 8 — non-read/write capabilities are NOT emitted.
-  it('non-birdshot capability (create) is not emitted as a row', () => {
+  // Test 8 (Phase 3) — catalog capabilities ARE emitted; policy/etl caps are NOT.
+  it('catalog capability (create) IS emitted as a row carrying the capability', () => {
     const rows = deriveEffectiveRules(
-      [makeGrant({ capability: 'create', verb: 'read', effect: 'allow' })],
-      [makeScope({ capability: 'create' })],
+      [makeGrant({ capability: 'create', verb: 'read', effect: 'allow',
+                   schema_name: 'hn', table_name: '*' })],
+      [makeScope({ capability: 'create', schema_name: 'hn', table_name: '*' })],
+      'agent1',
+      NOW,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].capability).toBe('create');
+    expect(rows[0].schema_name).toBe('hn');
+  });
+
+  it('policy capability (read_source) is not emitted as an acl_rule row', () => {
+    const rows = deriveEffectiveRules(
+      [makeGrant({ capability: 'read_source', verb: 'read', effect: 'allow' })],
+      [makeScope({ capability: 'read_source' })],
       'agent1',
       NOW,
     );
@@ -526,5 +559,173 @@ describe('known limitation: wildcard allow + specific deny (Phase-2 territory)',
       (g) => g.tableRef === 'sales.*',
     );
     expect(wildcardGrant).toBeDefined(); // gap: should be undefined after Phase-2 fix
+  });
+});
+
+// ── Phase 3: capability grants + non-catalog policies ────────────────────────
+
+function makeRule(o: Partial<AclRuleRow> = {}): AclRuleRow {
+  return {
+    id: 'r1', org_id: 'org1', datalake_id: 'lake1', agent_id: 'agent1',
+    schema_name: 'hn', table_name: '*', columns: null,
+    verb: 'read', capability: 'create', effect: 'allow',
+    row_limit: null, ttl_seconds: null, window_start: null, window_end: null,
+    not_before: null, expires_at: null, priority: 100, ...o,
+  };
+}
+
+describe('compilePolicy — capability grants', () => {
+  it('emits a create grant with action="create"', () => {
+    const { snapshot } = compilePolicy([makeRule({ capability: 'create' })], NOW);
+    const g = snapshot.roleGrants.find((x) => x.tableRef === 'hn.*');
+    expect(g?.action).toBe('create');
+    expect(snapshot.userRoles).toContainEqual({
+      userId: 'agent:agent1', role: 'agent_agent1',
+    });
+  });
+
+  it('keys deny/allow per capability — a write deny does not suppress a read allow', () => {
+    const { snapshot } = compilePolicy(
+      [
+        makeRule({ id: 'a', capability: 'read', verb: 'read', table_name: 't' }),
+        makeRule({ id: 'd', capability: 'write', verb: 'write', table_name: 't', effect: 'deny' }),
+      ],
+      NOW,
+    );
+    expect(snapshot.roleGrants.find((g) => g.tableRef === 'hn.t' && g.action === 'read')).toBeDefined();
+    expect(snapshot.roleGrants.find((g) => g.tableRef === 'hn.t' && g.action === 'write')).toBeUndefined();
+  });
+
+  it('drops a policy capability that lands on an acl_rule row (no catalog resource)', () => {
+    const { snapshot } = compilePolicy([makeRule({ capability: 'read_source' })], NOW);
+    expect(snapshot.roleGrants).toHaveLength(0);
+  });
+});
+
+describe('compilePolicy — non-catalog policies', () => {
+  function makePol(o: Partial<AclPolicyRow> = {}): AclPolicyRow {
+    return {
+      id: 'p1', agent_id: 'agent1', policy_kind: 'source',
+      capability: 'read_source', pattern: 'hn.algolia.com', expires_at: null, ...o,
+    };
+  }
+
+  it('emits a source policy + creates the agent role even with no grants', () => {
+    const { snapshot } = compilePolicy([], NOW, [makePol()]);
+    expect(snapshot.policies).toContainEqual({
+      role: 'agent_agent1', kind: 'source', pattern: 'hn.algolia.com',
+    });
+    expect(snapshot.userRoles).toContainEqual({
+      userId: 'agent:agent1', role: 'agent_agent1',
+    });
+  });
+
+  it('maps each capability to the right policy family', () => {
+    const { snapshot } = compilePolicy([], NOW, [
+      makePol({ id: 'a', policy_kind: 'dest', capability: 'copy_to', pattern: 'out.x' }),
+      makePol({ id: 'b', policy_kind: 'extension', capability: 'install', pattern: 'birdshot' }),
+      makePol({ id: 'c', policy_kind: 'attach', capability: 'attach', pattern: 'lake.x' }),
+    ]);
+    expect(snapshot.policies?.map((p) => p.kind).sort()).toEqual(['attach', 'dest', 'extension']);
+  });
+
+  it('drops an expired policy', () => {
+    const { snapshot } = compilePolicy([], NOW, [
+      makePol({ expires_at: '2020-01-01T00:00:00Z' }),
+    ]);
+    expect(snapshot.policies).toHaveLength(0);
+  });
+});
+
+describe('compilePolicy — fail-closed guard (prerequisite #2)', () => {
+  // Per-role, NOT per-endpoint: the tripping agent is fully dropped; others stay.
+  it('drops a role that mixes a column-constrained read with a parse-authorized grant', () => {
+    const { snapshot, activeAgentIds } = compilePolicy(
+      [
+        makeRule({ id: 'c', capability: 'read', verb: 'read', table_name: 'colcon', columns: ['id'] }),
+        makeRule({ id: 'd', capability: 'create', table_name: '*' }),
+      ],
+      NOW,
+    );
+    expect(snapshot.roleGrants.filter((g) => g.role === 'agent_agent1')).toHaveLength(0);
+    expect(snapshot.userRoles.find((u) => u.role === 'agent_agent1')).toBeUndefined();
+    expect(activeAgentIds).not.toContain('agent1');
+  });
+
+  it('drops a role that mixes a column-constrained read with a policy', () => {
+    const { snapshot, activeAgentIds } = compilePolicy(
+      [makeRule({ id: 'c', capability: 'read', verb: 'read', table_name: 'colcon', columns: ['id'] })],
+      NOW,
+      [{ id: 'p', agent_id: 'agent1', policy_kind: 'source', capability: 'read_source', pattern: 'x.com', expires_at: null }],
+    );
+    expect(snapshot.roleGrants).toHaveLength(0);
+    expect(snapshot.policies).toHaveLength(0);
+    expect(activeAgentIds).not.toContain('agent1');
+  });
+
+  it('drops ONLY the tripping role — a clean agent on the same endpoint survives', () => {
+    const { snapshot, activeAgentIds } = compilePolicy(
+      [
+        // agent1 trips: column-constrained read + create.
+        makeRule({ id: 'a', agent_id: 'agent1', capability: 'read', verb: 'read', table_name: 'colcon', columns: ['id'] }),
+        makeRule({ id: 'b', agent_id: 'agent1', capability: 'create', table_name: '*' }),
+        // agent2 is clean: a plain read grant.
+        makeRule({ id: 'c', agent_id: 'agent2', capability: 'read', verb: 'read', table_name: 'orders' }),
+      ],
+      NOW,
+    );
+    expect(activeAgentIds).not.toContain('agent1');
+    expect(activeAgentIds).toContain('agent2');
+    expect(snapshot.roleGrants.find((g) => g.role === 'agent_agent2')).toBeDefined();
+  });
+
+  it('does NOT drop the HN happy path (create + read_source, no column allow-list)', () => {
+    const { snapshot, activeAgentIds } = compilePolicy(
+      [makeRule({ capability: 'create', table_name: '*' })],
+      NOW,
+      [{ id: 'p', agent_id: 'agent1', policy_kind: 'source', capability: 'read_source', pattern: 'hn.algolia.com', expires_at: null }],
+    );
+    expect(snapshot.roleGrants.find((g) => g.action === 'create')).toBeDefined();
+    expect(snapshot.policies).toHaveLength(1);
+    expect(activeAgentIds).toContain('agent1');
+  });
+});
+
+describe('deriveEffectivePolicies', () => {
+  function makeUserPol(o: Partial<AclPolicyRowFull> = {}): AclPolicyRowFull {
+    return {
+      id: 'up1', org_id: 'org1', datalake_id: 'lake1', subject_kind: 'user',
+      agent_id: null, user_id: 'user1', policy_kind: 'source',
+      capability: 'read_source', pattern: 'hn.algolia.com', expires_at: null,
+      created_by: 'user1', created_at: NOW, ...o,
+    };
+  }
+
+  it('emits the owner pattern when the capability is delegated', () => {
+    const out = deriveEffectivePolicies(
+      [makeUserPol()],
+      [makeScope({ capability: 'read_source' })],
+      'agent1',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ agent_id: 'agent1', pattern: 'hn.algolia.com', policy_kind: 'source' });
+  });
+
+  it('drops when the capability is not delegated', () => {
+    const out = deriveEffectivePolicies(
+      [makeUserPol()],
+      [makeScope({ capability: 'read' })],
+      'agent1',
+    );
+    expect(out).toHaveLength(0);
+  });
+
+  it('takes the tighter expiry across policy and scope', () => {
+    const out = deriveEffectivePolicies(
+      [makeUserPol({ expires_at: '2026-12-31T00:00:00Z' })],
+      [makeScope({ capability: 'read_source', expires_at: '2026-06-30T00:00:00Z' })],
+      'agent1',
+    );
+    expect(out[0].expires_at).toBe('2026-06-30T00:00:00Z');
   });
 });

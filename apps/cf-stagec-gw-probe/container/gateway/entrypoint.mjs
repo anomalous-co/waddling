@@ -53,6 +53,10 @@ const HOP_BY_HOP = new Set([
 
 const log = (...a) => console.log("[gw-entry]", ...a);
 
+/** Single-quote escape for inlining a bound value into a DuckDB SQL literal (typed
+ *  memory ops only — see /ctrl/qb-remember). */
+const qlit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+
 async function main() {
   const dataDir = resolve(STATE_DIR, "data");
   mkdirSync(dataDir, { recursive: true });
@@ -64,9 +68,15 @@ async function main() {
   //   • SELFTEST/demo — no real catalog configured (or GW_SELFTEST_SEED=1): a local-file
   //     DuckLake + local data dir, plus a seeded memory.main demo lake. Deterministic and
   //     OFFLINE so the data plane /selftest stays a regression guard, not a live-infra test.
+  // Quackboard: serve a durable .duckdb file directly (no lake, no demo seed). birdshot still
+  // boots + enforces; bootDuckRuntime bootstraps the schema on the control connection. Must
+  // NOT seed the demo lake (that would create memory.main.orders and leave the default catalog
+  // as :memory: with no observations table → birdshot bind_error).
+  const quackboard = /^(1|true|yes|on)$/i.test(process.env.QUACKBOARD ?? "");
   const seedDemo =
-    process.env.GW_SELFTEST_SEED === "1" ||
-    (!process.env.DUCKLAKE_CATALOG_DSN && !/^s3:\/\//i.test(process.env.DUCKLAKE_DATA_PATH ?? ""));
+    !quackboard &&
+    (process.env.GW_SELFTEST_SEED === "1" ||
+      (!process.env.DUCKLAKE_CATALOG_DSN && !/^s3:\/\//i.test(process.env.DUCKLAKE_DATA_PATH ?? "")));
 
   const localDataDir = dataDir.endsWith("/") ? dataDir : `${dataDir}/`;
   const ducklakeDataPath = process.env.DUCKLAKE_DATA_PATH || localDataDir;
@@ -96,12 +106,16 @@ async function main() {
       useSsl: /^(1|true|yes|on)$/i.test(process.env.S3_USE_SSL ?? ""),
       urlStyle: process.env.S3_URL_STYLE === "vhost" ? "vhost" : "path",
     },
+    // Quackboard mode: open this durable file as the DEFAULT catalog so quack serves its
+    // tables and birdshot resolves bare refs against it (no lake ATTACH). Empty ⇒ lake mode.
+    quackboard,
+    databasePath: process.env.DUCKDB_DATABASE_PATH || ":memory:",
   };
 
   const catalogDesc = config.ducklakeCatalogFile
     ? `file:${config.ducklakeCatalogFile}`
     : `postgres(schema=${config.metadataSchema || "main"})`;
-  log(`booting gateway: quack:${QUACK_PORT}, mode=${seedDemo ? "selftest-demo" : "real-lake"}, catalog=${catalogDesc}, dataPath=${config.ducklakeDataPath}`);
+  log(`booting gateway: quack:${QUACK_PORT}, mode=${quackboard ? `quackboard(db=${config.databasePath})` : seedDemo ? "selftest-demo" : "real-lake"}, catalog=${catalogDesc}, dataPath=${config.ducklakeDataPath}`);
   const rt = await bootDuckRuntime(config);
   log("gateway booted — quack_serve up, birdshot hooks installed pre-serve");
 
@@ -137,6 +151,12 @@ async function main() {
   await client.run("INSTALL quack; LOAD quack");
   // One ATTACH per session token; cache so repeated /query calls reuse the session.
   const attachedTokens = new Set();
+
+  // FTS recall (quackboard): the BM25 index is rebuilt lazily — only when the observations
+  // table has grown since the last build — so recall never pays an O(N) rebuild per write
+  // (plan req 3) and reads stay fresh within one observe→recall hop. -1 forces a rebuild on
+  // the first recall after a (cold) boot, folding in any observes since bootstrap.
+  let lastFtsCount = -1;
   async function attach(token) {
     if (attachedTokens.has(token)) return;
     // birdshot_authenticate verifies the JWT (RS256) against server_token + JWKS at
@@ -238,6 +258,73 @@ async function main() {
       await rt.run("CHECKPOINT");
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // ── Private per-agent memory (TRUSTED, narrow-typed — NOT a SQL passthrough) ──
+    // agent_memory carries NO birdshot grant, so the gated quack path (raw qb_query)
+    // can never reach it. These two endpoints are the ONLY way in, and they run FIXED
+    // SQL on the trusted control connection with the parameters bound — `agentRole` is
+    // always supplied by the control plane from the authenticated caller, never by the
+    // agent. This is the proxy-layer row-scoping the ACL model calls for, kept as two
+    // typed verbs rather than an arbitrary-SQL endpoint (which would re-create the
+    // retired /gw/query trusted-connection bypass).
+    if (path === "/ctrl/qb-remember" && method === "POST") {
+      const { agentRole, key, content } = await readJson(req);
+      if (!agentRole || content === undefined || content === null) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing agentRole/content" }));
+        return;
+      }
+      await rt.run(
+        `INSERT INTO agent_memory(agent_role, key, content) VALUES (${qlit(agentRole)}, ${key ? qlit(key) : "NULL"}, ${qlit(content)})`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (path === "/ctrl/qb-mine" && method === "POST") {
+      const { agentRole, key, limit } = await readJson(req);
+      if (!agentRole) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing agentRole" }));
+        return;
+      }
+      const cap = Math.min(Math.max(Number(limit) || 50, 1), 500);
+      const where = `agent_role = ${qlit(agentRole)}` + (key ? ` AND key = ${qlit(key)}` : "");
+      const reader = await rt.connection.runAndReadAll(
+        `SELECT key, content, ts FROM agent_memory WHERE ${where} ORDER BY ts DESC LIMIT ${cap}`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, rows: normalize(reader.getRowObjects()) }));
+      return;
+    }
+
+    // Shared-corpus BM25 recall (TRUSTED — observations is RW to every org agent, so ranked
+    // recall over it adds no per-agent governance; running it on the control connection avoids
+    // birdshot's bind-walk choking on the fts_main_observations.* internal tables the match_bm25
+    // macro expands to). Rebuilds the index only when the corpus changed since the last recall.
+    if (path === "/ctrl/qb-recall" && method === "POST") {
+      const { term, limit } = await readJson(req);
+      if (!term) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing term" }));
+        return;
+      }
+      const cap = Math.min(Math.max(Number(limit) || 20, 1), 100);
+      const cntReader = await rt.connection.runAndReadAll("SELECT count(*) AS n FROM observations");
+      const cnt = Number(cntReader.getRowObjects()[0]?.n ?? 0);
+      if (cnt !== lastFtsCount) {
+        await rt.run("PRAGMA create_fts_index('observations', 'id', 'content', stemmer = 'porter', overwrite = 1)");
+        lastFtsCount = cnt;
+      }
+      const reader = await rt.connection.runAndReadAll(
+        `SELECT agent_role, content, topic, ts, score FROM (
+           SELECT *, fts_main_observations.match_bm25(id, ${qlit(term)}) AS score FROM observations
+         ) sq WHERE score IS NOT NULL ORDER BY score DESC LIMIT ${cap}`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, rows: normalize(reader.getRowObjects()) }));
       return;
     }
 

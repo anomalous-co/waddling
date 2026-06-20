@@ -82,8 +82,18 @@ export interface Plan {
 }
 
 // ── Birdshot policy compiler output ───────────────────────────────────────────
+// Catalog capability: read/write ride the bind-walk; create/drop/alter/detach are
+// parse-layer-authorized (Phase 2). birdshot_add_role_grant accepts every value.
+export type BirdshotCatalogCapability =
+  | 'read'
+  | 'write'
+  | 'create'
+  | 'drop'
+  | 'alter'
+  | 'detach';
+
 export interface BirdshotSnapshot {
-  roleGrants: { role: string; tableRef: string; action: 'read' | 'write' }[];
+  roleGrants: { role: string; tableRef: string; action: BirdshotCatalogCapability }[];
   userRoles: { userId: string; role: string }[];
   // Column allow-lists + UTC time-of-day windows, pushed into birdshot via
   // birdshot_add_grant_constraint (Phase 2). Parallel to roleGrants (NOT folded
@@ -95,6 +105,16 @@ export interface BirdshotSnapshot {
     tableRef: string;
     columns?: string[];
     window?: { start: string; end: string };
+  }[];
+  // Per-role allowlists for NON-catalog resources (Phase 3) → birdshot_add_
+  // {source,dest,ext,attach}_policy. `kind` encodes the birdshot function:
+  // source←(read_source,copy_from), dest←copy_to, extension←(install,load),
+  // attach←attach. A policy only WIDENS what an already-CONSTANT literal may
+  // match; a non-constant resource is DENIED regardless.
+  policies?: {
+    role: string;
+    kind: 'source' | 'dest' | 'extension' | 'attach';
+    pattern: string;
   }[];
 }
 

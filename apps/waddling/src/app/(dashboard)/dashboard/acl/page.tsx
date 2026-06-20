@@ -53,10 +53,21 @@ import type { AclRuleInput, DatalakeSummary, AgentSummary } from '@/lib/types';
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type SubjectKind = 'agent' | 'user' | 'org';
-type Capability = 'read' | 'write';
+// Catalog capabilities — those keyed to a schema.table[.db] resource, authorable
+// on this acl_rule form. read/write ride the bind-walk; create/drop/alter/detach
+// are parse-layer-authorized (Phase 3). Non-catalog capabilities (read_source/
+// copy/attach/install/load) gate a URI or extension name, NOT a table, so they
+// are authored on the separate acl-policy surface, not here.
+type Capability = 'read' | 'write' | 'create' | 'drop' | 'alter' | 'detach';
 
-// Phase 1 capabilities; extend this array in Phase 3 to surface more.
-const CAPABILITIES: Capability[] = ['read', 'write'];
+const CAPABILITIES: Capability[] = [
+  'read',
+  'write',
+  'create',
+  'drop',
+  'alter',
+  'detach',
+];
 
 interface AclRuleRow {
   id: string;
@@ -253,8 +264,9 @@ function RuleBuilder({
         windowStart && windowEnd
           ? { start: windowStart, end: windowEnd }
           : undefined,
-      // capability drives both verb (backward-compat) and the new capability field
-      verb: capability,
+      // capability is the source of truth; verb is the legacy read|write filler
+      // (write-class → write, else read). The server keys on capability.
+      verb: capability === 'write' ? 'write' : 'read',
       subjectKind,
       userId: subjectKind === 'user' ? userId : undefined,
       capability,

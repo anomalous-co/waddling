@@ -207,9 +207,10 @@ function bootEnvFromConfig(boot?: GatewayBoot): Record<string, string> | undefin
   set('GW_SERVER_TOKEN', boot.serverToken);
   if (boot.quackboard) {
     // No lake: boot birdshot + serve quack against the restored .duckdb file.
+    // No DUCKLAKE_ALIAS — birdshot resolves unqualified table refs against the
+    // DuckDB default catalog, not a lake alias.
     env.QUACKBOARD = 'true';
     env.DUCKDB_DATABASE_PATH = QB_DB_PATH;
-    set('DUCKLAKE_ALIAS', boot.alias);
     return env;
   }
   set('DUCKLAKE_CATALOG_DSN', boot.catalogDsn);
@@ -377,6 +378,49 @@ async function qbQuery(env: Env, orgId: string, sql: string, token: string): Pro
   }
 }
 
+/** Private per-agent memory — TRUSTED, narrow-typed ops forwarded to the container's
+ *  /ctrl/qb-remember | /ctrl/qb-mine (fixed SQL, agentRole bound by the control plane).
+ *  agent_memory has NO birdshot grant, so it is unreachable from the gated quack path;
+ *  these are the only way in. boot is ensured first so a cold/slept org still serves. */
+async function qbRemember(
+  env: Env, orgId: string, boot: GatewayBoot, agentRole: string, key: string | undefined, content: string,
+): Promise<{ status: number; json: any }> {
+  await ensureQuackboard(env, orgId, boot);
+  return qbFwd(env, orgId, "/ctrl/qb-remember", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ agentRole, key, content }),
+  });
+}
+async function qbMine(
+  env: Env, orgId: string, boot: GatewayBoot, agentRole: string, key: string | undefined, limit: number | undefined,
+): Promise<{ status: number; json: any }> {
+  await ensureQuackboard(env, orgId, boot);
+  return qbFwd(env, orgId, "/ctrl/qb-mine", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ agentRole, key, limit }),
+  });
+}
+
+/** Shared-corpus BM25 recall — TRUSTED typed op (observations is shared; ranked recall over it
+ *  adds no per-agent governance and dodges birdshot's fts-internal-table bind-walk). */
+async function qbRecall(
+  env: Env, orgId: string, boot: GatewayBoot, term: string, limit: number | undefined,
+): Promise<{ status: number; json: any }> {
+  await ensureQuackboard(env, orgId, boot);
+  return qbFwd(env, orgId, "/ctrl/qb-recall", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ term, limit }),
+  });
+}
+
+/** Drain birdshot's process-global audit log from the org's quackboard container (destructive,
+ *  exactly-once per record). The control plane persists each record as an audit_event. */
+async function qbAuditDrain(env: Env, orgId: string): Promise<{ status: number; json: any }> {
+  return qbFwd(env, orgId, "/ctrl/audit-drain", {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  });
+}
+
 /** Fold the WAL into the file (best-effort CHECKPOINT via the un-gated /ctrl channel) then
  *  upload it to R2. Bounded-staleness durability: call on a schedule and on disconnect. The
  *  /ctrl/checkpoint endpoint is a container-side follow-up; if absent, the upload still runs. */
@@ -394,7 +438,10 @@ async function qbPersist(env: Env, orgId: string, r2Key: string): Promise<{ ok: 
 // Proves container orchestration, the birdshot-gated write+read path, AND the R2 durability
 // round-trip in one verdict. Self-contained (mints its own JWT/JWKS); touches no real org.
 async function qbSelftest(env: Env): Promise<Response> {
-  const orgId = "qb-selftest";
+  // Fresh org id per run → a never-seen DO that ALWAYS cold-boots on the latest image with a
+  // clean R2 key (404 → fresh bootstrap). Avoids destroying a hot container (which would
+  // restore a stale/bad file and fail healthz) and avoids serving stale code from a warm one.
+  const orgId = `qb-selftest-${crypto.randomUUID().slice(0, 8)}`;
   const r2Key = `quackboard/${orgId}/quackboard.duckdb`;
   const boot: GatewayBoot = { serverToken: "srv_qbselftest", alias: "quackboard", quackboard: true, r2Key };
   const marker = `mk-${crypto.randomUUID()}`;
@@ -408,13 +455,23 @@ async function qbSelftest(env: Env): Promise<Response> {
   };
   const pushSnapshot = () => qbFwd(env, orgId, "/ctrl/snapshot", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ snapshot, auth, lakeCatalog: "quackboard" }),
+    body: JSON.stringify({ snapshot, auth }),
   });
   const steps: Record<string, unknown> = {};
   try {
     steps.boot1 = await ensureQuackboard(env, orgId, boot);
     steps.snapshot1 = (await pushSnapshot()).json;
+    // Verify birdshot has the right mode + catalog before querying.
+    const st1 = await qbFwd(env, orgId, "/ctrl/status", { method: "GET" });
+    steps.birdshotStatus = st1.json;
+    // Probes (through the gated quack path): what catalog does the serving connection use,
+    // and where does `observations` actually live? Pinpoints catalog/resolution vs authz.
+    steps.probeCatalog = (await qbQuery(env, orgId, "SELECT current_database() AS db, current_schema() AS sch", jwt)).json;
+    steps.probeTableLoc = (await qbQuery(env, orgId, "SELECT database_name, schema_name FROM duckdb_tables() WHERE table_name='observations'", jwt)).json;
+    // Drain any warm-start audit noise before the real steps.
+    try { await qbFwd(env, orgId, "/ctrl/audit-drain", { method: "POST" }); } catch {}
     steps.observe = (await qbQuery(env, orgId, `INSERT INTO observations(agent_role, content) VALUES ('${ST_AGENT}', '${marker}')`, jwt)).json;
+    steps.audit1 = (await qbFwd(env, orgId, "/ctrl/audit-drain", { method: "POST" })).json;
     steps.recallBefore = (await qbQuery(env, orgId, `SELECT content FROM observations WHERE content = '${marker}'`, jwt)).json;
     steps.persist = await qbPersist(env, orgId, r2Key);
     // force a true cold boot: destroy the container so the next ensure restores from R2.
@@ -819,9 +876,12 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   // ── workspace lifecycle (control-api configure; mcp-external query/run) ─────────
   if (path === "/configure" && request.method === "POST") {
-    const { workspaceId, agentId, endpointId, workspaceKey, lakeToken, disableSsl } = body;
+    // control-api migrated endpointId → datalakeId (the gateway DO is keyed gw:<datalakeId>,
+    // and gw-<id>.internal uses the same value); accept either name for the routing id.
+    const { workspaceId, agentId, workspaceKey, lakeToken, disableSsl } = body;
+    const endpointId = body.endpointId ?? body.datalakeId;
     if (!workspaceId || !agentId || !endpointId || !workspaceKey || !lakeToken) {
-      return Response.json({ error: "missing workspaceId/agentId/endpointId/workspaceKey/lakeToken" }, { status: 400 });
+      return Response.json({ error: "missing workspaceId/agentId/datalakeId/workspaceKey/lakeToken" }, { status: 400 });
     }
     const out = await configureWorkspace(env, { workspaceId, agentId, endpointId, workspaceKey, lakeToken, disableSsl });
     return Response.json({ ok: true, ...out });
@@ -866,9 +926,43 @@ async function route(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true, ...out, snapshot: snap });
   }
   if (path === "/qb/query" && request.method === "POST") {
-    const { orgId, sql, lakeToken } = body;
+    const { orgId, sql, lakeToken, gatewayBoot } = body;
     if (!orgId || !sql || !lakeToken) return Response.json({ error: "missing orgId/sql/lakeToken" }, { status: 400 });
+    // Ensure the container is booted + quack serving before the gated query (a cold/slept org
+    // otherwise refuses the connection). birdshot authz still depends on the snapshot the
+    // control plane pushes via /qb/configure — control-api re-pushes on cold-detect + retries.
+    if (gatewayBoot) await ensureQuackboard(env, orgId, gatewayBoot as GatewayBoot);
     const r = await qbQuery(env, orgId, sql, lakeToken);
+    return Response.json(r.json, { status: r.status });
+  }
+  if (path === "/qb/remember" && request.method === "POST") {
+    const { orgId, gatewayBoot, agentRole, key, content } = body;
+    if (!orgId || !gatewayBoot || !agentRole || content === undefined || content === null) {
+      return Response.json({ error: "missing orgId/gatewayBoot/agentRole/content" }, { status: 400 });
+    }
+    const r = await qbRemember(env, orgId, gatewayBoot as GatewayBoot, agentRole, key, content);
+    return Response.json(r.json, { status: r.status });
+  }
+  if (path === "/qb/mine" && request.method === "POST") {
+    const { orgId, gatewayBoot, agentRole, key, limit } = body;
+    if (!orgId || !gatewayBoot || !agentRole) {
+      return Response.json({ error: "missing orgId/gatewayBoot/agentRole" }, { status: 400 });
+    }
+    const r = await qbMine(env, orgId, gatewayBoot as GatewayBoot, agentRole, key, limit);
+    return Response.json(r.json, { status: r.status });
+  }
+  if (path === "/qb/recall" && request.method === "POST") {
+    const { orgId, gatewayBoot, term, limit } = body;
+    if (!orgId || !gatewayBoot || !term) {
+      return Response.json({ error: "missing orgId/gatewayBoot/term" }, { status: 400 });
+    }
+    const r = await qbRecall(env, orgId, gatewayBoot as GatewayBoot, term, limit);
+    return Response.json(r.json, { status: r.status });
+  }
+  if (path === "/qb/audit-drain" && request.method === "POST") {
+    const { orgId } = body;
+    if (!orgId) return Response.json({ error: "missing orgId" }, { status: 400 });
+    const r = await qbAuditDrain(env, orgId);
     return Response.json(r.json, { status: r.status });
   }
   if (path === "/qb/persist" && request.method === "POST") {

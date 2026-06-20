@@ -163,12 +163,19 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   if (config.quackboard) {
     // Discover and USE the actual database name so quack's per-request connections +
     // birdshot's bind-walk resolve unqualified table refs against the same catalog.
-    // MUST come BEFORE table creation so tables land in the right DB.
-    const dbReader = await connection.runAndReadAll("SELECT database_name FROM duckdb_databases() WHERE internal = false ORDER BY database_name");
-    const dbName = String((dbReader.getRowObjects()[0] as any)?.database_name ?? "memory");
-    console.log(`[gateway] quackboard database name: ${dbName}, lakeAlias=${config.lakeAlias || "(empty)"}`);
+    // Opening a file path makes that file (not `memory`) the default catalog, and
+    // birdshot_set_lake_catalog must match it — so override config.lakeAlias with the
+    // discovered name. MUST come BEFORE table creation so tables land in the right DB.
+    const dbReader = await connection.runAndReadAll(
+      "SELECT database_name FROM duckdb_databases() WHERE internal = false ORDER BY database_name",
+    );
+    const dbName = String(
+      (dbReader.getRowObjects()[0] as Record<string, unknown>)?.database_name ?? "memory",
+    );
+    console.log(
+      `[gateway] quackboard database name: ${dbName}, lakeAlias=${config.lakeAlias || "(empty)"}`,
+    );
     await connection.run(`USE ${qid(dbName)}`);
-    // Override the config so applySnapshot sets the correct birdshot lake catalog.
     config.lakeAlias = dbName;
     // FTS powers quackboard recall (BM25) + pub/sub matching; no lake catalog/object store.
     await connection.run("INSTALL fts; LOAD fts;");
@@ -189,7 +196,7 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   // A quackboard has no lake: skip the S3 secret, the ducklake ATTACH, and the read-through
   // views entirely. quack serves the opened database's own tables (restored from R2). The
   // birdshot hooks + quack_serve below still run, so ACLs are enforced.
-  // (Quackboard config (USE + lakeAlias) was already handled above before schema creation.)
+  // (Quackboard config — USE + lakeAlias override — was already handled above, before schema creation.)
   if (!config.quackboard) {
   // S3 / R2 / MinIO secret. PROVIDER config = explicit static creds.
   // MinIO: USE_SSL false + URL_STYLE path; R2: USE_SSL true + vhost.
@@ -420,6 +427,21 @@ export async function applySnapshot(
     await c.run(
       `SELECT birdshot_add_grant_constraint(${q(rc.role)}, ${q(rc.tableRef)}, ${q(cols)}, ${q(ws)}, ${q(we)})`,
     );
+  }
+  // Per-role allowlists for NON-catalog resources (Phase 3). Each `kind` maps to a
+  // distinct birdshot policy function; the role can then run an already-CONSTANT
+  // read_source/copy/attach/install whose literal matches the pattern. Without
+  // these, every such capability default-denies (an empty allowlist grants nothing).
+  for (const p of snapshot.policies ?? []) {
+    const fn =
+      p.kind === "source"
+        ? "birdshot_add_source_policy"
+        : p.kind === "dest"
+          ? "birdshot_add_dest_policy"
+          : p.kind === "extension"
+            ? "birdshot_add_ext_policy"
+            : "birdshot_add_attach_policy";
+    await c.run(`SELECT ${fn}(${q(p.role)}, ${q(p.pattern)})`);
   }
   await c.run("SELECT birdshot_commit_config()");
 }

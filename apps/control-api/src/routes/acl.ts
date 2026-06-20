@@ -92,7 +92,11 @@ const AclRuleSchema = z.object({
   schema: z.string().default('*'),
   table: z.string().default('*'),
   columns: z.array(z.string()).optional(),
-  verb: z.enum(['read', 'write']),
+  // Legacy read|write verb. Optional now that `capability` is the source of truth;
+  // the compiler keys on capability and only falls back to verb. Auto-derived from
+  // capability when omitted (write-class → write, else read) so authoring a
+  // create/drop/read_source grant needs no filler verb.
+  verb: z.enum(['read', 'write']).optional(),
   effect: z.enum(['allow', 'deny']).default('allow'),
   rowLimit: z.number().int().positive().optional(),
   ttlSeconds: z.number().int().positive().optional(),
@@ -185,6 +189,11 @@ acl.post('/', (c) =>
       assertOrg(caller, agent.org_id);
     }
 
+    // Legacy verb is a filler for non-read/write capabilities (the compiler keys
+    // on capability). Derive it when omitted so the NOT NULL column is satisfied.
+    const verb: 'read' | 'write' =
+      input.verb ?? (input.capability === 'write' ? 'write' : 'read');
+
     // Resolve ttl_seconds → absolute expires_at (prefer explicit expiresAt).
     let expiresAt: string | null = input.expiresAt ?? null;
     if (!expiresAt && input.ttlSeconds) {
@@ -208,7 +217,7 @@ acl.post('/', (c) =>
         input.schema,
         input.table,
         input.columns ?? null,
-        input.verb,
+        verb,
         input.effect,
         input.rowLimit ?? null,
         input.ttlSeconds ?? null,

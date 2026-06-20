@@ -33,10 +33,12 @@ import { usage } from "./routes/usage";
 import { audit } from "./routes/audit";
 import { billing } from "./routes/billing";
 import { acl } from "./routes/acl";
+import { policies } from "./routes/policies";
 import { delegations } from "./routes/delegations";
 import { sessions } from "./routes/sessions";
 import { deviceLink } from "./routes/device-link";
 import { catalog } from "./routes/catalog";
+import { quackboard } from "./routes/quackboard";
 import { account } from "./routes/account";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -516,11 +518,13 @@ app.route("/api/cp/usage", usage);
 app.route("/api/cp/audit", audit);
 app.route("/api/cp/billing", billing);
 app.route("/api/cp/acl", acl);
+app.route("/api/cp/acl-policy", policies);
 app.route("/api/cp/delegations", delegations);
 app.route("/api/cp/sessions", sessions);
 app.route("/api/cp/whoami", whoami);
 app.route("/api/cp/device-link", deviceLink);
 app.route("/api/cp/catalog", catalog);
+app.route("/api/cp/quackboard", quackboard);
 app.route("/api/cp/account", account);
 
 app.get("/", (c) =>

@@ -74,8 +74,22 @@ export interface Plan {
 }
 
 // ── Birdshot policy compiler output ───────────────────────────────────────────
+/**
+ * A birdshot capability on a CATALOG resource (schema.table[.db]), matched by
+ * RefMatch. `read`/`write` ride the bind-walk; `create`/`drop`/`alter`/`detach`
+ * are authorized at the parse layer (Phase 2 full-scope ACL). `birdshot_add_role_grant`
+ * accepts every value — the action arg widened from read|write to the full enum.
+ */
+export type BirdshotCatalogCapability =
+  | 'read'
+  | 'write'
+  | 'create'
+  | 'drop'
+  | 'alter'
+  | 'detach';
+
 export interface BirdshotSnapshot {
-  roleGrants: { role: string; tableRef: string; action: 'read' | 'write' }[];
+  roleGrants: { role: string; tableRef: string; action: BirdshotCatalogCapability }[];
   userRoles: { userId: string; role: string }[];
   // Column allow-lists + UTC time-of-day windows, pushed into birdshot via
   // birdshot_add_grant_constraint (Phase 2). Parallel to roleGrants (NOT folded
@@ -87,6 +101,22 @@ export interface BirdshotSnapshot {
     tableRef: string;
     columns?: string[];
     window?: { start: string; end: string };
+  }[];
+  // Per-role allowlists for NON-catalog resources (Phase 3). These compile to
+  // birdshot_add_{source,dest,ext,attach}_policy — birdshot matches a CONSTANT
+  // literal (a read_source/copy URI, an INSTALL/LOAD extension name, an ATTACH
+  // target) against the pattern. `kind` already encodes the birdshot function:
+  //   source → add_source_policy   (read_source, copy_from)
+  //   dest   → add_dest_policy     (copy_to)
+  //   extension → add_ext_policy   (install, load)
+  //   attach → add_attach_policy   (attach)
+  // HARD INVARIANT: a resource that can't be pinned to a constant literal is
+  // DENIED by birdshot regardless of any policy — a policy only WIDENS what an
+  // already-constant literal may match, never relaxes the constant requirement.
+  policies?: {
+    role: string;
+    kind: 'source' | 'dest' | 'extension' | 'attach';
+    pattern: string;
   }[];
 }
 

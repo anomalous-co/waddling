@@ -21,6 +21,7 @@ import { query } from './db';
 import {
   compilePolicy,
   type AclRuleRow,
+  type AclPolicyRow,
   type CompileResult,
 } from './policy-compiler';
 
@@ -41,8 +42,36 @@ export type Capability =
   | 'load'
   | 'etl';
 
-/** Capabilities birdshot can enforce as of Phase 1 (read/write verb rows). */
-const BIRDSHOT_CAPABILITIES = new Set<Capability>(['read', 'write']);
+/**
+ * Catalog capabilities (Phase 3): these intersect a user grant with a delegation
+ * scope and emit an acl_rule-shaped row carrying `capability` for the compiler to
+ * key on. read/write ride the bind-walk; create/drop/alter/detach are parse-layer.
+ * `etl` and the non-catalog capabilities (read_source/copy/attach/install/load)
+ * never become acl_rule rows — the latter ride acl_policy (deriveEffectivePolicies).
+ */
+const CATALOG_CAPABILITIES = new Set<Capability>([
+  'read',
+  'write',
+  'create',
+  'drop',
+  'alter',
+  'detach',
+]);
+
+/** Capabilities matched by a per-role policy allowlist (acl_policy, not acl_rule). */
+const POLICY_CAPABILITIES = new Set<Capability>([
+  'read_source',
+  'copy_to',
+  'copy_from',
+  'attach',
+  'install',
+  'load',
+]);
+
+/** The legacy read|write verb a catalog capability maps to (write-class → write). */
+function verbForCapability(cap: Capability): 'read' | 'write' {
+  return cap === 'write' ? 'write' : 'read';
+}
 
 // ── Extended row shapes ──────────────────────────────────────────────────────
 
@@ -196,17 +225,19 @@ export function deriveEffectiveRules(
     // ── Deny preservation ────────────────────────────────────────────────────
     // A user-level deny is carried to the agent directly, regardless of scope.
     // This means an agent can never exceed its owner: if the owner has been
-    // denied something, the agent is denied it too. Only birdshot-capable
-    // verbs (read/write) are rewritten; others are not enforceable in Phase 1.
+    // denied something, the agent is denied it too. Only CATALOG capabilities
+    // (read/write/create/drop/alter/detach) are carried — birdshot has no deny
+    // mechanism for the allowlist-based policy capabilities (a missing pattern
+    // IS the deny), and `etl` is control-plane sugar, so those are dropped.
     if (grant.effect === 'deny') {
-      if (!BIRDSHOT_CAPABILITIES.has(grant.capability)) continue;
-      const verb = grant.capability as 'read' | 'write';
+      if (!CATALOG_CAPABILITIES.has(grant.capability)) continue;
       derived.push({
         ...grant,
         agent_id: agentId,
         subject_kind: 'agent' as const,
         user_id: null,
-        verb,
+        capability: grant.capability,
+        verb: verbForCapability(grant.capability),
       } as AclRuleRow);
       continue;
     }
@@ -215,7 +246,9 @@ export function deriveEffectiveRules(
     // An allow grant is granted to the agent only if both:
     //   1. The grant's capability matches at least one scope entry, AND
     //   2. The resource selectors overlap.
-    if (!BIRDSHOT_CAPABILITIES.has(grant.capability)) continue; // Phase 1: skip non-read/write
+    // Only CATALOG capabilities become acl_rule rows here; non-catalog policy
+    // capabilities ride deriveEffectivePolicies (acl_policy ∩ scope).
+    if (!CATALOG_CAPABILITIES.has(grant.capability)) continue;
 
     for (const entry of scope) {
       // Capability must match on both sides.
@@ -267,7 +300,6 @@ export function deriveEffectiveRules(
       // not_before: comes from the user grant side only (DelegationRow has none).
       const notBefore = grant.not_before;
 
-      const verb = grant.capability as 'read' | 'write';
       const row: AclRuleRow = {
         // Identity fields
         id: `derived:${grant.id}:${entry.id}`,
@@ -278,8 +310,9 @@ export function deriveEffectiveRules(
         schema_name: schema,
         table_name: table,
         columns: cols,
-        // Verb / effect
-        verb,
+        // Capability + legacy verb / effect
+        capability: grant.capability,
+        verb: verbForCapability(grant.capability),
         effect: 'allow',
         // Constraints
         row_limit: rowLimit,
@@ -293,6 +326,73 @@ export function deriveEffectiveRules(
       };
       derived.push(row);
     }
+  }
+
+  return derived;
+}
+
+// ── acl_policy (non-catalog resource) derivation ─────────────────────────────
+
+/**
+ * A waddling.acl_policy row after migration 012 — the per-subject allowlist for a
+ * non-catalog resource (a read_source/copy URI, an install/load extension, an
+ * attach target). Mirrors the migration DDL.
+ */
+export interface AclPolicyRowFull {
+  id: string;
+  org_id: string;
+  datalake_id: string | null;
+  subject_kind: 'agent' | 'user' | 'org';
+  agent_id: string | null;
+  user_id: string | null;
+  policy_kind: 'source' | 'dest' | 'extension' | 'attach';
+  capability: Capability;
+  pattern: string;
+  expires_at: Date | string | null;
+  created_by: string;
+  created_at: Date | string;
+}
+
+/**
+ * Derive effective non-catalog policies for `agentId` by intersecting the owner's
+ * acl_policy rows with their delegation scope.
+ *
+ * A delegation row has no `pattern` column — it cannot narrow a host/extension
+ * allowlist — so the intersection is purely on CAPABILITY (and datalake): the
+ * agent inherits the owner's pattern for any policy capability the owner delegated
+ * to it. This preserves "agent ⊆ owner": the agent can only reach a resource the
+ * owner already allowlisted, and only via a capability the owner explicitly
+ * delegated. expires_at is the tightest of the policy's and the scope entry's.
+ */
+export function deriveEffectivePolicies(
+  userPolicies: AclPolicyRowFull[],
+  scope: DelegationRow[],
+  agentId: string,
+): AclPolicyRow[] {
+  const derived: AclPolicyRow[] = [];
+
+  for (const pol of userPolicies) {
+    if (!POLICY_CAPABILITIES.has(pol.capability)) continue;
+
+    // The owner must have delegated this exact policy capability to this agent.
+    const matches = scope.filter((e) => e.capability === pol.capability);
+    if (matches.length === 0) continue;
+
+    // Tightest expiry across the policy and every matching scope entry.
+    let expiresAt = toIso(pol.expires_at);
+    for (const e of matches) {
+      const eExp = toIso(e.expires_at);
+      if (eExp && (!expiresAt || eExp < expiresAt)) expiresAt = eExp;
+    }
+
+    derived.push({
+      id: `derived:${pol.id}`,
+      agent_id: agentId,
+      policy_kind: pol.policy_kind,
+      capability: pol.capability,
+      pattern: pol.pattern,
+      expires_at: expiresAt,
+    });
   }
 
   return derived;
@@ -341,6 +441,27 @@ export async function compileEndpointPolicy(
   // Split by subject_kind.
   const directRows = rows.filter((r) => r.subject_kind !== 'user');
   const userGrantRows = rows.filter((r) => r.subject_kind === 'user');
+
+  // Load every acl_policy row (non-catalog allowlists) for the endpoint, scoped to
+  // this datalake OR global (datalake_id IS NULL). Split the same way as acl_rule:
+  // direct (agent/org) → straight to the compiler; user → the policy derivation
+  // source (intersected with each agent's delegation scope, never a principal).
+  const { rows: polRows } = await query<AclPolicyRowFull>(
+    `SELECT * FROM waddling.acl_policy
+      WHERE datalake_id = $1 OR datalake_id IS NULL`,
+    [datalakeId],
+  );
+  const directPolicies: AclPolicyRow[] = polRows
+    .filter((p) => p.subject_kind !== 'user')
+    .map((p) => ({
+      id: p.id,
+      agent_id: p.agent_id,
+      policy_kind: p.policy_kind,
+      capability: p.capability,
+      pattern: p.pattern,
+      expires_at: p.expires_at,
+    }));
+  const userPolicyRows = polRows.filter((p) => p.subject_kind === 'user');
 
   // Enumerate every delegated and autonomous-owned agent live on this datalake.
   // A "live" agent is one with an active or recent agent_session on this datalake,
@@ -407,6 +528,7 @@ export async function compileEndpointPolicy(
   );
 
   const derivedRows: AclRuleRow[] = [];
+  const derivedPolicies: AclPolicyRow[] = [];
 
   for (const agent of agentRows.rows) {
     // Resolve the owner user id for this agent.
@@ -424,9 +546,10 @@ export async function compileEndpointPolicy(
 
     if (!ownerId) continue; // no resolvable owner — skip
 
-    // User grants for this owner on this datalake (from the already-loaded rows).
+    // User grants + policies for this owner (from the already-loaded rows).
     const uGrants = userGrantRows.filter((r) => r.user_id === ownerId);
-    if (uGrants.length === 0) continue;
+    const uPolicies = userPolicyRows.filter((p) => p.user_id === ownerId);
+    if (uGrants.length === 0 && uPolicies.length === 0) continue;
 
     // Delegation scope: all entries for (userId, agentId, datalakeId|NULL).
     const { rows: scopeRows } = await query<DelegationRow>(
@@ -438,13 +561,20 @@ export async function compileEndpointPolicy(
     );
     if (scopeRows.length === 0) continue;
 
-    const derived = deriveEffectiveRules(uGrants, scopeRows, agent.id, now);
-    derivedRows.push(...derived);
+    if (uGrants.length > 0) {
+      derivedRows.push(...deriveEffectiveRules(uGrants, scopeRows, agent.id, now));
+    }
+    if (uPolicies.length > 0) {
+      derivedPolicies.push(
+        ...deriveEffectivePolicies(uPolicies, scopeRows, agent.id),
+      );
+    }
   }
 
-  // Union: direct (agent + org) rows ∪ derived.
-  // User rows are excluded — they were only the derivation source, never birdshot rows.
+  // Union: direct (agent + org) rows ∪ derived. User rows are excluded — they were
+  // only the derivation source, never birdshot rows. Same split for policies.
   const allRules: AclRuleRow[] = [...directRows, ...derivedRows];
+  const allPolicies: AclPolicyRow[] = [...directPolicies, ...derivedPolicies];
 
-  return compilePolicy(allRules, now);
+  return compilePolicy(allRules, now, allPolicies);
 }
