@@ -36,7 +36,6 @@ import { fetchCp } from '@/components/dashboard/fetch';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
-import { Separator } from '@/components/ui/separator';
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import {
@@ -357,7 +356,8 @@ function AppSidebar({
           </SidebarGroup>
         ))}
       </SidebarContent>
-      <SidebarFooter>
+      <SidebarFooter className="flex flex-row items-center gap-0">
+        <SidebarTrigger className="shrink-0" />
         <UserMenu user={user} activeOrgId={activeOrgId} />
       </SidebarFooter>
       <SidebarRail />
@@ -478,9 +478,6 @@ export function DashboardShell({
                 align="center"
               />
             </Link>
-            <Separator orientation="vertical" className="mr-1 h-4 shrink-0" />
-            <SidebarTrigger className="-ml-1 shrink-0" />
-            <Separator orientation="vertical" className="mr-1 h-4 shrink-0" />
             <div className="min-w-0 flex-1 overflow-hidden">
               <Breadcrumbs pathname={pathname} />
             </div>
