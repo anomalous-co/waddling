@@ -30,7 +30,7 @@ export interface Crypto {
  * Per-isolate crypto singleton + throwing getter (mirrors db.ts's pool pattern).
  *
  * `makeCrypto(secret)` stays the explicit factory (used directly by the Stage-B
- * crypto probe). But `endpoint-secrets.ts` and `workspace-keys.ts` need the
+ * crypto probe). But `datalake-secrets.ts` and `workspace-keys.ts` need the
  * seal/open pair WITHOUT taking a secret in their own signatures (the originals
  * imported a module-singleton `sealJson`/`openJson`). On workerd the secret arrives
  * per-request via `c.env`, so a middleware calls `initCrypto(secret)` once before

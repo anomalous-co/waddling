@@ -32,7 +32,7 @@ import type { BirdshotSnapshot } from './types';
 // ── Request payloads ────────────────────────────────────────────────────────────
 
 export interface SnapshotRequest {
-  endpointId: string;
+  datalakeId: string;
   /** birdshot auth config (RS256). */
   auth: { issuer: string; audience: string; mode: 'rs256'; jwks: BirdshotJwk[] };
   snapshot: BirdshotSnapshot;
@@ -65,6 +65,13 @@ export interface GatewayBoot {
     endpoint?: string; keyId?: string; secret?: string; sessionToken?: string;
     region?: string; useSsl?: boolean; urlStyle?: 'path' | 'vhost';
   };
+  /**
+   * Quackboard endpoint: boot birdshot + serve quack but do NOT ATTACH any DuckLake — the
+   * served database IS the durable store. `r2Key` is the object key under which the data
+   * plane restores/persists the single .duckdb file. No catalogDsn/catalogFile/s3.
+   */
+  quackboard?: boolean;
+  r2Key?: string;
 }
 
 export interface BirdshotJwk {
@@ -74,7 +81,7 @@ export interface BirdshotJwk {
 }
 
 export interface RevokeRequest {
-  endpointId: string;
+  datalakeId: string;
   kind: 'user' | 'jti' | 'session';
   id: string;
   reason: string;
@@ -96,13 +103,13 @@ export interface GatewayTableInfo {
   columns: { name: string; type: string; nullable?: boolean }[];
 }
 
+// Pool runtime status from the dataplane GatewayPoolDO (derived without waking a sleeping
+// pool). Replaces the old per-gateway birdshot counts.
 export interface GatewayStatus {
-  ok: boolean;
-  authMode: string;
-  policySize: number;
-  sessionCount: number;
-  auditRingDepth: number;
-  snapshotLag?: number;
+  state: 'running' | 'asleep' | 'unconfigured';
+  replicas: number;
+  inFlightTotal: number;
+  version: number;
 }
 
 export class GatewayError extends Error {
@@ -167,11 +174,14 @@ export class GatewayClient {
   }
 
   /** Push a birdshot ACL snapshot + RS256 JWKS to the per-endpoint GatewayDO. The
-   *  data plane boots `gw:<endpointId>` if cold and applies the snapshot (a full
+   *  data plane boots `gw:<datalakeId>` if cold and applies the snapshot (a full
    *  reset → set_auth → grants → commit), so callers MUST push the endpoint's WHOLE
    *  compiled policy (all agents), not a single agent's — see sessions/acl. */
   pushSnapshot(req: SnapshotRequest): Promise<GatewayAck> {
-    return this.send<GatewayAck>('POST', '/gw/snapshot', req);
+    // WIRE CONTRACT: the deployed dataplane reads `endpointId` (value = the datalake id).
+    // Keep the internal field `datalakeId`, remap to `endpointId` on the wire.
+    const { datalakeId, ...rest } = req;
+    return this.send<GatewayAck>('POST', '/gw/snapshot', { endpointId: datalakeId, ...rest });
   }
 
   /**
@@ -190,14 +200,22 @@ export class GatewayClient {
   }
 
   revoke(req: RevokeRequest): Promise<GatewayAck> {
-    return this.send<GatewayAck>('POST', '/gw/revoke', req);
+    // WIRE CONTRACT: dataplane reads `endpointId` (= datalake id) — remap on the wire.
+    const { datalakeId, ...rest } = req;
+    return this.send<GatewayAck>('POST', '/gw/revoke', { endpointId: datalakeId, ...rest });
   }
 
-  status(endpointId: string): Promise<GatewayStatus> {
+  status(datalakeId: string): Promise<GatewayStatus> {
+    // WIRE CONTRACT: dataplane query param is `endpointId` (= datalake id).
     return this.send<GatewayStatus>(
       'GET',
-      `/gw/status?endpointId=${encodeURIComponent(endpointId)}`,
+      `/gw/status?endpointId=${encodeURIComponent(datalakeId)}`,
     );
+  }
+
+  /** Tear down a datalake's gateway pool + any abandoned legacy static gateway DO. */
+  teardownGateways(datalakeId: string): Promise<{ ok: boolean; legacyDestroyed?: boolean; destroyed?: number }> {
+    return this.send('POST', '/gw/teardown-legacy', { endpointId: datalakeId });
   }
 
   /**
@@ -206,11 +224,11 @@ export class GatewayClient {
    * (DESTRUCTIVE — each record once). Cold gateway ⇒ empty. control-api persists
    * these as `source='gateway'` audit rows so queries show in the dashboard.
    */
-  drainAudit(endpointId: string): Promise<{ records: GatewayAuditRecord[]; count: number }> {
+  drainAudit(datalakeId: string): Promise<{ records: GatewayAuditRecord[]; count: number }> {
     return this.send<{ records: GatewayAuditRecord[]; count: number }>(
       'POST',
       '/gw/audit-drain',
-      { endpointId },
+      { endpointId: datalakeId }, // WIRE CONTRACT: dataplane reads `endpointId` (= datalake id)
     );
   }
 }
@@ -260,11 +278,9 @@ function getDataplane(): Fetcher {
  * call-site compatibility (and to make the per-endpoint intent legible) but its
  * fields are no longer used for transport: every endpoint's control channel is
  * routed through the single DATAPLANE binding, and the GatewayDO is keyed per
- * endpoint INSIDE the data plane by the `endpointId` carried in each request body.
+ * endpoint INSIDE the data plane by the `datalakeId` carried in each request body.
  */
 export function gatewayClientFor(_endpoint?: {
-  gateway_host: string | null;
-  quack_port: number | null;
   server_token: string;
   ctrl_port?: number | null;
 }): GatewayClient {

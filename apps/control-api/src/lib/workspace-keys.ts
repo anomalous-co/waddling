@@ -12,7 +12,7 @@
  *      and returned ONLY to the session actor, NEVER to the agent.
  *
  * The S3 coords the actor persists to are derived from the endpoint's own storage
- * config (getEndpointGatewayConfig) — the workspace file lives in the lake bucket
+ * config (getDatalakeGatewayConfig) — the workspace file lives in the lake bucket
  * under a sibling `workspace/` prefix.
  *
  * Workers difference vs the original: seal/open come from `getCrypto()` (the
@@ -23,7 +23,7 @@
 import { randomBytes } from 'node:crypto';
 import { query, queryOne } from './db';
 import { getCrypto, type SealedSecret } from './secret-crypto';
-import { getEndpointGatewayConfig } from './endpoint-secrets';
+import { getDatalakeGatewayConfig } from './datalake-secrets';
 
 export interface ResolvedWorkspace {
   workspaceId: string;
@@ -62,7 +62,7 @@ export function bucketFromDataPath(dataPath: string): string {
  */
 export async function resolveWorkspaceForSession(
   orgId: string,
-  endpointId: string,
+  datalakeId: string,
   agentId: string,
   name: string = DEFAULT_WORKSPACE,
 ): Promise<ResolvedWorkspace> {
@@ -70,21 +70,21 @@ export async function resolveWorkspaceForSession(
   let ws = await queryOne<{ id: string; data_path: string }>(
     `SELECT w.id, e.data_path
        FROM waddling.workspace w
-       JOIN waddling.endpoint e ON e.id = w.endpoint_id
-      WHERE w.org_id = $1 AND w.name = $2 AND w.endpoint_id = $3`,
-    [orgId, name, endpointId],
+       JOIN waddling.datalake e ON e.id = w.datalake_id
+      WHERE w.org_id = $1 AND w.name = $2 AND w.datalake_id = $3`,
+    [orgId, name, datalakeId],
   );
   if (!ws) {
     const created = await queryOne<{ id: string }>(
-      `INSERT INTO waddling.workspace (org_id, name, endpoint_id)
+      `INSERT INTO waddling.workspace (org_id, name, datalake_id)
          VALUES ($1, $2, $3)
        ON CONFLICT (org_id, name) DO UPDATE SET name = EXCLUDED.name
        RETURNING id`,
-      [orgId, name, endpointId],
+      [orgId, name, datalakeId],
     );
     const dp = await queryOne<{ data_path: string }>(
-      `SELECT data_path FROM waddling.endpoint WHERE id = $1`,
-      [endpointId],
+      `SELECT data_path FROM waddling.datalake WHERE id = $1`,
+      [datalakeId],
     );
     ws = { id: created!.id, data_path: dp!.data_path };
   }
@@ -138,14 +138,14 @@ export async function ensureWorkspaceKey(workspaceId: string, agentId: string): 
 }
 
 /** Build the actor's S3 persistence coords from the endpoint's storage config. */
-export async function getWorkspaceS3Config(endpointId: string): Promise<WorkspaceS3Config> {
+export async function getWorkspaceS3Config(datalakeId: string): Promise<WorkspaceS3Config> {
   // Stage C rework: point at per-team R2 bucket, not the customer lake bucket. The
   // current logic (preserved) derives the workspace file's S3 coords from the
   // endpoint's own BYO storage config — workspace files share the lake bucket under
   // a `workspace/` prefix. Stage C moves durable workspaces to a waddling-owned
   // per-team R2 bucket (DO-minted presigned URLs), decoupling them from the
   // customer's lake storage; repoint here then.
-  const cfg = await getEndpointGatewayConfig(endpointId);
+  const cfg = await getDatalakeGatewayConfig(datalakeId);
   if (!cfg || cfg.localData || !cfg.s3) {
     throw new Error('workspace persistence requires an s3:// endpoint with storage credentials');
   }

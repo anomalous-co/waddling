@@ -2,20 +2,43 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
+import { RefreshCw, Trash2, Zap } from 'lucide-react';
+import { toast } from 'sonner';
 import {
   Card,
   CardHeader,
-  Badge,
-  statusVariant,
-  Button,
-  Spinner,
-  ErrorState,
-  SectionTitle,
+  CardTitle,
+  CardDescription,
+  CardContent,
+} from '@/components/ui/card';
+import {
   Table,
-  Td,
-  Modal,
-} from '@/components/dashboard/ui';
-import { fetchCp, cpPost } from '@/components/dashboard/fetch';
+  TableHeader,
+  TableRow,
+  TableHead,
+  TableBody,
+  TableCell,
+} from '@/components/ui/table';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
+import { Separator } from '@/components/ui/separator';
+import {
+  Empty,
+  EmptyHeader,
+  EmptyTitle,
+  EmptyDescription,
+} from '@/components/ui/empty';
+import { StatusBadge } from '@/components/dashboard/status';
+import { fetchCp, cpPost, cpDelete } from '@/components/dashboard/fetch';
 import type { AgentSummary, SessionSummary } from '@/lib/types';
 
 interface ApiKeyRow {
@@ -32,39 +55,25 @@ interface AgentDetail extends AgentSummary {
   sessions: SessionSummary[];
 }
 
-function RevokeAgentModal({
-  open,
-  onClose,
-  agentName,
-  onConfirm,
-  loading,
-}: {
-  open: boolean;
-  onClose: () => void;
-  agentName: string;
-  onConfirm: () => void;
-  loading: boolean;
-}) {
+function AgentDetailSkeleton() {
   return (
-    <Modal title="Revoke agent" open={open} onClose={onClose}>
-      <p className="text-sm text-neutral-300 mb-4">
-        Revoke <span className="font-mono text-red-300">{agentName}</span>?
-        This will instantly deny all future queries from this agent and kill
-        any active sessions.
-      </p>
-      <div className="flex gap-2">
-        <Button
-          variant="danger"
-          onClick={onConfirm}
-          loading={loading}
-        >
-          Revoke agent
-        </Button>
-        <Button variant="ghost" onClick={onClose}>
-          Cancel
-        </Button>
+    <div className="flex flex-col gap-6">
+      <Skeleton className="h-8 w-48" />
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <Skeleton className="h-56 w-full" />
+        <Skeleton className="h-56 w-full" />
       </div>
-    </Modal>
+      <Skeleton className="h-64 w-full" />
+    </div>
+  );
+}
+
+function InfoRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-start justify-between gap-4 py-2">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="text-right text-sm">{children}</span>
+    </div>
   );
 }
 
@@ -76,15 +85,24 @@ export default function AgentDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [revokeOpen, setRevokeOpen] = useState(false);
   const [revoking, setRevoking] = useState(false);
+  const [killingSession, setKillingSession] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const res = await fetchCp<{ agent: AgentDetail }>(
+    const res = await fetchCp<{ agent: AgentDetail; apiKeys: ApiKeyRow[]; sessions: SessionSummary[] }>(
       `/api/cp/agents/${params.id}`,
     );
     if (!res.ok) {
       setError(res.error);
     } else {
-      setAgent(res.data.agent);
+      // Support both envelope shapes: { agent: { ...apiKeys, sessions } } and
+      // { agent, apiKeys, sessions } (the spec says the latter).
+      const data = res.data;
+      const detail: AgentDetail = {
+        ...data.agent,
+        apiKeys: (data as { apiKeys?: ApiKeyRow[] }).apiKeys ?? data.agent.apiKeys ?? [],
+        sessions: (data as { sessions?: SessionSummary[] }).sessions ?? data.agent.sessions ?? [],
+      };
+      setAgent(detail);
     }
     setLoading(false);
   }, [params.id]);
@@ -94,180 +112,266 @@ export default function AgentDetailPage() {
   }, [load]);
 
   const killSession = async (sessionId: string) => {
+    setKillingSession(sessionId);
     const res = await cpPost<{ ok: boolean }>(
       `/api/cp/sessions/${sessionId}/kill`,
-      { reason: 'Manually killed from dashboard' },
+      {},
     );
+    setKillingSession(null);
     if (res.ok) {
-      setAgent((prev) =>
-        prev
-          ? {
-              ...prev,
-              sessions: prev.sessions.map((s) =>
-                s.id === sessionId ? { ...s, status: 'killed' as const } : s,
-              ),
-            }
-          : prev,
-      );
+      toast.success('Session killed');
+      void load();
+    } else {
+      toast.error(`Failed to kill session: ${res.error}`);
     }
   };
 
   const revokeAgent = async () => {
     if (!agent) return;
     setRevoking(true);
-    const res = await cpPost<{ ok: boolean }>(
-      `/api/cp/agents/${agent.id}/revoke`,
-      { reason: 'Revoked from dashboard' },
-    );
+    const res = await cpDelete<{ ok: boolean }>(`/api/cp/agents/${agent.id}`);
     setRevoking(false);
     if (res.ok) {
+      toast.success(`Agent "${agent.name}" revoked`);
       setRevokeOpen(false);
       router.push('/dashboard/agents');
+    } else {
+      toast.error(`Failed to revoke agent: ${res.error}`);
     }
   };
 
-  if (loading)
+  if (loading) return <AgentDetailSkeleton />;
+
+  if (error)
     return (
-      <div className="flex justify-center py-24">
-        <Spinner size="lg" />
-      </div>
+      <Alert variant="destructive">
+        <AlertTitle>Couldn't load agent</AlertTitle>
+        <AlertDescription className="flex flex-col items-start gap-3">
+          {error}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setLoading(true);
+              void load();
+            }}
+          >
+            <RefreshCw data-icon="inline-start" />
+            Retry
+          </Button>
+        </AlertDescription>
+      </Alert>
     );
-  if (error) return <ErrorState message={error} retry={() => { setLoading(true); void load(); }} />;
+
   if (!agent) return null;
 
   const activeSessions = agent.sessions.filter((s) => s.status === 'active');
 
   return (
-    <div className="space-y-4">
-      <SectionTitle>
-        Agent: <span className="font-mono text-blue-300">{agent.name}</span>
-      </SectionTitle>
+    <div className="flex flex-col gap-6">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">{agent.name}</h1>
+          <p className="text-sm text-muted-foreground">
+            {agent.description ?? 'Agent detail'}
+          </p>
+        </div>
+        {agent.status === 'active' ? (
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={() => setRevokeOpen(true)}
+          >
+            <Trash2 data-icon="inline-start" />
+            Revoke agent
+          </Button>
+        ) : null}
+      </div>
 
-      {/* Meta + revoke */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        {/* Agent info card */}
         <Card>
-          <CardHeader title="Agent info" />
-          <div className="space-y-2">
-            <Row label="ID">
-              <code className="font-mono text-xs text-neutral-300">{agent.id}</code>
-            </Row>
-            <Row label="Status">
-              <Badge variant={statusVariant(agent.status)}>{agent.status}</Badge>
-            </Row>
-            <Row label="Default role">
-              <code className="font-mono text-xs">{agent.defaultRole}</code>
-            </Row>
-            {agent.description && (
-              <Row label="Description">{agent.description}</Row>
-            )}
-            {agent.lastSeenAt && (
-              <Row label="Last seen">
-                {new Date(agent.lastSeenAt).toLocaleString()}
-              </Row>
-            )}
-          </div>
-          {agent.status === 'active' && (
-            <div className="mt-4">
-              <Button
-                variant="danger"
-                size="sm"
-                onClick={() => setRevokeOpen(true)}
-              >
-                Revoke agent
-              </Button>
+          <CardHeader>
+            <CardTitle>Agent info</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="divide-y divide-border">
+              <InfoRow label="ID">
+                <code className="font-mono text-xs text-muted-foreground">{agent.id}</code>
+              </InfoRow>
+              <InfoRow label="Status">
+                <StatusBadge status={agent.status} />
+              </InfoRow>
+              <InfoRow label="Mode">
+                <StatusBadge status={agent.mode} />
+              </InfoRow>
+              <InfoRow label="Default role">
+                <code className="font-mono text-xs">{agent.defaultRole}</code>
+              </InfoRow>
+              {agent.owner ? (
+                <InfoRow label="Owner">{agent.owner}</InfoRow>
+              ) : null}
+              {agent.lastSeenAt ? (
+                <InfoRow label="Last seen">
+                  {new Date(agent.lastSeenAt).toLocaleString()}
+                </InfoRow>
+              ) : null}
             </div>
-          )}
+          </CardContent>
         </Card>
 
-        {/* API keys */}
+        {/* API keys card */}
         <Card>
-          <CardHeader
-            title="API keys"
-            subtitle="Keys are shown once at creation. Revoke by deleting."
-          />
-          {agent.apiKeys.length === 0 ? (
-            <p className="text-sm text-neutral-500">No keys.</p>
-          ) : (
-            <Table headers={['Prefix', 'Created', 'Expires', 'Last used']}>
-              {agent.apiKeys.map((k) => (
-                <tr key={k.id}>
-                  <Td mono>{k.prefix}…</Td>
-                  <Td>{new Date(k.createdAt).toLocaleDateString()}</Td>
-                  <Td>
-                    {k.expiresAt
-                      ? new Date(k.expiresAt).toLocaleDateString()
-                      : '—'}
-                  </Td>
-                  <Td>
-                    {k.lastUsedAt
-                      ? new Date(k.lastUsedAt).toLocaleString()
-                      : 'Never'}
-                  </Td>
-                </tr>
-              ))}
-            </Table>
-          )}
+          <CardHeader>
+            <CardTitle>API keys</CardTitle>
+            <CardDescription>
+              Keys are shown once at creation. Revoke by revoking the agent.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {agent.apiKeys.length === 0 ? (
+              <Empty>
+                <EmptyHeader>
+                  <EmptyTitle>No API keys</EmptyTitle>
+                  <EmptyDescription>
+                    This agent has no active API keys.
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Prefix</TableHead>
+                    <TableHead>Created</TableHead>
+                    <TableHead>Last used</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {agent.apiKeys.map((k) => (
+                    <TableRow key={k.id}>
+                      <TableCell className="font-mono text-xs">
+                        {k.prefix}&hellip;
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {new Date(k.createdAt).toLocaleDateString()}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {k.lastUsedAt
+                          ? new Date(k.lastUsedAt).toLocaleString()
+                          : 'Never'}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
         </Card>
       </div>
 
-      {/* Sessions */}
+      {/* Sessions card */}
       <Card>
-        <CardHeader
-          title="Sessions"
-          subtitle={`${activeSessions.length} active`}
-        />
-        {agent.sessions.length === 0 ? (
-          <p className="text-sm text-neutral-500">No sessions yet.</p>
-        ) : (
-          <Table headers={['SID', 'Endpoint', 'Status', 'Started', 'Expires', '']}>
-            {agent.sessions.map((s) => (
-              <tr key={s.id}>
-                <Td mono>{s.sid}</Td>
-                <Td mono>{s.endpointId}</Td>
-                <Td>
-                  <Badge variant={statusVariant(s.status)}>{s.status}</Badge>
-                </Td>
-                <Td>{new Date(s.startedAt).toLocaleString()}</Td>
-                <Td>{new Date(s.expiresAt).toLocaleString()}</Td>
-                <Td>
-                  {s.status === 'active' && (
-                    <Button
-                      variant="danger"
-                      size="sm"
-                      onClick={() => void killSession(s.id)}
-                    >
-                      Kill
-                    </Button>
-                  )}
-                </Td>
-              </tr>
-            ))}
-          </Table>
-        )}
+        <CardHeader>
+          <CardTitle>Sessions</CardTitle>
+          <CardDescription>
+            {activeSessions.length} active &middot; {agent.sessions.length} total
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {agent.sessions.length === 0 ? (
+            <Empty>
+              <EmptyHeader>
+                <EmptyTitle>No sessions yet</EmptyTitle>
+                <EmptyDescription>
+                  This agent has not opened any sessions.
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>SID</TableHead>
+                  <TableHead>Data Lake</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Started</TableHead>
+                  <TableHead>Expires</TableHead>
+                  <TableHead />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {agent.sessions.map((s) => (
+                  <TableRow key={s.id}>
+                    <TableCell className="font-mono text-xs">
+                      {s.sid.slice(0, 8)}&hellip;
+                    </TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">
+                      {s.datalakeId.slice(0, 8)}&hellip;
+                    </TableCell>
+                    <TableCell>
+                      <StatusBadge status={s.status} />
+                    </TableCell>
+                    <TableCell className="text-muted-foreground">
+                      {new Date(s.startedAt).toLocaleString()}
+                    </TableCell>
+                    <TableCell className="text-muted-foreground">
+                      {new Date(s.expiresAt).toLocaleString()}
+                    </TableCell>
+                    <TableCell>
+                      {s.status === 'active' ? (
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          disabled={killingSession === s.id}
+                          onClick={() => void killSession(s.id)}
+                        >
+                          <Zap data-icon="inline-start" />
+                          {killingSession === s.id ? 'Killing…' : 'Kill'}
+                        </Button>
+                      ) : null}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
       </Card>
 
-      <RevokeAgentModal
-        open={revokeOpen}
-        onClose={() => setRevokeOpen(false)}
-        agentName={agent.name}
-        onConfirm={() => void revokeAgent()}
-        loading={revoking}
-      />
-    </div>
-  );
-}
-
-function Row({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-4">
-      <span className="text-xs text-neutral-500">{label}</span>
-      <span className="text-sm text-neutral-300">{children}</span>
+      {/* Revoke confirm dialog */}
+      <Dialog open={revokeOpen} onOpenChange={setRevokeOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Revoke agent</DialogTitle>
+            <DialogDescription>
+              This will permanently revoke{' '}
+              <span className="font-mono font-medium text-foreground">
+                {agent.name}
+              </span>{' '}
+              and kill all active sessions. This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <Separator />
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setRevokeOpen(false)}
+              disabled={revoking}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void revokeAgent()}
+              disabled={revoking}
+            >
+              <Trash2 data-icon="inline-start" />
+              {revoking ? 'Revoking…' : 'Revoke agent'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

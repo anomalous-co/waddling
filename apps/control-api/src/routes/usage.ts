@@ -16,7 +16,7 @@ import type { UsageRollup } from '../lib/types';
 
 const IngestSchema = z.object({
   agentId: z.string().optional(),
-  endpointId: z.string().optional(),
+  datalakeId: z.string().optional(),
   kind: z.enum(['query', 'rows_scanned', 'bytes_scanned', 'session']),
   quantity: z.number().int().nonnegative().default(1),
   durationMs: z.number().int().nonnegative().optional(),
@@ -165,9 +165,9 @@ usage.post('/', (c) =>
     const caller = await resolveCaller(c);
     const e = await parseBody(c, IngestSchema);
     await query(
-      `INSERT INTO waddling.usage_event (org_id, agent_id, endpoint_id, kind, quantity, duration_ms)
+      `INSERT INTO waddling.usage_event (org_id, agent_id, datalake_id, kind, quantity, duration_ms)
        VALUES ($1,$2,$3,$4,$5,$6)`,
-      [caller.orgId, e.agentId ?? null, e.endpointId ?? null, e.kind, e.quantity, e.durationMs ?? null],
+      [caller.orgId, e.agentId ?? null, e.datalakeId ?? null, e.kind, e.quantity, e.durationMs ?? null],
     );
     return ok(c, { success: true }, 201);
   }),

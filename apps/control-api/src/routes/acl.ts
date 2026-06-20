@@ -2,16 +2,17 @@
  * /api/cp/acl — Hono port of apps/waddling/src/app/api/cp/acl/route.ts +
  * acl/[id]/route.ts (§3e, §6). ACL rule CRUD that triggers a policy recompile.
  *
- * GET  /        → list rules for the caller's org (optionally ?endpointId=&agentId=).
- * POST /        → create a rule (gated by requirePlan(org,'pro') → 402 upgrade_required),
- *                 then recompile the affected (endpoint, agent) policy and push the
- *                 birdshot snapshot to the gateway control channel.
+ * GET  /        → list rules for the caller's org (optionally ?datalakeId=&agentId=
+ *                 &subjectKind=&userId=).
+ * POST /        → create a rule. When subjectKind='user', requires the caller to be
+ *                 an org owner or admin. Recompiles the affected endpoint policy and
+ *                 pushes the birdshot snapshot to the gateway control channel.
  * GET  /:id     → single rule (org-scoped).
  * DELETE /:id   → delete a rule, recompile, audit the revoke.
  *
  * The DB-side ACL persistence is fully live. The gateway snapshot push is e2e-gated
- * on Stage D (see recompileAndPush) — best-effort, so a rule is persisted even when
- * the gateway is unreachable; the next connect/recompile re-pushes.
+ * on Stage D (see recompileAndPush in lib/gateway-push) — best-effort, so a rule is
+ * persisted even when the gateway is unreachable; the next connect/recompile re-pushes.
  *
  * ttl_seconds is resolved to an absolute expires_at at insert time so the compiler
  * only ever reasons over absolute timestamps.
@@ -25,116 +26,18 @@ import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
 import { requirePlan, UpgradeRequiredError } from '../lib/entitlements';
-import {
-  compilePolicy,
-  type AclRuleRow,
-  type CompileResult,
-} from '../lib/policy-compiler';
-import {
-  gatewayClientFor,
-  type SnapshotRequest,
-  type BirdshotJwk,
-} from '../lib/gateway-client';
-import { resolveGatewayBoot } from '../lib/gateway-boot';
+import { recompileAndPush } from '../lib/gateway-push';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err } from '../lib/cp-shared';
-
-// ── recompile + push helper (ported from acl/recompile.ts) ───────────────────────
-// Shared by the POST and DELETE handlers below. Reads the endpoint's signing key +
-// all active rules for the endpoint (optionally scoped to one agent), runs the pure
-// compiler, and pushes the birdshot snapshot to the gateway. Column/window ACLs ride
-// inside that snapshot (`roleConstraints`, enforced by birdshot's bind-walk).
-
-interface RecompileEndpointRow {
-  id: string;
-  org_id: string;
-  status: string;
-  gateway_host: string | null;
-  quack_port: number | null;
-  server_token: string;
-}
-
-/** Newest non-expired jwks row → birdshot public JWK (kid/n/e), or null. */
-async function loadJwk(): Promise<BirdshotJwk | null> {
-  const row = await queryOne<{ id: string; publicKey: string }>(
-    `SELECT id, "publicKey" FROM "jwks"
-      WHERE "expiresAt" IS NULL OR "expiresAt" > now()
-      ORDER BY "createdAt" DESC LIMIT 1`,
-  ).catch(() => null);
-  if (!row) return null;
-  const pub = JSON.parse(row.publicKey) as { n: string; e: string };
-  return { kid: row.id, n: pub.n, e: pub.e };
-}
-
-/**
- * Recompile the endpoint's FULL policy (every agent) and push it.
- *
- * The push is ALWAYS the whole endpoint — never a single agent's slice. The GatewayDO
- * is shared per endpoint (`gw:<endpointId>`) and applySnapshot does a full
- * birdshot_reset_config → re-add → commit, so pushing one agent's compiled snapshot
- * would WIPE every other agent's grants on the shared gateway. `agentId` is accepted
- * (call-site compatibility / audit) but does NOT narrow the push.
- *
- * Best-effort push: if the gateway is unreachable the rule is still persisted; the
- * next connect/recompile re-pushes. Returns the (full) compile result for the caller.
- */
-async function recompileAndPush(
-  c: { env: Env },
-  endpointId: string,
-  _agentId?: string,
-): Promise<CompileResult> {
-  const endpoint = await queryOne<RecompileEndpointRow>(
-    `SELECT id, org_id, status, gateway_host, quack_port, server_token
-       FROM waddling.endpoint WHERE id = $1`,
-    [endpointId],
-  );
-
-  const rows = await query<AclRuleRow>(
-    `SELECT * FROM waddling.acl_rule WHERE endpoint_id = $1`,
-    [endpointId],
-  );
-
-  const compiled = compilePolicy(rows.rows, new Date());
-
-  if (endpoint && endpoint.status === 'running') {
-    const jwk = await loadJwk();
-    const gw = gatewayClientFor(endpoint);
-    try {
-      // Carry the endpoint's real lake boot config + birdshot catalog so that if THIS
-      // push is the one that cold-boots the gateway, it ATTACHes the real DuckLake (not
-      // the demo). resolveGatewayBoot may report the managed catalog still provisioning;
-      // skip the push then (the rule is persisted; connect/recompile re-pushes later).
-      const boot = await resolveGatewayBoot(c.env, endpointId);
-      const snapshotReq: SnapshotRequest = {
-        endpointId,
-        auth: {
-          issuer: c.env.JWT_ISSUER,
-          audience: `gw:${endpointId}`,
-          mode: 'rs256',
-          jwks: jwk ? [jwk] : [],
-        },
-        snapshot: compiled.snapshot,
-        lakeCatalog: boot.lakeCatalog,
-        gatewayBoot: boot.gatewayBoot,
-      };
-      // Best-effort: pushes over the DATAPLANE binding to the per-endpoint GatewayDO.
-      // Column + window ACLs ride inside the snapshot (`roleConstraints`); there is no
-      // separate constraint push. A failure leaves the rule persisted for the next
-      // connect/recompile to re-push.
-      await gw.pushSnapshot(snapshotReq);
-    } catch {
-      // gateway down / catalog provisioning — persisted rule re-pushes on next connect/recompile
-    }
-  }
-
-  return compiled;
-}
 
 // ── Routes ───────────────────────────────────────────────────────────────────────
 
 interface AclRuleDbRow {
   id: string;
-  endpoint_id: string;
+  datalake_id: string;
   agent_id: string | null;
+  subject_kind: 'agent' | 'user' | 'org';
+  user_id: string | null;
+  capability: string;
   schema_name: string;
   table_name: string;
   columns: string[] | null;
@@ -153,8 +56,11 @@ interface AclRuleDbRow {
 function mapRule(r: AclRuleDbRow) {
   return {
     id: r.id,
-    endpointId: r.endpoint_id,
+    datalakeId: r.datalake_id,
     agentId: r.agent_id ?? undefined,
+    subjectKind: r.subject_kind,
+    userId: r.user_id ?? undefined,
+    capability: r.capability,
     schemaName: r.schema_name,
     tableName: r.table_name,
     columns: r.columns ?? undefined,
@@ -170,9 +76,19 @@ function mapRule(r: AclRuleDbRow) {
   };
 }
 
+// Full capability taxonomy, matching the migration 010 CHECK constraint exactly.
+const CAPABILITY_VALUES = [
+  'read', 'write', 'create', 'drop', 'alter',
+  'read_source', 'copy_to', 'copy_from',
+  'attach', 'detach', 'install', 'load', 'etl',
+] as const;
+
 const AclRuleSchema = z.object({
-  endpointId: z.string().min(1),
+  datalakeId: z.string().min(1),
   agentId: z.string().optional(),
+  subjectKind: z.enum(['agent', 'user', 'org']).default('agent'),
+  userId: z.string().optional(),
+  capability: z.enum(CAPABILITY_VALUES).default('read'),
   schema: z.string().default('*'),
   table: z.string().default('*'),
   columns: z.array(z.string()).optional(),
@@ -183,12 +99,14 @@ const AclRuleSchema = z.object({
   window: z.object({ start: z.string(), end: z.string() }).optional(),
   notBefore: z.string().optional(),
   expiresAt: z.string().optional(),
+}).refine((d) => d.subjectKind !== 'user' || !!d.userId, {
+  message: 'userId is required when subjectKind is "user"',
 });
 
 interface RuleRow {
   id: string;
   org_id: string;
-  endpoint_id: string;
+  datalake_id: string;
   agent_id: string | null;
 }
 
@@ -198,16 +116,20 @@ acl.get('/', (c) =>
   handle(c, async () => {
     const caller = await resolveCaller(c);
     const url = new URL(c.req.url);
-    const endpointId = url.searchParams.get('endpointId');
+    const datalakeId = url.searchParams.get('datalakeId');
     const agentId = url.searchParams.get('agentId');
+    const subjectKind = url.searchParams.get('subjectKind');
+    const userId = url.searchParams.get('userId');
 
     const rows = await query<AclRuleDbRow>(
       `SELECT * FROM waddling.acl_rule
         WHERE org_id = $1
-          AND ($2::text IS NULL OR endpoint_id = $2)
+          AND ($2::text IS NULL OR datalake_id = $2)
           AND ($3::text IS NULL OR agent_id = $3)
+          AND ($4::text IS NULL OR subject_kind = $4)
+          AND ($5::text IS NULL OR user_id = $5)
         ORDER BY priority ASC, created_at DESC`,
-      [caller.orgId, endpointId, agentId],
+      [caller.orgId, datalakeId, agentId, subjectKind, userId],
     );
     return ok(c, { rules: rows.rows.map(mapRule) });
   }),
@@ -234,10 +156,22 @@ acl.post('/', (c) =>
       }
     }
 
+    // When subjectKind='user', only org owners/admins may assign user-subject grants.
+    if (input.subjectKind === 'user') {
+      const member = await queryOne<{ role: string }>(
+        `SELECT role FROM "member"
+          WHERE "userId" = $1 AND "organizationId" = $2`,
+        [caller.callerId, caller.orgId],
+      );
+      if (!member || !['owner', 'admin'].includes(member.role)) {
+        return err(c, 'forbidden', 403, 'Only org owners and admins may assign user-subject grants');
+      }
+    }
+
     // Tenant-isolate the endpoint (and agent, if present).
     const endpoint = await queryOne<{ org_id: string }>(
-      `SELECT org_id FROM waddling.endpoint WHERE id = $1`,
-      [input.endpointId],
+      `SELECT org_id FROM waddling.datalake WHERE id = $1`,
+      [input.datalakeId],
     );
     if (!endpoint) return err(c, 'endpoint_not_found', 404);
     assertOrg(caller, endpoint.org_id);
@@ -259,14 +193,18 @@ acl.post('/', (c) =>
 
     const created = await queryOne<AclRuleDbRow>(
       `INSERT INTO waddling.acl_rule
-         (org_id, endpoint_id, agent_id, schema_name, table_name, columns, verb, effect,
+         (org_id, datalake_id, agent_id, subject_kind, user_id, capability,
+          schema_name, table_name, columns, verb, effect,
           row_limit, ttl_seconds, window_start, window_end, not_before, expires_at, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
        RETURNING *`,
       [
         caller.orgId,
-        input.endpointId,
+        input.datalakeId,
         input.agentId ?? null,
+        input.subjectKind,
+        input.userId ?? null,
+        input.capability,
         input.schema,
         input.table,
         input.columns ?? null,
@@ -282,12 +220,12 @@ acl.post('/', (c) =>
       ],
     );
 
-    const compiled = await recompileAndPush(c, input.endpointId, input.agentId);
+    const compiled = await recompileAndPush(c, input.datalakeId);
 
     await query(
-      `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, endpoint_id, decision, actor)
+      `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, datalake_id, decision, actor)
        VALUES ($1,'control-plane','grant',$2,$3,'allow',$4)`,
-      [caller.orgId, input.agentId ?? null, input.endpointId, caller.callerId],
+      [caller.orgId, input.agentId ?? null, input.datalakeId, caller.callerId],
     );
 
     return ok(
@@ -321,19 +259,19 @@ acl.delete('/:id', (c) =>
     const caller = await resolveCaller(c);
     const id = c.req.param('id');
     const rule = await queryOne<RuleRow>(
-      `SELECT id, org_id, endpoint_id, agent_id FROM waddling.acl_rule WHERE id = $1`,
+      `SELECT id, org_id, datalake_id, agent_id FROM waddling.acl_rule WHERE id = $1`,
       [id],
     );
     if (!rule) return err(c, 'rule_not_found', 404);
     assertOrg(caller, rule.org_id);
 
     await query(`DELETE FROM waddling.acl_rule WHERE id = $1`, [id]);
-    const compiled = await recompileAndPush(c, rule.endpoint_id, rule.agent_id ?? undefined);
+    const compiled = await recompileAndPush(c, rule.datalake_id);
 
     await query(
-      `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, endpoint_id, decision, actor)
+      `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, datalake_id, decision, actor)
        VALUES ($1,'control-plane','revoke',$2,$3,'deny',$4)`,
-      [rule.org_id, rule.agent_id, rule.endpoint_id, caller.callerId],
+      [rule.org_id, rule.agent_id, rule.datalake_id, caller.callerId],
     );
 
     return ok(c, { success: true, ruleId: id, compiledGrants: compiled.snapshot });

@@ -45,7 +45,7 @@ export interface SavedView {
 
 // ── ACL ────────────────────────────────────────────────────────────────────────
 export interface AclRuleInput {
-  endpointId: string;
+  datalakeId: string;
   agentId?: string;
   schema: string;
   table: string;
@@ -100,7 +100,7 @@ export interface BirdshotSnapshot {
 
 // ── MCP tool result types (§4a — External MCP) ────────────────────────────────
 
-export interface EndpointSummary {
+export interface DatalakeSummary {
   id: string;
   name: string;
   slug: string;
@@ -113,7 +113,7 @@ export interface EndpointSummary {
 // 'config' uses the static keyId/secret; 'credential_chain' uses the gateway's
 // ambient instance role (no creds stored). Credentials are encrypted at rest
 // (migration 005); never round-tripped back to the browser.
-export interface EndpointStorageInput {
+export interface DatalakeStorageInput {
   /** DATA_PATH: 's3://bucket/prefix/' (object store) or a local dir (demo). */
   dataPath: string;
   provider: 'config' | 'credential_chain';
@@ -127,13 +127,16 @@ export interface EndpointStorageInput {
   useSsl?: boolean;
 }
 
-export interface CreateEndpointInput {
+export interface CreateDatalakeInput {
   name: string;
   slug: string;
   region?: string;
   encrypted?: boolean;
-  /** Bring-your-own object storage for the lake's data files. */
-  storage: EndpointStorageInput;
+  /** Fully managed: waddling provisions an isolated Postgres catalog + an encrypted
+   *  object-store bucket. When true, `storage`/`catalogDsn` are not required. */
+  managed?: boolean;
+  /** Bring-your-own object storage for the lake's data files (omit when managed). */
+  storage?: DatalakeStorageInput;
   /** Bring-your-own postgres catalog DSN. Omit ⇒ waddling provisions the catalog. */
   catalogDsn?: string;
 }
@@ -152,7 +155,7 @@ export interface TableInfo {
 }
 
 export interface DescribeResult {
-  endpointId: string;
+  datalakeId: string;
   tables: TableInfo[];
 }
 
@@ -236,7 +239,7 @@ export interface SessionSummary {
   id: string;
   orgId: string;
   agentId: string;
-  endpointId: string;
+  datalakeId: string;
   sid: string;
   status: 'active' | 'expired' | 'revoked' | 'killed';
   grantedRoles: string[];
@@ -262,7 +265,7 @@ export interface AuditEventRow {
   event: string;
   agentId?: string;
   sessionId?: string;
-  endpointId?: string;
+  datalakeId?: string;
   decision?: 'allow' | 'deny';
   reason?: string;
   query?: string;
@@ -280,25 +283,41 @@ export interface UsageRollup {
   estimatedCost?: number;
 }
 
-export interface EndpointStatus {
-  endpointId: string;
+// The gateway is a dynamic, scale-to-zero POOL of replica containers (apps/dataplane
+// GatewayPoolDO). A datalake's gateway only surfaces as RUNTIME STATE, derived live
+// without waking a sleeping pool.
+export type GatewayRuntimeState =
+  | 'running'
+  | 'asleep'
+  | 'provisioning'
+  | 'error'
+  | 'unconfigured';
+
+export interface DatalakeRuntime {
+  state: GatewayRuntimeState;
+  replicas: number;
+}
+
+/** The object GET /api/cp/datalakes/:id returns as `datalake`. */
+export interface DatalakeDetail {
+  id: string;
+  name: string;
+  slug: string;
   status: 'provisioning' | 'running' | 'stopped' | 'error';
-  gatewayHost?: string;
-  quackPort?: number;
-  birdshotStatus?: {
-    authMode: string;
-    policySize: number;
-    sessionCount: number;
-    auditRingDepth: number;
-  };
-  duckLakeSnapshotLag?: number;
+  dataPath: string;
+  region: string;
+  runtime?: DatalakeRuntime;
+}
+
+export interface DatalakeStatus {
+  datalakeId: string;
+  status: 'provisioning' | 'running' | 'stopped' | 'error';
+  runtime?: DatalakeRuntime;
 }
 
 export interface ProvisionResult {
-  endpointId: string;
+  datalakeId: string;
   status: 'provisioning' | 'running';
-  gatewayHost?: string;
-  quackPort?: number;
 }
 
 // ── Device-code onboarding (FUNNEL / Stream B — migrations-002-device-link) ────

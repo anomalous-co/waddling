@@ -1,8 +1,8 @@
 /**
  * Endpoint credential store + gateway-config accessor
- * (ported from apps/waddling/src/lib/endpoint-secrets.ts, migration 005).
+ * (ported from apps/waddling/src/lib/datalake-secrets.ts, migration 005).
  *
- * THE CONTRACT: `getEndpointGatewayConfig(endpointId)` decrypts an endpoint's
+ * THE CONTRACT: `getDatalakeGatewayConfig(datalakeId)` decrypts an endpoint's
  * stored credentials and returns the exact shape the data-plane gateway consumes
  * (packages/gateway config.s3 + DuckLake catalog/data fields). This is the single
  * server-side seam between the control plane's secret store and the gateway boot
@@ -50,22 +50,22 @@ const toSealed = (r: SecretRow): SealedSecret => ({
 
 /** Encrypt + upsert one credential payload for an endpoint. */
 export async function putEndpointSecret(
-  endpointId: string,
+  datalakeId: string,
   kind: SecretKind,
   payload: StorageCreds | CatalogCreds,
 ): Promise<void> {
   const s = getCrypto().sealJson(payload);
   await query(
-    `INSERT INTO waddling.endpoint_secret (endpoint_id, kind, iv, auth_tag, ciphertext)
+    `INSERT INTO waddling.datalake_secret (datalake_id, kind, iv, auth_tag, ciphertext)
        VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (endpoint_id, kind)
+     ON CONFLICT (datalake_id, kind)
        DO UPDATE SET iv = $3, auth_tag = $4, ciphertext = $5, updated_at = now()`,
-    [endpointId, kind, s.iv, s.authTag, s.ciphertext],
+    [datalakeId, kind, s.iv, s.authTag, s.ciphertext],
   );
 }
 
 /** Resolved gateway config for one endpoint — mirrors packages/gateway config.s3. */
-export interface EndpointGatewayConfig {
+export interface DatalakeGatewayConfig {
   /** Postgres DSN for the DuckLake catalog ('' in managed-local mode). */
   ducklakeCatalogDsn: string;
   /** Local DuckLake catalog file ('' unless managed-local). */
@@ -105,26 +105,26 @@ interface EndpointStorageRow {
  * Decrypt an endpoint's credentials into the gateway's runtime config shape.
  * Returns null if the endpoint doesn't exist. Server-only.
  */
-export async function getEndpointGatewayConfig(
-  endpointId: string,
-): Promise<EndpointGatewayConfig | null> {
+export async function getDatalakeGatewayConfig(
+  datalakeId: string,
+): Promise<DatalakeGatewayConfig | null> {
   const ep = await queryOne<EndpointStorageRow>(
     `SELECT data_path, encrypted, storage_provider, storage_endpoint, storage_region,
             storage_url_style, storage_use_ssl, catalog_mode, catalog_file
-       FROM waddling.endpoint WHERE id = $1`,
-    [endpointId],
+       FROM waddling.datalake WHERE id = $1`,
+    [datalakeId],
   );
   if (!ep) return null;
 
   const secrets = await query<SecretRow & { kind: SecretKind }>(
-    `SELECT kind, iv, auth_tag, ciphertext FROM waddling.endpoint_secret WHERE endpoint_id = $1`,
-    [endpointId],
+    `SELECT kind, iv, auth_tag, ciphertext FROM waddling.datalake_secret WHERE datalake_id = $1`,
+    [datalakeId],
   );
   const byKind = new Map(secrets.rows.map((r) => [r.kind, r]));
 
   const localData = !/^s3:\/\//i.test(ep.data_path);
 
-  let s3: EndpointGatewayConfig['s3'];
+  let s3: DatalakeGatewayConfig['s3'];
   if (!localData && ep.storage_provider) {
     const provider = ep.storage_provider as 'config' | 'credential_chain';
     const creds =

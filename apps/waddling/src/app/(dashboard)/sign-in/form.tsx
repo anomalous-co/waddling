@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Loader2 } from 'lucide-react';
 import { authClient } from '@/lib/auth-client';
+import { CONTROL_API_BASE } from '@/lib/control-api';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -32,6 +33,14 @@ export function SignInForm() {
 
     if (res.error) {
       setError(res.error.message ?? 'Sign-in failed');
+      return;
+    }
+    // OAuth/MCP resume: Better Auth redirected an unauthenticated authorize here with
+    // the full OAuth query (client_id, redirect_uri, scope, prompt=consent, …). Now
+    // that a session exists, full-navigate back to the API authorize endpoint to
+    // continue the flow (→ consent screen → back to the agent). Otherwise normal nav.
+    if (searchParams.get('client_id')) {
+      window.location.href = `${CONTROL_API_BASE}/api/auth/mcp/authorize${window.location.search}`;
       return;
     }
     router.push(next);

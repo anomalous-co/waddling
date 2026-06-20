@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# bbq — quackboard quack client. Routes one SQL payload to the long-lived quack
+# server that holds the quackboard DuckDB file. Uses quack_query (stateless),
+# which executes the SQL server-side in the served catalog, so bare table names
+# work with no USE/ATTACH. Opens an in-memory DuckDB → never touches the file,
+# never contends for the single-writer lock. Defaults baked in (env overrides)
+# so they survive claude -> Bash-tool -> hook subprocess boundaries.
+URI="${BB_URI:-quack:127.0.0.1:9494}"
+TOK="${BB_TOKEN:-bb-dev-token}"
+SQL=$(printf '%s' "$1" | sed "s/'/''/g")   # double single-quotes for the nested string literal
+exec duckdb -c "INSTALL quack; LOAD quack; FROM quack_query('$URI','$SQL', token => '$TOK');"

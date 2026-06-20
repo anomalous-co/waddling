@@ -231,6 +231,16 @@ async function main() {
       return;
     }
 
+    // Fold the WAL into the main .duckdb file on the trusted control connection (un-gated),
+    // so the DO can upload a crash-consistent file to R2. Quackboard durability (the served
+    // database IS the store); a no-op CHECKPOINT on a lake gateway (:memory:) is harmless.
+    if (path === "/ctrl/checkpoint" && method === "POST") {
+      await rt.run("CHECKPOINT");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
     if (path === "/ctrl/status" && method === "GET") {
       // birdshot_status() returns a SPACE-delimited "key=value ..." string (NOT
       // JSON — see StatusSummary in birdshot_extension.cpp), so duck.ts's

@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# bb — the swarm agent toolkit. A documented set of verbs over the shared
+# quackboard (DuckDB served via quack). Routes all SQL through ./bbq, so many
+# agents use it concurrently. Auto-scopes to your role via $BB_ROLE.
+set -uo pipefail
+ROLE="${BB_ROLE:-anon}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SWARM_HOME="${SWARM_HOME:-$(cd "$HERE/.." && pwd)}"
+BBQ="$HERE/bbq"
+NOTIFY="$SWARM_HOME/hooks/hook-notify.sh"
+esc(){ printf '%s' "$1" | sed "s/'/''/g"; }
+cmd="${1:-help}"; shift 2>/dev/null || true
+
+case "$cmd" in
+
+help)
+cat <<'HELP'
+bb — swarm agent toolkit. You are one of several agents sharing ONE objective and
+ONE quackboard. You coordinate ONLY through these verbs; there is no other channel.
+Your role name is in $BB_ROLE and is attached to everything you write.
+
+ORIENT
+  bb objective              Show the shared objective(s).
+  bb help                   This guide.
+
+COORDINATE (do this BEFORE and DURING work — avoid duplicating peers)
+  bb boundaries             List the planner's non-overlapping areas with status/owner.
+                            When boundaries exist, work the planned partition: pick an
+                            OPEN one and take it (below). This is preferred over claim.
+  bb take <id>              Atomically take boundary #id. If it prints ALREADY TAKEN,
+                            run bb boundaries and take another OPEN one. Investigate
+                            ONLY within that boundary's scope — do not stray.
+  bb claim "<area>"         (Ad-hoc, when there is no plan) atomically claim a free-text
+                            area. If it prints TAKEN, pick a different area.
+  bb recall "<query>"       Ranked full-text search over ALL peers' observations.
+                            Run this FIRST on any topic to build on what's known
+                            instead of rediscovering it.
+
+RECORD (your findings are the deliverable)
+  bb observe "<finding>" <ref> [<ref>...]
+                            Record ONE qualified architectural finding with file
+                            references (path:line). Be specific and evidence-based
+                            ("sessions.ts:196 mints the RS256 JWT AFTER recompile,
+                            so a skipped re-push breaks auth"). This is what the
+                            synthesizer reads. Each observe may notify subscribers.
+  bb remember <key> "<txt>" Private scratch note, visible only to you.
+  bb mine [<query>]         Read back your private notes.
+
+STAY INFORMED (reactive — others' findings come to you)
+  bb subscribe "<pattern>" [--fts|--ilike|--regex] [--topic <name>]
+                            Be notified when a peer observes something matching.
+                            --fts (default): ranked keyword match (e.g. "jwt token
+                            audience"). --ilike: substring. --regex: regex. Use this
+                            for cross-cutting concerns that span others' areas
+                            (e.g. subscribe "secret|credential|encrypt" --regex).
+  bb inbox                  Read + clear notifications addressed to you. Check it
+                            periodically; act on what peers surface.
+
+TALK
+  bb note <role|all> "<msg>"   Direct message a peer (or broadcast to 'all').
+
+ETIQUETTE: recall → claim → explore (Read/Grep/Glob the repo) → observe with refs →
+subscribe to your topic → check inbox → when no area is left unclaimed and your
+inbox is quiet, summarize what you did via bb note all and stop.
+HELP
+;;
+
+objective)
+  $BBQ "SELECT id, body FROM objectives WHERE status='open' ORDER BY id;" ;;
+
+claims)
+  $BBQ "SELECT area, agent_role AS owner, status FROM claims ORDER BY ts;" ;;
+
+claim)
+  area=$(esc "${1:-}")
+  [ -z "$area" ] && { echo "usage: bb claim \"<area>\""; exit 2; }
+  # PRIMARY KEY on area makes this race-safe: only the first writer wins.
+  $BBQ "INSERT INTO claims(area, agent_role) VALUES ('$area','$ROLE') ON CONFLICT DO NOTHING;
+        SELECT CASE WHEN agent_role='$ROLE' THEN 'CLAIMED by you ($ROLE)'
+                    ELSE 'TAKEN by '||agent_role||' — pick another area' END AS result
+        FROM claims WHERE area='$area';" ;;
+
+observe)
+  content=$(esc "${1:-}"); shift 2>/dev/null || true
+  [ -z "$content" ] && { echo "usage: bb observe \"<finding>\" <ref>..."; exit 2; }
+  if [ "$#" -gt 0 ]; then refs=$(printf '%s\n' "$@" | jq -R . | jq -cs .); else refs='[]'; fi
+  refs=$(esc "$refs")
+  $BBQ "INSERT INTO observations(agent_role, content, refs) VALUES ('$ROLE','$content','$refs');
+        SELECT 'observed #'||currval('obs_seq') AS ok;"
+  # inline FTS pub/sub: rebuild index + notify matching subscribers (idempotent,
+  # so it is harmless if a PostToolUse hook also runs it). Inline because Workflow
+  # subagents do NOT fire --settings hooks (see HOOKS.md).
+  BB_ROLE="$ROLE" "$NOTIFY" </dev/null >/dev/null 2>&1 ;;
+
+remember)
+  key=$(esc "${1:-}"); content=$(esc "${2:-}")
+  [ -z "$key" ] && { echo "usage: bb remember <key> \"<text>\""; exit 2; }
+  $BBQ "INSERT INTO agent_memory(agent_role,key,content) VALUES ('$ROLE','$key','$content'); SELECT 'remembered' AS ok;" ;;
+
+mine)
+  if [ -n "${1:-}" ]; then q=$(esc "$1")
+    $BBQ "SELECT key, content FROM agent_memory WHERE agent_role='$ROLE' AND (content ILIKE '%$q%' OR key ILIKE '%$q%') ORDER BY ts;"
+  else
+    $BBQ "SELECT key, content FROM agent_memory WHERE agent_role='$ROLE' ORDER BY ts;"
+  fi ;;
+
+recall)
+  q=$(esc "${1:-}")
+  [ -z "$q" ] && { echo "usage: bb recall \"<query>\""; exit 2; }
+  $BBQ "SELECT agent_role AS by, score, left(content,140) AS finding, refs
+        FROM (SELECT agent_role, content, refs, fts_main_observations.match_bm25(id,'$q') AS score FROM observations)
+        WHERE score IS NOT NULL ORDER BY score DESC LIMIT 10;" ;;
+
+subscribe)
+  pattern=""; mtype="fts"; topic=""
+  while [ "$#" -gt 0 ]; do case "$1" in
+    --fts) mtype=fts;; --ilike) mtype=ilike;; --regex) mtype=regex;;
+    --topic) shift; topic="${1:-}";; *) pattern="$1";;
+  esac; shift 2>/dev/null || true; done
+  [ -z "$pattern" ] && { echo "usage: bb subscribe \"<pattern>\" [--fts|--ilike|--regex] [--topic <name>]"; exit 2; }
+  pe=$(esc "$pattern"); te=$(esc "$topic")
+  $BBQ "INSERT INTO subscriptions(agent_role, pattern, match_type, topic) VALUES ('$ROLE','$pe','$mtype','$te');
+        SELECT 'subscribed ('||'$mtype'||'): '||'$pe' AS ok;" ;;
+
+inbox)
+  $BBQ "SELECT n.id, o.agent_role AS from_peer, n.snippet
+        FROM notifications n LEFT JOIN observations o ON o.id = n.source_id
+        WHERE n.to_role='$ROLE' AND NOT n.is_read ORDER BY n.ts;
+        UPDATE notifications SET is_read=true WHERE to_role='$ROLE' AND NOT is_read;" ;;
+
+note)
+  to=$(esc "${1:-all}"); msg=$(esc "${2:-}")
+  $BBQ "INSERT INTO messages(from_agent,to_agent,body) VALUES ('$ROLE','$to','$msg'); SELECT 'sent' AS ok;" ;;
+
+plan)
+  name=$(esc "${1:-}"); scope=$(esc "${2:-}"); shift 2 2>/dev/null || true
+  [ -z "$name" ] && { echo "usage: bb plan \"<name>\" \"<scope incl. what is OUT>\" <path>..."; exit 2; }
+  if [ "$#" -gt 0 ]; then paths=$(printf '%s\n' "$@" | jq -R . | jq -cs .); else paths='[]'; fi
+  paths=$(esc "$paths")
+  $BBQ "INSERT INTO boundaries(name, scope, paths) VALUES ('$name','$scope','$paths');
+        SELECT 'planned boundary #'||currval('bnd_seq')||': '||'$name' AS ok;" ;;
+
+boundaries)
+  $BBQ "SELECT id, status, COALESCE(owner,'-') AS owner, name, scope FROM boundaries ORDER BY id;" ;;
+
+take)
+  id="${1:-}"
+  case "$id" in *[!0-9]*|'') echo "usage: bb take <boundary-id>"; exit 2 ;; esac
+  # atomic: succeeds only if still open; retry on transient write-write conflict
+  for i in 1 2 3 4 5; do
+    out=$($BBQ "UPDATE boundaries SET owner='$ROLE', status='claimed' WHERE id=$id AND status='open';
+                SELECT CASE WHEN owner='$ROLE' THEN 'TAKEN by you ('||'$ROLE'||'): #'||id||' '||name
+                            ELSE 'ALREADY TAKEN by '||owner||' — run bb boundaries and take another OPEN one' END AS result
+                FROM boundaries WHERE id=$id;" 2>&1) && { echo "$out"; break; }
+    sleep 0.2
+  done ;;
+
+*) echo "unknown verb '$cmd' — run: bb help"; exit 2 ;;
+esac

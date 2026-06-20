@@ -18,7 +18,7 @@ const IngestSchema = z.object({
   event: z.string().min(1),
   agentId: z.string().optional(),
   sessionId: z.string().optional(),
-  endpointId: z.string().optional(),
+  datalakeId: z.string().optional(),
   decision: z.enum(['allow', 'deny']).optional(),
   reason: z.string().optional(),
   query: z.string().optional(),
@@ -44,13 +44,13 @@ audit.get('/', (c) =>
       event: string;
       agent_id: string | null;
       session_id: string | null;
-      endpoint_id: string | null;
+      datalake_id: string | null;
       decision: 'allow' | 'deny' | null;
       reason: string | null;
       query: string | null;
       actor: string | null;
     }>(
-      `SELECT id, org_id, ts, source, event, agent_id, session_id, endpoint_id, decision, reason, query, actor
+      `SELECT id, org_id, ts, source, event, agent_id, session_id, datalake_id, decision, reason, query, actor
          FROM waddling.audit_event
         WHERE org_id = $1
           AND ($2::text IS NULL OR agent_id = $2)
@@ -68,7 +68,7 @@ audit.get('/', (c) =>
       event: r.event,
       agentId: r.agent_id ?? undefined,
       sessionId: r.session_id ?? undefined,
-      endpointId: r.endpoint_id ?? undefined,
+      datalakeId: r.datalake_id ?? undefined,
       decision: r.decision ?? undefined,
       reason: r.reason ?? undefined,
       query: r.query ?? undefined,
@@ -94,7 +94,7 @@ audit.post('/', (c) =>
     const e = await parseBody(c, IngestSchema);
     await query(
       `INSERT INTO waddling.audit_event
-         (org_id, source, event, agent_id, session_id, endpoint_id, decision, reason, query, actor)
+         (org_id, source, event, agent_id, session_id, datalake_id, decision, reason, query, actor)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [
         caller.orgId,
@@ -102,7 +102,7 @@ audit.post('/', (c) =>
         e.event,
         e.agentId ?? null,
         e.sessionId ?? null,
-        e.endpointId ?? null,
+        e.datalakeId ?? null,
         e.decision ?? null,
         e.reason ?? null,
         e.query ?? null,

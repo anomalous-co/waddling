@@ -1,14 +1,13 @@
 /**
- * /api/cp/catalog — per-org managed Postgres catalog (PlanetScale) lifecycle.
+ * /api/cp/catalog — per-org managed Postgres catalog (Neon) lifecycle.
  *
- * Each org gets ONE PlanetScale Postgres database (the DuckLake metadata catalog the
- * gateway ATTACHes via `ducklake:postgres:<dsn>`). Provisioning is async, so this is a
- * kick-off + poll surface over the provisioning→ready machine in lib/catalog-provision:
+ * Each org gets ONE Neon project whose database is the DuckLake metadata catalog the gateway
+ * ATTACHes via `ducklake:postgres:<dsn>`. Provisioning is synchronous (createProject returns
+ * the DSN), so this is a provision + status surface over lib/catalog-provision:
  *
- *   POST /          → provision (idempotent): create the PlanetScale DB if absent,
- *                     insert the 'provisioning' row, return status. Fast.
- *   GET  /          → reconcile + status: advance toward 'ready' (mint password + seal
- *                     DSN once the cluster is up), return the current state. Poll this.
+ *   POST /          → provision (idempotent): create the org's Neon project if absent, seal
+ *                     the DSN, return 'ready' status.
+ *   GET  /          → status, return the current state. Poll this.
  *
  * Org-scoped (the caller's active org). The sealed DSN never leaves the server.
  */
@@ -19,7 +18,7 @@ import { resolveCaller, handle, ok, err } from '../lib/cp-shared';
 import {
   provisionOrgCatalog,
   reconcileOrgCatalog,
-  getPlanetScaleClient,
+  getNeonClient,
   getOrgCatalogDsn,
 } from '../lib/catalog-provision';
 
@@ -36,12 +35,12 @@ async function orgSlug(orgId: string): Promise<string | null> {
 catalog.post('/', (c) =>
   handle(c, async () => {
     const caller = await resolveCaller(c);
-    if (!getPlanetScaleClient(c.env)) {
+    if (!getNeonClient(c.env)) {
       return err(
         c,
-        'planetscale_not_configured',
+        'neon_not_configured',
         503,
-        'Managed Postgres catalog is not configured (PLANETSCALE_* env). Set the service token + org to enable.',
+        'Managed Postgres catalog is not configured (NEON_API_KEY). Set the Neon API key to enable.',
       );
     }
     const slug = await orgSlug(caller.orgId);
@@ -88,6 +87,22 @@ catalog.post('/lakeprobe', (c) =>
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ dsn }),
     });
+    const json = await res.json().catch(() => ({ error: 'non-json data-plane response' }));
+    return c.json(json as Record<string, unknown>, res.status as 200);
+  }),
+);
+
+/**
+ * POST /qbselftest — drive the data plane's quackboard end-to-end self-test (boot → birdshot
+ * snapshot → gated write+read → persist to R2 → cold boot → restore → recall). Auth-gated
+ * (any authenticated caller); the data plane stays private (reached only via the service
+ * binding). The self-test is self-contained (mints its own JWT/JWKS) and touches no real org.
+ * Temporary verification surface; safe to remove once the quackboard is signed off.
+ */
+catalog.post('/qbselftest', (c) =>
+  handle(c, async () => {
+    await resolveCaller(c);
+    const res = await c.env.DATAPLANE.fetch('https://dataplane/qb/selftest', { method: 'POST' });
     const json = await res.json().catch(() => ({ error: 'non-json data-plane response' }));
     return c.json(json as Record<string, unknown>, res.status as 200);
   }),

@@ -16,7 +16,7 @@
  * reveals the rest.
  */
 import { useMemo, useState } from 'react';
-import { Button } from './ui';
+import { Button } from '@/components/ui/button';
 
 type SortDir = 'asc' | 'desc';
 

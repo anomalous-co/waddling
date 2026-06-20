@@ -16,7 +16,7 @@
  * storage secret; the catalog DSN from the org/endpoint catalog secret. All server-side.
  */
 import { query, queryOne } from './db';
-import { getEndpointGatewayConfig } from './endpoint-secrets';
+import { getDatalakeGatewayConfig } from './datalake-secrets';
 import { getOrgCatalogDsn } from './catalog-provision';
 import type { GatewayBoot } from './gateway-client';
 import type { Env } from './env';
@@ -50,13 +50,20 @@ interface EndpointCatalogRow {
   server_token: string;
   catalog_mode: string | null;
   catalog_schema: string | null;
+  kind: string;
 }
 
 const LAKE_ALIAS = 'lake';
+const QUACKBOARD_ALIAS = 'quackboard';
+
+/** R2 object key for an org's durable quackboard .duckdb file. */
+export function quackboardR2Key(orgId: string): string {
+  return `quackboard/${orgId}/quackboard.duckdb`;
+}
 
 /** Deterministic per-endpoint metadata schema (PG-identifier-safe). */
-export function endpointMetadataSchema(endpointId: string): string {
-  return `ep_${endpointId.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+export function endpointMetadataSchema(datalakeId: string): string {
+  return `ep_${datalakeId.replace(/[^a-zA-Z0-9_]/g, '_')}`;
 }
 
 /**
@@ -64,15 +71,30 @@ export function endpointMetadataSchema(endpointId: string): string {
  * CatalogNotReadyError when the endpoint is configured for the managed catalog but the
  * org's catalog is still provisioning (the caller maps that to a retryable 503).
  */
-export async function resolveGatewayBoot(env: Env, endpointId: string): Promise<ResolvedGatewayBoot> {
+export async function resolveGatewayBoot(env: Env, datalakeId: string): Promise<ResolvedGatewayBoot> {
   const ep = await queryOne<EndpointCatalogRow>(
-    `SELECT org_id, server_token, catalog_mode, catalog_schema
-       FROM waddling.endpoint WHERE id = $1`,
-    [endpointId],
+    `SELECT org_id, server_token, catalog_mode, catalog_schema, kind
+       FROM waddling.datalake WHERE id = $1`,
+    [datalakeId],
   );
   if (!ep) return { lakeCatalog: 'memory' };
 
-  const cfg = await getEndpointGatewayConfig(endpointId);
+  // Quackboard: no DuckLake, no object store. The served DuckDB IS the durable store; the
+  // data plane restores/persists it from R2 at `r2Key`. birdshot still boots + enforces, so
+  // birdshot resolves agent table refs against the served db's own catalog (QUACKBOARD_ALIAS).
+  if (ep.kind === 'quackboard') {
+    return {
+      lakeCatalog: QUACKBOARD_ALIAS,
+      gatewayBoot: {
+        serverToken: ep.server_token,
+        alias: QUACKBOARD_ALIAS,
+        quackboard: true,
+        r2Key: quackboardR2Key(ep.org_id),
+      },
+    };
+  }
+
+  const cfg = await getDatalakeGatewayConfig(datalakeId);
   if (!cfg) return { lakeCatalog: 'memory' };
 
   const s3: GatewayBoot['s3'] | undefined = cfg.s3
@@ -94,8 +116,9 @@ export async function resolveGatewayBoot(env: Env, endpointId: string): Promise<
     s3,
   };
 
-  // (a) managed-postgres: shared per-org catalog + per-endpoint metadata schema, with
-  // managed R2 storage minted by the faucet (per-org bucket, per-endpoint prefix scope).
+  // (a) managed-postgres: shared per-org Neon catalog + per-datalake metadata schema. Storage
+  // is independent: a BYO bucket (the datalake carries real S3 creds) OR managed R2 minted by
+  // the faucet. The catalog is managed either way.
   if (ep.catalog_mode === 'managed-postgres') {
     const dsn = await getOrgCatalogDsn(ep.org_id);
     if (!dsn) {
@@ -103,10 +126,19 @@ export async function resolveGatewayBoot(env: Env, endpointId: string): Promise<
         `org ${ep.org_id} managed catalog is still provisioning — retry shortly`,
       );
     }
-    const schema = ep.catalog_schema ?? (await ensureEndpointSchema(endpointId));
+    const schema = ep.catalog_schema ?? (await ensureEndpointSchema(datalakeId));
+
+    // BYO object storage + managed Neon catalog: use the datalake's own bucket + creds (base
+    // already carries cfg.ducklakeDataPath + cfg.s3). No faucet needed.
+    if (cfg.s3 && cfg.s3.keyId && cfg.s3.secret) {
+      return {
+        lakeCatalog: LAKE_ALIAS,
+        gatewayBoot: { ...base, catalogDsn: dsn, metadataSchema: schema },
+      };
+    }
 
     // Managed lake data: provision the org's R2 bucket + mint SHORT-LIVED creds scoped to
-    // exactly this endpoint's prefix. The gateway never sees a broad account credential.
+    // exactly this datalake's prefix. The gateway never sees a broad account credential.
     const faucet = getR2Faucet(env);
     if (!faucet) {
       throw new StorageNotReadyError('managed storage requires the R2 faucet (R2_FAUCET_TOKEN / R2_PARENT_ACCESS_KEY_ID)');
@@ -114,7 +146,7 @@ export async function resolveGatewayBoot(env: Env, endpointId: string): Promise<
     const slug = await orgSlugFor(ep.org_id);
     const bucket = orgBucketName(slug);
     await faucet.ensureBucket(bucket);
-    const prefix = `${endpointId}/`;
+    const prefix = `${datalakeId}/`;
     const creds = await faucet.mintScopedCreds(bucket, {
       permission: 'object-read-write',
       ttlSeconds: 604_800, // 7d (max) — covers a long-lived gateway between cold boots
@@ -144,7 +176,7 @@ export async function resolveGatewayBoot(env: Env, endpointId: string): Promise<
     };
   }
 
-  // (b) byo-postgres: customer's own catalog DSN (from getEndpointGatewayConfig).
+  // (b) byo-postgres: customer's own catalog DSN (from getDatalakeGatewayConfig).
   if (cfg.ducklakeCatalogDsn) {
     return {
       lakeCatalog: LAKE_ALIAS,
@@ -175,11 +207,11 @@ async function orgSlugFor(orgId: string): Promise<string> {
 }
 
 /** Lazily assign + persist a deterministic metadata schema for an endpoint that has none. */
-async function ensureEndpointSchema(endpointId: string): Promise<string> {
-  const schema = endpointMetadataSchema(endpointId);
+async function ensureEndpointSchema(datalakeId: string): Promise<string> {
+  const schema = endpointMetadataSchema(datalakeId);
   await query(
-    `UPDATE waddling.endpoint SET catalog_schema = $2 WHERE id = $1 AND catalog_schema IS NULL`,
-    [endpointId, schema],
+    `UPDATE waddling.datalake SET catalog_schema = $2 WHERE id = $1 AND catalog_schema IS NULL`,
+    [datalakeId, schema],
   );
   return schema;
 }

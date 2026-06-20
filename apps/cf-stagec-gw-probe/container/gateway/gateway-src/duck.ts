@@ -105,9 +105,51 @@ export interface DuckRuntime {
   run(sql: string): Promise<void>;
 }
 
+// Idempotent quackboard schema: the shared agent-coordination tables + a seeded FTS index.
+// Run on the un-gated CONTROL connection at boot (before quack_serve), so it is not subject
+// to birdshot authorization. CREATE … IF NOT EXISTS makes it a no-op on a restored db.
+const QUACKBOARD_SCHEMA: string[] = [
+  "CREATE SEQUENCE IF NOT EXISTS obs_seq   START 1",
+  "CREATE SEQUENCE IF NOT EXISTS amem_seq  START 1",
+  "CREATE SEQUENCE IF NOT EXISTS sub_seq   START 1",
+  "CREATE SEQUENCE IF NOT EXISTS notif_seq START 1",
+  "CREATE SEQUENCE IF NOT EXISTS bnd_seq   START 1",
+  "CREATE SEQUENCE IF NOT EXISTS msg_seq   START 1",
+  `CREATE TABLE IF NOT EXISTS objectives(id INTEGER PRIMARY KEY, owner TEXT,
+     status TEXT DEFAULT 'open', body TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY DEFAULT nextval('obs_seq'),
+     agent_role TEXT, content TEXT, refs JSON, topic TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS agent_memory(id INTEGER PRIMARY KEY DEFAULT nextval('amem_seq'),
+     agent_role TEXT, key TEXT, content TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS claims(area TEXT PRIMARY KEY, agent_role TEXT,
+     status TEXT DEFAULT 'claimed', ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS subscriptions(id INTEGER PRIMARY KEY DEFAULT nextval('sub_seq'),
+     agent_role TEXT, pattern TEXT, match_type TEXT DEFAULT 'fts', topic TEXT,
+     created TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY DEFAULT nextval('notif_seq'),
+     to_role TEXT, source_id INTEGER, sub_id INTEGER, snippet TEXT,
+     ts TIMESTAMP DEFAULT current_timestamp, is_read BOOLEAN DEFAULT false)`,
+  `CREATE TABLE IF NOT EXISTS boundaries(id INTEGER PRIMARY KEY DEFAULT nextval('bnd_seq'),
+     name TEXT, scope TEXT, paths JSON, status TEXT DEFAULT 'open', owner TEXT,
+     ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY DEFAULT nextval('msg_seq'),
+     from_agent TEXT, to_agent TEXT, body TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  // Seed one sentinel so the FTS index always has a document, then build it.
+  `INSERT INTO observations(agent_role, content, refs, topic)
+     SELECT 'system', 'quackboard initialized', '[]', 'meta'
+     WHERE NOT EXISTS (SELECT 1 FROM observations)`,
+  "PRAGMA create_fts_index('observations', 'id', 'content', stemmer = 'porter', overwrite = 1)",
+];
+
+async function bootstrapQuackboardSchema(connection: DuckDBConnection): Promise<void> {
+  for (const stmt of QUACKBOARD_SCHEMA) await connection.run(stmt);
+}
+
 /** Boot DuckDB, load birdshot, create the S3 secret, ATTACH the lake, serve quack. */
 export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntime> {
-  const instance = await DuckDBInstance.create(":memory:", {
+  // A lake gateway opens ':memory:' (durable data lives in the ATTACHed lake); a quackboard
+  // opens its durable .duckdb file directly, so quack serves the agent-coordination tables.
+  const instance = await DuckDBInstance.create(config.databasePath, {
     allow_unsigned_extensions: "true",
   });
   const connection = await instance.connect();
@@ -116,8 +158,18 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   await connection.run("INSTALL quack; LOAD quack");
   await connection.run(`LOAD ${q(config.birdshotExtensionPath)}`);
 
-  // ducklake + postgres + httpfs for s3 access.
-  await connection.run("INSTALL ducklake; INSTALL postgres; INSTALL httpfs;");
+  // httpfs underlies quack's wire transport — needed for both lake and quackboard.
+  await connection.run("INSTALL httpfs;");
+  if (config.quackboard) {
+    // FTS powers quackboard recall (BM25) + pub/sub matching; no lake catalog/object store.
+    await connection.run("INSTALL fts; LOAD fts;");
+    // Create the shared coordination tables on the un-gated control connection, before the
+    // birdshot hooks + quack_serve below. Idempotent — a no-op on a restored db.
+    await bootstrapQuackboardSchema(connection);
+  } else {
+    // ducklake + postgres for the lake catalog/object store.
+    await connection.run("INSTALL ducklake; INSTALL postgres;");
+  }
 
   // quack's wire transport rides HTTPFS, so cache + reuse the underlying HTTP(S)
   // connections instead of paying a fresh handshake per request — the lever for
@@ -125,6 +177,10 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   // per-request connections quack's auth callbacks run on inherit it.
   await connection.run("LOAD httpfs; SET GLOBAL httpfs_connection_caching = true;");
 
+  // A quackboard has no lake: skip the S3 secret, the ducklake ATTACH, and the read-through
+  // views entirely. quack serves the opened database's own tables (restored from R2). The
+  // birdshot hooks + quack_serve below still run, so ACLs are enforced.
+  if (!config.quackboard) {
   // S3 / R2 / MinIO secret. PROVIDER config = explicit static creds.
   // MinIO: USE_SSL false + URL_STYLE path; R2: USE_SSL true + vhost.
   // Skipped entirely in local-data mode (DATA_PATH is a local dir, no object store).
@@ -210,6 +266,7 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   // memory.main is shared across the instance's connections, so quack's per-request
   // serving connections see these views. Restores on every (re)boot from the durable lake.
   await restoreLakeViews(connection, config.lakeAlias);
+  } // end if (!config.quackboard) — quackboard skips the entire lake-mount section
 
   // Hand quack's auth/authz hooks to birdshot BEFORE the server starts listening.
   // The auth callbacks are evaluated on a fresh server-side connection per request

@@ -6,8 +6,8 @@
  *   Error:    { error: string; code?: string; status?: number }
  *
  * Per-route contracts W2 assumes (W1 must align):
- *   GET  /api/cp/endpoints          → { endpoints: EndpointSummary[] }
- *   GET  /api/cp/endpoints/:id      → { endpoint: EndpointRow }
+ *   GET  /api/cp/datalakes          → { datalakes: DatalakeSummary[] }
+ *   GET  /api/cp/datalakes/:id      → { datalake: DatalakeDetail }
  *   GET  /api/cp/agents             → { agents: AgentSummary[] }
  *   GET  /api/cp/agents/:id         → { agent: AgentRow }
  *   GET  /api/cp/acl                → { rules: AclRuleRow[] }

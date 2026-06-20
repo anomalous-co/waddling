@@ -6,20 +6,27 @@
  * Posts to /api/cp/device-link/claim with the session cookie. On success it
  * shows the "return to your terminal" screen — the agent is polling and will
  * pick up the freshly-minted API key on its next poll.
- *
- * Inline-styled (no dashboard component imports) to keep /link self-contained.
  */
 import { useState, type FormEvent } from 'react';
+import { Loader2, CheckCircle2 } from 'lucide-react';
 import { cpUrl } from '@/lib/control-api';
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
+import { Field, FieldLabel, FieldGroup } from '@/components/ui/field';
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from '@/components/ui/select';
 
 interface OrgOption {
   id: string;
   name: string;
 }
-
-const inputCls =
-  'w-full rounded border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-sm text-neutral-100 ' +
-  'placeholder:text-neutral-600 focus:border-blue-500 focus:outline-none';
 
 export function ClaimForm({
   initialCode,
@@ -63,99 +70,81 @@ export function ClaimForm({
 
   if (done) {
     return (
-      <div className="space-y-3 text-center">
-        <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full border border-blue-500/40 bg-blue-500/10 text-blue-400">
-          <svg
-            viewBox="0 0 20 20"
-            fill="none"
-            className="h-5 w-5"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M5 10.5l3.5 3.5L15 6" />
-          </svg>
-        </div>
-        <h1 className="text-base font-semibold text-neutral-100">
-          Return to your terminal
-        </h1>
-        <p className="text-sm text-neutral-400">
-          Your agent is now connected. It will detect the link automatically and
-          continue what you asked it to do — you can close this tab.
-        </p>
-      </div>
+      <Card>
+        <CardContent className="flex flex-col items-center gap-3 py-8 text-center">
+          <CheckCircle2 className="size-10 text-primary" />
+          <CardTitle className="text-base">Return to your terminal</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Your agent is now connected. It will detect the link automatically and continue what you
+            asked it to do — you can close this tab.
+          </p>
+        </CardContent>
+      </Card>
     );
   }
 
   return (
-    <form onSubmit={(e) => void submit(e)} className="space-y-4">
-      <h1 className="text-base font-semibold text-neutral-100">
-        Connect this agent
-      </h1>
+    <Card>
+      <CardHeader>
+        <CardTitle>Connect this agent</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={(e) => void submit(e)}>
+          <FieldGroup className="gap-4">
+            <Field>
+              <FieldLabel htmlFor="code">Code</FieldLabel>
+              <Input
+                id="code"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                placeholder="XXXX-XXXX"
+                required
+                autoFocus={!initialCode}
+                className="font-mono uppercase tracking-widest"
+              />
+            </Field>
 
-      <div>
-        <label htmlFor="code" className="block text-xs text-neutral-400 mb-1">
-          Code
-        </label>
-        <input
-          id="code"
-          className={`${inputCls} font-mono tracking-widest uppercase`}
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-          placeholder="XXXX-XXXX"
-          required
-          autoFocus={!initialCode}
-        />
-      </div>
+            <Field>
+              <FieldLabel htmlFor="org">Organization</FieldLabel>
+              <Select value={orgId} onValueChange={setOrgId}>
+                <SelectTrigger id="org" className="w-full">
+                  <SelectValue placeholder="Select organization" />
+                </SelectTrigger>
+                <SelectContent>
+                  {orgs.map((o) => (
+                    <SelectItem key={o.id} value={o.id}>
+                      {o.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
 
-      <div>
-        <label htmlFor="org" className="block text-xs text-neutral-400 mb-1">
-          Organization
-        </label>
-        <select
-          id="org"
-          className={inputCls}
-          value={orgId}
-          onChange={(e) => setOrgId(e.target.value)}
-          required
-        >
-          {orgs.map((o) => (
-            <option key={o.id} value={o.id}>
-              {o.name}
-            </option>
-          ))}
-        </select>
-      </div>
+            <Field>
+              <FieldLabel htmlFor="agentName">Agent name</FieldLabel>
+              <Input
+                id="agentName"
+                value={agentName}
+                onChange={(e) => setAgentName(e.target.value)}
+                placeholder="claude-code"
+                required
+              />
+            </Field>
 
-      <div>
-        <label htmlFor="agentName" className="block text-xs text-neutral-400 mb-1">
-          Agent name
-        </label>
-        <input
-          id="agentName"
-          className={inputCls}
-          value={agentName}
-          onChange={(e) => setAgentName(e.target.value)}
-          placeholder="claude-code"
-          required
-        />
-      </div>
+            {error ? (
+              <Alert variant="destructive">
+                <AlertTitle>Could not connect agent</AlertTitle>
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            ) : null}
 
-      {error && (
-        <p className="text-xs text-red-400 rounded border border-red-900 bg-red-950/40 px-3 py-2">
-          {error}
-        </p>
-      )}
-
-      <button
-        type="submit"
-        disabled={loading}
-        className="w-full inline-flex items-center justify-center rounded border border-blue-500 bg-[#2563eb] px-3.5 py-1.5 text-sm font-medium text-white hover:bg-[#3b82f6] disabled:opacity-60"
-      >
-        {loading ? 'Connecting…' : 'Connect agent'}
-      </button>
-    </form>
+            <Button type="submit" disabled={loading} className="w-full">
+              {loading ? <Loader2 data-icon="inline-start" className="animate-spin" /> : null}
+              {loading ? 'Connecting…' : 'Connect agent'}
+            </Button>
+          </FieldGroup>
+        </form>
+      </CardContent>
+    </Card>
   );
 }

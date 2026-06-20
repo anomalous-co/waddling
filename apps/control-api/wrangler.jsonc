@@ -36,6 +36,15 @@
       "id": "cbd2434e2b3043fa914156943178a856"
     }
   ],
+  // Public-ish user avatar storage. Uploaded by POST /api/cp/account/avatar and
+  // served (no auth) by GET /api/cp/account/avatar/:userId. Not lake data — a
+  // separate bucket from the workspace/lake buckets.
+  "r2_buckets": [
+    {
+      "binding": "AVATARS",
+      "bucket_name": "waddling-avatars"
+    }
+  ],
   // Data plane (apps/dataplane), reached ONLY over this service binding — it is
   // private (workers_dev:false). gateway-client transports /gw/* here; sessions
   // connect/query call /configure + /query. Agent SQL still flows through the
@@ -89,15 +98,12 @@
     "STRIPE_WEBHOOK_SECRET": "whsec_placeholder_b1",
     "STRIPE_PRICE_PRO": "price_placeholder_pro",
     "STRIPE_PRICE_ENTERPRISE": "price_placeholder_ent",
-    // PlanetScale per-org managed Postgres catalog. PLACEHOLDERs — replace with the
-    // real service-token id + org slug + cluster size to enable. The token SECRET half
-    // is a Worker secret: `wrangler secret put PLANETSCALE_SERVICE_TOKEN`. Until that
-    // secret is set, getPlanetScaleClient() returns null and /api/cp/catalog 503s
-    // (managed-postgres catalog disabled) — safe to deploy unconfigured.
-    "PLANETSCALE_SERVICE_TOKEN_ID": "bziiutpzar3a",
-    "PLANETSCALE_ORG": "anomalous",
-    "PLANETSCALE_CLUSTER_SIZE": "PS-5",
-    "PLANETSCALE_REGION": "us-east",
+    // Neon per-org managed Postgres catalog. The API key is a Worker secret:
+    // `wrangler secret put NEON_API_KEY`. Until it is set, getNeonClient() returns null and
+    // /api/cp/catalog 503s (managed-postgres catalog disabled) — safe to deploy unconfigured.
+    // NEON_REGION_ID / NEON_PG_VERSION are optional (Neon picks defaults when unset).
+    "NEON_REGION_ID": "aws-us-east-1",
+    "NEON_PG_VERSION": "17",
     // (GATEWAY_INTERNAL_URL removed: the gateway now lives in the waddling-dataplane
     // worker's GatewayDO, reached over the DATAPLANE service binding — see services.)
     // Deployment posture. MUST be "production": the endpoints/:id/provision dev

@@ -50,9 +50,17 @@ UPDATE waddling.agent_session
 -- per-(endpoint,agent) ACL model) can fan out, while same-endpoint key-sharing is
 -- still caught. App logic supersedes the prior session on connect; this index
 -- guarantees correctness under concurrent connects (loser → 409 agent_session_in_use).
-CREATE UNIQUE INDEX IF NOT EXISTS agent_session_one_active_per_agent
-  ON waddling.agent_session (agent_id, endpoint_id)
-  WHERE status = 'active' AND origin = 'agent';
+-- Guarded for re-run safety after 008 renames agent_session.endpoint_id→datalake_id
+-- (the index survives the column rename automatically; this CREATE just no-ops post-rename).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema='waddling' AND table_name='agent_session' AND column_name='endpoint_id') THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS agent_session_one_active_per_agent
+      ON waddling.agent_session (agent_id, endpoint_id)
+      WHERE status = 'active' AND origin = 'agent';
+  END IF;
+END $$;
 
 -- ── 4. Trace enrichment: AAP identity on audit + usage events ──────────────────
 -- Nullable/additive. No FK to Better Auth tables (cross-schema rule, §2). These let

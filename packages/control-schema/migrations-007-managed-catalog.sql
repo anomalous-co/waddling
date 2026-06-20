@@ -36,5 +36,12 @@ CREATE TABLE IF NOT EXISTS waddling.org_catalog (
 -- gets its OWN DuckLake metadata schema inside the org's database so they don't stomp
 -- each other. NULL for legacy / managed-local / byo-postgres endpoints. catalog_mode
 -- gains 'managed-postgres' (the column is free-text, no CHECK to alter).
-ALTER TABLE waddling.endpoint
-  ADD COLUMN IF NOT EXISTS catalog_schema TEXT;          -- DuckLake metadata schema within org_catalog.ps_database
+-- Guarded for re-run safety after 008 renames endpoint→datalake (post-rename the column
+-- already lives on datalake → no-op).
+DO $$
+BEGIN
+  IF to_regclass('waddling.endpoint') IS NOT NULL THEN
+    ALTER TABLE waddling.endpoint
+      ADD COLUMN IF NOT EXISTS catalog_schema TEXT;        -- DuckLake metadata schema within org_catalog.ps_database
+  END IF;
+END $$;

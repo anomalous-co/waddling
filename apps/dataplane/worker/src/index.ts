@@ -26,6 +26,7 @@
 // back out of the host and routes to GatewayDO `gw:<endpointId>`.
 
 import { getSandbox, Sandbox, ContainerProxy } from "@cloudflare/sandbox";
+import { DurableObject } from "cloudflare:workers";
 import { AwsClient } from "aws4fetch";
 import { importJWK, SignJWT, type JWK } from "jose";
 import { createHash } from "node:crypto";
@@ -34,7 +35,13 @@ export { ContainerProxy };
 
 interface Env {
   GATEWAY: DurableObjectNamespace<GatewayDO>;
+  // The per-datalake autoscaling director (plain DO). One instance per datalake id; owns the
+  // gateway replica pool, the load-based scale decision, and the fail-safe snapshot-arming
+  // invariant. It is on the CONTROL path (cheap decisions), never the data path (bytes).
+  GATEWAY_POOL: DurableObjectNamespace<GatewayPoolDO>;
   WORKSPACE: DurableObjectNamespace<WorkspaceSandbox>;
+  // Per-org quackboard: a single-writer governed DuckDB (no lake), one container per org.
+  QUACKBOARD: DurableObjectNamespace<QuackboardDO>;
   R2_ACCESS_KEY_ID: { get(): Promise<string> };
   R2_SECRET_ACCESS_KEY: { get(): Promise<string> };
   R2_ENDPOINT: string;
@@ -48,20 +55,38 @@ interface Env {
 const GW_FWD_PORT = 8080;       // gateway forwarder (proxies non-/ctrl → quack:9500)
 const WS_SIDECAR_PORT = 8080;   // workspace sidecar control port (its own container)
 const GW_DIR = "/opt/gateway";
+// Quackboard: one DO/container per org (single writer); its durable DuckDB lives at a fixed
+// container path, restored from / persisted to R2 at the control-plane-assigned r2Key.
+const quackboardDoId = (orgId: string): string => `qb:${orgId}`.toLowerCase();
+const QB_DB_PATH = "/var/lib/waddling/quackboard.duckdb";
+const QB_LOCAL_QUACK = "quack:localhost:9500"; // the in-container quack server (QUACK_PORT)
 const BOOT_CMD = `node --import tsx ${GW_DIR}/entrypoint.mjs`;
 const WS_SIDECAR_CMD = "node --use-system-ca /opt/workspace/workspace-sidecar.mjs";
 const PRESIGN_TTL_SEC = 3600;   // covers a full session (≤1h); R2 max is 7d. Sessions
                                  // longer than this need a periodic re-/init refresh (a
                                  // production follow-up; the DO holds the creds to do it).
 
-// PER-ENDPOINT gateway addressing. The host is symbolic (never DNS-resolved — the
-// outbound handler short-circuits it into the gateway DO).
-const gatewayDoId = (endpointId: string): string => `gw:${endpointId}`;
-const gatewayHost = (endpointId: string): string => `gw-${endpointId}.internal`;
+// PER-DATALAKE gateway addressing. The host is symbolic (never DNS-resolved — the
+// outbound handler short-circuits it into a gateway replica DO).
+const gatewayHost = (datalakeId: string): string => `gw-${datalakeId}.internal`;
 function endpointFromGatewayHost(host: string): string | null {
   const m = /^gw-(.+)\.internal$/.exec(host);
   return m ? m[1] : null;
 }
+
+// LEGACY static gateway key (one DO per datalake, ran forever). Replaced by the replica
+// pool below; retained only so /gw/teardown-legacy can destroy the abandoned DOs on cutover.
+const legacyGatewayDoId = (datalakeId: string): string => `gw:${datalakeId}`;
+
+// ── gateway pool (autoscaling) ──────────────────────────────────────────────────
+// A datalake's gateway compute is an ephemeral POOL of replica containers, created on
+// demand by load and slept (scaled to zero) when idle. Each replica is a GatewayDO keyed
+// `gwpool:<datalakeId>:<n>`; the per-datalake GatewayPoolDO director owns which n's are live.
+const MAX_REPLICAS = 4;          // hard cap on concurrent replicas per datalake
+const TARGET_CONCURRENCY = 8;    // in-flight queries per replica before spilling to a new one
+const replicaDoId = (datalakeId: string, n: number): string => `gwpool:${datalakeId}:${n}`.toLowerCase();
+const getPool = (env: Env, datalakeId: string): DurableObjectStub<GatewayPoolDO> =>
+  env.GATEWAY_POOL.get(env.GATEWAY_POOL.idFromName(datalakeId));
 
 // DO id + R2 object key for a (workspace, agent). Lowercased (the SDK warns uppercase
 // breaks case-insensitive preview hostnames). Object key is CONSTANT across sessions so
@@ -82,6 +107,10 @@ const workspaceObjectKey = (workspaceId: string, agentId: string): string => `wo
 // quack:443 tunnel). The SDK default would pass only 80/443/DNS, blocking the catalog.
 export class GatewayDO extends Sandbox<Env> {
   enableInternet = true;
+  // Scale-to-zero: an idle gateway replica container sleeps after this window, freeing its
+  // slot. Waking is cold (the /tmp marker + quack_serve process are gone) — ensureGateway
+  // re-boots and the director re-applies the birdshot snapshot before the replica serves.
+  sleepAfter = "5m";
 }
 
 export class WorkspaceSandbox extends Sandbox<Env> {
@@ -99,16 +128,28 @@ export class WorkspaceSandbox extends Sandbox<Env> {
 }).outboundHandlers = {
   toGateway: async (request: Request, env: Env): Promise<Response> => {
     const u = new URL(request.url);
-    const endpointId = endpointFromGatewayHost(u.hostname);
-    if (!endpointId) return new Response(`bad gateway host: ${u.hostname}`, { status: 502 });
-    const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as {
+    const datalakeId = endpointFromGatewayHost(u.hostname);
+    if (!datalakeId) return new Response(`bad gateway host: ${u.hostname}`, { status: 502 });
+    // Ask the director for a replica. It scales under load and GUARANTEES the chosen replica is
+    // armed with the current birdshot snapshot before returning — so a woken/cold gateway can
+    // never serve this query with a stale/empty ACL set (the fail-safe).
+    const pool = getPool(env, datalakeId);
+    const picked = await pool.pickReplica(datalakeId);
+    if (!picked.replicaKey) return new Response(picked.error ?? "no gateway replica", { status: 503 });
+    const gw = getSandbox(env.GATEWAY, picked.replicaKey, { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as {
       containerFetch(url: string, init: RequestInit, port?: number): Promise<Response>;
     };
     const headers: Record<string, string> = {};
     request.headers.forEach((v, k) => { headers[k] = v; });
     const hasBody = request.method !== "GET" && request.method !== "HEAD";
     const body = hasBody ? new Uint8Array(await request.arrayBuffer()) : undefined;
-    return gw.containerFetch(`http://gw${u.pathname}${u.search}`, { method: request.method, headers, body }, GW_FWD_PORT);
+    try {
+      return await gw.containerFetch(`http://gw${u.pathname}${u.search}`, { method: request.method, headers, body }, GW_FWD_PORT);
+    } finally {
+      // Release the in-flight slot. The outbound handler has no ctx for waitUntil; the release
+      // RPC is cheap and does not consume the (already-returned) response body stream.
+      try { await pool.release(picked.replicaKey); } catch { /* best-effort load bookkeeping */ }
+    }
   },
 };
 
@@ -151,6 +192,10 @@ interface GatewayBoot {
     endpoint?: string; keyId?: string; secret?: string; sessionToken?: string;
     region?: string; useSsl?: boolean; urlStyle?: 'path' | 'vhost';
   };
+  // Quackboard: serve the opened database directly (no lake ATTACH). r2Key is informational
+  // here (the DO restores/persists the file); QUACKBOARD + DUCKDB_DATABASE_PATH drive the boot.
+  quackboard?: boolean;
+  r2Key?: string;
 }
 
 /** Translate a GatewayBoot descriptor into the entrypoint's per-process env. Only set keys
@@ -160,6 +205,13 @@ function bootEnvFromConfig(boot?: GatewayBoot): Record<string, string> | undefin
   const env: Record<string, string> = {};
   const set = (k: string, v: unknown) => { if (v !== undefined && v !== null && v !== '') env[k] = String(v); };
   set('GW_SERVER_TOKEN', boot.serverToken);
+  if (boot.quackboard) {
+    // No lake: boot birdshot + serve quack against the restored .duckdb file.
+    env.QUACKBOARD = 'true';
+    env.DUCKDB_DATABASE_PATH = QB_DB_PATH;
+    set('DUCKLAKE_ALIAS', boot.alias);
+    return env;
+  }
   set('DUCKLAKE_CATALOG_DSN', boot.catalogDsn);
   set('DUCKLAKE_CATALOG_FILE', boot.catalogFile);
   set('DUCKLAKE_DATA_PATH', boot.dataPath);
@@ -187,13 +239,16 @@ interface WsHandle {
 }
 
 // ── gateway helpers ────────────────────────────────────────────────────────────
-async function ensureGateway(gw: GatewayHandle, bootEnv?: Record<string, string>): Promise<{ waitedMs: number }> {
+async function ensureGateway(gw: GatewayHandle, bootEnv?: Record<string, string>): Promise<{ waitedMs: number; coldBooted: boolean }> {
   const marker = await withBootRetry(() => gw.exec("test -f /tmp/gw-started && echo yes || echo no"), "gw warmup");
-  if (marker.stdout.trim() !== "yes") {
+  // A slept/woken container loses its /tmp marker AND its loaded birdshot config (the process
+  // is gone), so an absent marker means COLD: the caller MUST re-apply the snapshot before the
+  // replica serves any agent query (fail-safe — never serve with a stale/empty ACL set).
+  const coldBooted = marker.stdout.trim() !== "yes";
+  if (coldBooted) {
     await gw.exec("touch /tmp/gw-started");
-    // bootEnv carries the per-endpoint lake config (catalog DSN, metadata schema, s3 creds).
-    // A HOT gateway is NOT re-bootstrapped — its config is fixed at first boot, so callers
-    // must gw.destroy() to re-apply changed config (e.g. after deploying a new entrypoint).
+    // bootEnv carries the per-datalake lake config (catalog DSN, metadata schema, s3 creds).
+    // A HOT gateway is NOT re-bootstrapped — its config is fixed at first boot.
     await gw.startProcess(BOOT_CMD, { cwd: GW_DIR, env: bootEnv });
   }
   const start = Date.now();
@@ -201,7 +256,7 @@ async function ensureGateway(gw: GatewayHandle, bootEnv?: Record<string, string>
   while (Date.now() - start < 90_000) {
     try {
       const r = await gw.containerFetch("http://gw/healthz", { method: "GET" }, GW_FWD_PORT);
-      if (r.ok) return { waitedMs: Date.now() - start };
+      if (r.ok) return { waitedMs: Date.now() - start, coldBooted };
       lastErr = `healthz ${r.status}`;
     } catch (e) { lastErr = e instanceof Error ? e.message : String(e); }
     await new Promise((res) => setTimeout(res, 1000));
@@ -217,15 +272,403 @@ async function gwFwd(gw: GatewayHandle, path: string, init: RequestInit): Promis
   return { status: r.status, json };
 }
 
-/** Push a birdshot ACL snapshot + RS256 JWKS to a per-endpoint gateway (boots it if cold,
- *  injecting bootEnv as the per-process lake config on a cold boot). */
-async function pushGatewaySnapshot(env: Env, endpointId: string, snapshot: unknown, auth: unknown, lakeCatalog?: string, bootEnv?: Record<string, string>): Promise<{ status: number; json: any }> {
-  const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
-  await ensureGateway(gw, bootEnv);
-  return gwFwd(gw, "/ctrl/snapshot", {
+// ── Quackboard: per-org governed DuckDB (no lake), single writer, R2-durable ─────
+// Same container image + entrypoint as the gateway, but booted with QUACKBOARD=1 so it serves
+// its restored .duckdb file directly (birdshot still loaded + enforcing). enableInternet=true
+// so the container can reach R2:443 to restore/persist the durable file.
+export class QuackboardDO extends Sandbox<Env> {
+  enableInternet = true;
+  sleepAfter = "10m";
+}
+
+interface QbHandle {
+  exec(cmd: string): Promise<{ stdout: string; stderr?: string }>;
+  startProcess(cmd: string, opts?: { cwd?: string; env?: Record<string, string> }): Promise<unknown>;
+  containerFetch(url: string, init: RequestInit, port?: number): Promise<Response>;
+  destroy(): Promise<void>;
+}
+
+const qbSandbox = (env: Env, orgId: string): QbHandle =>
+  getSandbox(env.QUACKBOARD, quackboardDoId(orgId), { sleepAfter: "10m" }) as unknown as QbHandle;
+
+// base64 (utf-8 safe) so arbitrary SQL crosses `exec` with no shell escaping; single-quote
+// for the shell (presigned URLs carry & = ?). base64 output is itself shell-safe.
+const b64 = (s: string): string => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+const shq = (s: string): string => `'${s.replace(/'/g, "'\\''")}'`;
+
+// In-container quack client (the image has @duckdb/node-api, NOT the duckdb CLI). Runs the
+// agent SQL through quack_query against the local server with the JWT as the token, so
+// birdshot authenticates + authorizes. SQL/TOKEN arrive base64 in env (no shell/SQL-literal
+// escaping in the command); the client decodes and doubles quotes for the quack_query literal.
+// Run from /opt/gateway via `node --input-type=module` over stdin (cwd resolves the package).
+const QB_CLIENT_JS = `
+import { DuckDBInstance } from '@duckdb/node-api';
+const dec = (b) => Buffer.from(b || '', 'base64').toString('utf8');
+const sql = dec(process.env.SQL_B64), token = dec(process.env.TOKEN_B64);
+const lit = (s) => s.replace(/'/g, "''");
+const inst = await DuckDBInstance.create(':memory:', { allow_unsigned_extensions: 'true' });
+const con = await inst.connect();
+await con.run('INSTALL quack; LOAD quack;');
+const reader = await con.runAndReadAll("FROM quack_query('${QB_LOCAL_QUACK}', '" + lit(sql) + "', token => '" + lit(token) + "')");
+const objs = reader.getRowObjects();
+const columns = objs.length ? Object.keys(objs[0]) : [];
+const rows = objs.map((o) => columns.map((c) => o[c]));
+process.stdout.write(JSON.stringify({ columns, rows }, (k, v) => typeof v === 'bigint' ? Number(v) : v));
+`;
+
+/** Boot the quackboard container: restore the durable file from R2 (404 ⇒ fresh), start the
+ *  gateway entrypoint with QUACKBOARD=1 (birdshot loaded, no lake, schema bootstrapped on the
+ *  control connection by duck.ts), wait for health. Cold-only startProcess; a hot container is
+ *  reused. The single-writer model means exactly one container per org is correct. */
+async function ensureQuackboard(env: Env, orgId: string, boot: GatewayBoot): Promise<{ coldBooted: boolean }> {
+  const qb = qbSandbox(env, orgId);
+  await withBootRetry(() => qb.exec("echo ready"), `qb warmup ${orgId}`);
+  const marker = await qb.exec("test -f /tmp/qb-started && echo yes || echo no");
+  const coldBooted = marker.stdout.trim() !== "yes";
+  if (coldBooted) {
+    await qb.exec("touch /tmp/qb-started");
+    await qb.exec(`mkdir -p ${QB_DB_PATH.replace(/\/[^/]+$/, "")}`);
+    // Restore the durable file. -f ⇒ curl fails on 404; on any failure clear the path so the
+    // entrypoint opens a fresh DuckDB and bootstraps the schema from scratch.
+    if (boot.r2Key) {
+      const get = await mintPresigned(env, "GET", boot.r2Key);
+      await qb.exec(`curl -fsS -o ${QB_DB_PATH} ${shq(get)} || rm -f ${QB_DB_PATH}`);
+    }
+    await qb.startProcess(BOOT_CMD, { cwd: GW_DIR, env: bootEnvFromConfig(boot) });
+  }
+  const start = Date.now();
+  let lastErr = "";
+  while (Date.now() - start < 90_000) {
+    try {
+      const r = await qb.containerFetch("http://gw/healthz", { method: "GET" }, GW_FWD_PORT);
+      if (r.ok) return { coldBooted };
+      lastErr = `healthz ${r.status}`;
+    } catch (e) { lastErr = e instanceof Error ? e.message : String(e); }
+    await new Promise((res) => setTimeout(res, 1000));
+  }
+  throw new Error(`quackboard not healthy in 90s: ${lastErr}`);
+}
+
+/** Forward a /ctrl/* control-channel call (e.g. the birdshot snapshot push) to the quackboard
+ *  container's forwarder — same mechanism as gwFwd, addressed by orgId. */
+async function qbFwd(env: Env, orgId: string, path: string, init: RequestInit): Promise<{ status: number; json: any }> {
+  const r = await qbSandbox(env, orgId).containerFetch(`http://gw${path}`, init, GW_FWD_PORT);
+  const txt = await r.text();
+  let json: any = txt;
+  try { json = txt ? JSON.parse(txt) : {}; } catch { /* keep raw */ }
+  return { status: r.status, json };
+}
+
+/** Run governed SQL against the in-container quack server AS the agent: the session JWT is the
+ *  quack TOKEN, so birdshot authenticates + authorizes. Uses an in-container duckdb quack_query
+ *  client (the stateless path the prototype proved). Returns {columns, rows, rowCount}. */
+async function qbQuery(env: Env, orgId: string, sql: string, token: string): Promise<{ status: number; json: any }> {
+  const cmd =
+    `cd /opt/gateway && SQL_B64=${b64(sql)} TOKEN_B64=${b64(token)} ` +
+    `sh -c 'echo ${b64(QB_CLIENT_JS)} | base64 -d | node --input-type=module'`;
+  const r = await qbSandbox(env, orgId).exec(cmd);
+  const out = (r.stdout ?? "").trim();
+  try {
+    const j = JSON.parse(out);
+    return { status: 200, json: { columns: j.columns ?? [], rows: j.rows ?? [], rowCount: (j.rows ?? []).length } };
+  } catch {
+    // birdshot denial / SQL error surfaces on stderr (not valid JSON) → structured envelope.
+    return { status: 500, json: { error: "query_failed", reason: (r.stderr ?? out ?? "").trim() } };
+  }
+}
+
+/** Fold the WAL into the file (best-effort CHECKPOINT via the un-gated /ctrl channel) then
+ *  upload it to R2. Bounded-staleness durability: call on a schedule and on disconnect. The
+ *  /ctrl/checkpoint endpoint is a container-side follow-up; if absent, the upload still runs. */
+async function qbPersist(env: Env, orgId: string, r2Key: string): Promise<{ ok: boolean }> {
+  const qb = qbSandbox(env, orgId);
+  try { await qb.containerFetch("http://gw/ctrl/checkpoint", { method: "POST" }, GW_FWD_PORT); }
+  catch { /* ctrl/checkpoint optional until the container exposes it */ }
+  const put = await mintPresigned(env, "PUT", r2Key);
+  const r = await qb.exec(`curl -fsS -X PUT --data-binary @${QB_DB_PATH} ${shq(put)} && echo OK || echo FAIL`);
+  return { ok: /OK\s*$/.test(r.stdout ?? "") };
+}
+
+// End-to-end remote proof of the quackboard data plane: boot → birdshot snapshot → observe
+// (gated write) → recall (gated read) → persist to R2 → force cold boot → restore → recall.
+// Proves container orchestration, the birdshot-gated write+read path, AND the R2 durability
+// round-trip in one verdict. Self-contained (mints its own JWT/JWKS); touches no real org.
+async function qbSelftest(env: Env): Promise<Response> {
+  const orgId = "qb-selftest";
+  const r2Key = `quackboard/${orgId}/quackboard.duckdb`;
+  const boot: GatewayBoot = { serverToken: "srv_qbselftest", alias: "quackboard", quackboard: true, r2Key };
+  const marker = `mk-${crypto.randomUUID()}`;
+  const { auth, jwt } = await mintSelftestAuthAndJwt();
+  const snapshot = {
+    userRoles: [{ userId: `agent:${ST_AGENT}`, role: `agent_${ST_AGENT}` }],
+    roleGrants: [
+      { role: `agent_${ST_AGENT}`, tableRef: "main.observations", action: "read" },
+      { role: `agent_${ST_AGENT}`, tableRef: "main.observations", action: "write" },
+    ],
+  };
+  const pushSnapshot = () => qbFwd(env, orgId, "/ctrl/snapshot", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ snapshot, auth, lakeCatalog: lakeCatalog ?? "memory" }),
+    body: JSON.stringify({ snapshot, auth, lakeCatalog: "quackboard" }),
   });
+  const steps: Record<string, unknown> = {};
+  try {
+    steps.boot1 = await ensureQuackboard(env, orgId, boot);
+    steps.snapshot1 = (await pushSnapshot()).json;
+    steps.observe = (await qbQuery(env, orgId, `INSERT INTO observations(agent_role, content) VALUES ('${ST_AGENT}', '${marker}')`, jwt)).json;
+    steps.recallBefore = (await qbQuery(env, orgId, `SELECT content FROM observations WHERE content = '${marker}'`, jwt)).json;
+    steps.persist = await qbPersist(env, orgId, r2Key);
+    // force a true cold boot: destroy the container so the next ensure restores from R2.
+    try { await qbSandbox(env, orgId).destroy(); } catch { /* already gone */ }
+    steps.boot2 = await ensureQuackboard(env, orgId, boot);
+    steps.snapshot2 = (await pushSnapshot()).json; // a cold gateway lost its in-memory policy
+    const after = (await qbQuery(env, orgId, `SELECT content FROM observations WHERE content = '${marker}'`, jwt)).json;
+    steps.recallAfter = after;
+    const durable = Array.isArray(after?.rows) && after.rows.some((r: unknown[]) => String(r?.[0]) === marker);
+    return Response.json({
+      marker, durable,
+      verdict: durable
+        ? "QUACKBOARD-REMOTE-PASS — gated write+read survived the R2 cold-boot round-trip"
+        : "FAIL — see steps",
+      steps,
+    });
+  } catch (e) {
+    return Response.json({ error: e instanceof Error ? e.message : String(e), steps }, { status: 500 });
+  }
+}
+
+// ── GatewayPoolDO: the per-datalake autoscaling director ─────────────────────────
+// One instance per datalake (keyed by datalake id). Owns the gateway replica pool: it makes
+// the load-based scale decision, guarantees the fail-safe snapshot invariant (a replica NEVER
+// serves an agent query before the CURRENT birdshot snapshot is applied), and reports the
+// runtime status (asleep/running). It stays on the CONTROL path — it decides + arms; the
+// worker forwards the query bytes directly to the chosen replica. The cached snapshot + lake
+// bootEnv are persisted (DO storage, encrypted at rest) so a woken director can re-arm a cold
+// replica without a control-api round-trip.
+
+interface PoolCache {
+  snapshot: unknown;
+  auth: unknown;
+  lakeCatalog?: string;
+  bootEnv?: Record<string, string>;
+}
+interface ReplicaRec { appliedVersion: number; lastActiveAt: number; }
+type ReplicaMap = Record<number, ReplicaRec>;
+
+const POOL_WARM_WINDOW_MS = 4 * 60_000;   // < sleepAfter(5m): touched within this ⇒ certainly awake
+const POOL_IDLE_WINDOW_MS = 6 * 60_000;   // > sleepAfter(5m): no activity within this ⇒ asleep
+const GATEWAY_SLEEP_AFTER = "5m";
+
+function replicaIndexFromKey(replicaKey: string): number {
+  const n = Number(replicaKey.slice(replicaKey.lastIndexOf(":") + 1));
+  return Number.isFinite(n) ? n : 0;
+}
+
+export class GatewayPoolDO extends DurableObject<Env> {
+  // In-memory only (lost on director hibernation — correctly, since a slept director had no
+  // in-flight work): live load + boot dedup per replica index.
+  private inFlight = new Map<number, number>();
+  private booting = new Map<number, Promise<void>>();
+  private datalakeId = "";
+
+  private async meta(): Promise<{ currentVersion: number }> {
+    return (await this.ctx.storage.get<{ currentVersion: number }>("meta")) ?? { currentVersion: 0 };
+  }
+  private async replicas(): Promise<ReplicaMap> {
+    return (await this.ctx.storage.get<ReplicaMap>("replicas")) ?? {};
+  }
+
+  /** Cache the newest snapshot, bump the version, and eagerly (re)arm live replicas so an ACL
+   *  change takes effect immediately on warm replicas (cold ones re-arm lazily on next pick).
+   *  Pre-warms replica 0 — this is the connect-time push, mirroring the old boot-on-snapshot. */
+  async applySnapshot(datalakeId: string, payload: PoolCache): Promise<{ version: number; status: number }> {
+    this.datalakeId = datalakeId;
+    const { currentVersion } = await this.meta();
+    const version = currentVersion + 1;
+    await this.ctx.storage.put("cache", payload);
+    await this.ctx.storage.put("meta", { currentVersion: version });
+
+    const reps = await this.replicas();
+    if (!(0 in reps)) reps[0] = { appliedVersion: 0, lastActiveAt: 0 };
+    await this.ctx.storage.put("replicas", reps);
+
+    // Eager fan-out: replica 0 always (pre-warm); any other recently-live replica too. Failures
+    // are tolerated — a replica that slept resets to appliedVersion 0 and re-arms on next pick.
+    let status = 200;
+    const now = Date.now();
+    for (const k of Object.keys(reps)) {
+      const n = Number(k);
+      const stale = now - reps[n].lastActiveAt > POOL_IDLE_WINDOW_MS;
+      if (n !== 0 && stale) continue; // don't wake idle replicas just to fan out — lazy is correct
+      try { await this.armReplica(n, /*force*/ true); } catch { status = 207; }
+    }
+    return { version, status };
+  }
+
+  /** Pick (or spawn) a replica under load and GUARANTEE it is armed with the current snapshot
+   *  before returning. Increments in-flight; the worker releases after the query. Fail-closed:
+   *  with no cached snapshot there are no ACLs, so we refuse to route (never serve open). */
+  async pickReplica(datalakeId: string): Promise<{ replicaKey?: string; error?: string }> {
+    this.datalakeId = datalakeId;
+    const { currentVersion } = await this.meta();
+    if (currentVersion === 0) return { error: "datalake gateway not configured (no snapshot)" };
+
+    const reps = await this.replicas();
+    const indices = Object.keys(reps).map(Number);
+    const now = Date.now();
+    const loadOf = (i: number) => this.inFlight.get(i) ?? 0;
+    // Selection order keeps warm replicas busy before paying a cold boot:
+    //   1. a WARM replica under target (no cold boot)         ← cheapest
+    //   2. any existing replica under target (wakes a cold slot, reuses its DO)
+    //   3. spawn the next index (scale up) if under the cap
+    //   4. all saturated + capped → least-loaded overall (pile on)
+    let n: number | null = null;
+    let best = Infinity;
+    for (const i of indices) {
+      const load = loadOf(i);
+      const warm = now - reps[i].lastActiveAt < POOL_IDLE_WINDOW_MS;
+      if (warm && load < TARGET_CONCURRENCY && load < best) { best = load; n = i; }
+    }
+    if (n === null) {
+      best = Infinity;
+      for (const i of indices) {
+        const load = loadOf(i);
+        if (load < TARGET_CONCURRENCY && load < best) { best = load; n = i; }
+      }
+    }
+    if (n === null && indices.length < MAX_REPLICAS) {
+      n = indices.length ? Math.max(...indices) + 1 : 0;
+      reps[n] = { appliedVersion: 0, lastActiveAt: 0 };
+      await this.ctx.storage.put("replicas", reps);
+    }
+    if (n === null) {
+      best = Infinity;
+      for (const i of indices) { const load = loadOf(i); if (load < best) { best = load; n = i; } }
+      n = n ?? 0;
+    }
+
+    // Reserve the slot (in-memory load only). Do NOT touch lastActiveAt here — doArm/release own
+    // it, so a slept replica keeps its STALE timestamp and doArm's ensureGateway correctly detects
+    // the cold container and re-applies the snapshot before this query is served (the fail-safe).
+    this.inFlight.set(n, loadOf(n) + 1);
+    try {
+      await this.armReplica(n, /*force*/ false);
+    } catch (e) {
+      this.inFlight.set(n, Math.max(0, loadOf(n) - 1));
+      return { error: `replica ${n} arm failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    return { replicaKey: replicaDoId(this.datalakeId, n) };
+  }
+
+  /** Decrement in-flight after the worker finishes forwarding a query to this replica. */
+  async release(replicaKey: string): Promise<void> {
+    const n = replicaIndexFromKey(replicaKey);
+    this.inFlight.set(n, Math.max(0, (this.inFlight.get(n) ?? 1) - 1));
+    const reps = await this.replicas();
+    if (reps[n]) { reps[n].lastActiveAt = Date.now(); await this.ctx.storage.put("replicas", reps); }
+  }
+
+  /** Runtime status WITHOUT waking any replica: asleep when nothing has been active within the
+   *  idle window (so a sleeping pool reports asleep), running otherwise. */
+  async status(): Promise<{ state: "asleep" | "running" | "unconfigured"; replicas: number; inFlightTotal: number; version: number }> {
+    const { currentVersion } = await this.meta();
+    const reps = await this.replicas();
+    const indices = Object.keys(reps).map(Number);
+    const now = Date.now();
+    let inFlightTotal = 0; for (const v of this.inFlight.values()) inFlightTotal += v;
+    const anyWarm = inFlightTotal > 0 || indices.some((i) => now - reps[i].lastActiveAt < POOL_IDLE_WINDOW_MS);
+    const state = currentVersion === 0 ? "unconfigured" : anyWarm ? "running" : "asleep";
+    return { state, replicas: indices.length, inFlightTotal, version: currentVersion };
+  }
+
+  /** Forward-only birdshot revoke (jti/user/session denylist) to currently-warm replicas. Cold
+   *  replicas have an empty denylist on their next boot, so they are skipped (nothing to revoke). */
+  async revoke(datalakeId: string, args: { kind: string; id: string; reason?: string; expiresUs?: number }): Promise<{ ok: boolean; fanned: number }> {
+    this.datalakeId = datalakeId;
+    return this.fanOut("/ctrl/revoke", JSON.stringify(args));
+  }
+  async drainAudit(datalakeId: string): Promise<{ records: unknown[]; count: number }> {
+    this.datalakeId = datalakeId;
+    const reps = await this.replicas();
+    const now = Date.now();
+    const records: unknown[] = [];
+    for (const k of Object.keys(reps)) {
+      const n = Number(k);
+      if (now - reps[n].lastActiveAt > POOL_IDLE_WINDOW_MS) continue; // cold ⇒ nothing ran ⇒ skip
+      try {
+        const gw = getSandbox(this.env.GATEWAY, replicaDoId(this.datalakeId, n), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
+        const r = await gwFwd(gw, "/ctrl/audit-drain", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+        if (r.json?.records) records.push(...r.json.records);
+      } catch { /* cold/raced — skip */ }
+    }
+    return { records, count: records.length };
+  }
+
+  /** Destroy every replica container for this datalake (hard reset / decommission). */
+  async destroyAll(datalakeId: string): Promise<{ destroyed: number }> {
+    this.datalakeId = datalakeId;
+    const reps = await this.replicas();
+    let destroyed = 0;
+    for (const k of Object.keys(reps)) {
+      try {
+        const gw = getSandbox(this.env.GATEWAY, replicaDoId(this.datalakeId, Number(k))) as unknown as { destroy(): Promise<void> };
+        await gw.destroy(); destroyed++;
+      } catch { /* already gone */ }
+    }
+    await this.ctx.storage.deleteAll();
+    this.inFlight.clear(); this.booting.clear();
+    return { destroyed };
+  }
+
+  private async fanOut(path: string, body: string): Promise<{ ok: boolean; fanned: number }> {
+    const reps = await this.replicas();
+    const now = Date.now();
+    let fanned = 0;
+    for (const k of Object.keys(reps)) {
+      const n = Number(k);
+      if (now - reps[n].lastActiveAt > POOL_IDLE_WINDOW_MS) continue;
+      try {
+        const gw = getSandbox(this.env.GATEWAY, replicaDoId(this.datalakeId, n), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
+        await gwFwd(gw, path, { method: "POST", headers: { "content-type": "application/json" }, body });
+        fanned++;
+      } catch { /* cold/raced — skip */ }
+    }
+    return { ok: true, fanned };
+  }
+
+  /** Guarantee replica n is booted AND carrying the current snapshot. Boot is deduped per index
+   *  (concurrent picks await one boot). Hot path: a replica touched within the warm window whose
+   *  applied version is current is trusted awake — no container round-trip. */
+  private armReplica(n: number, force: boolean): Promise<void> {
+    const existing = this.booting.get(n);
+    if (existing) return existing;
+    const p = this.doArm(n, force).finally(() => this.booting.delete(n));
+    this.booting.set(n, p);
+    return p;
+  }
+
+  private async doArm(n: number, force: boolean): Promise<void> {
+    const { currentVersion } = await this.meta();
+    const reps = await this.replicas();
+    const rec = reps[n] ?? { appliedVersion: 0, lastActiveAt: 0 };
+    const now = Date.now();
+    const certainlyAwake = now - rec.lastActiveAt < POOL_WARM_WINDOW_MS;
+    if (!force && rec.appliedVersion >= currentVersion && certainlyAwake) return; // hot path
+
+    const cache = await this.ctx.storage.get<PoolCache>("cache");
+    if (!cache) throw new Error("no cached snapshot");
+    const gw = getSandbox(this.env.GATEWAY, replicaDoId(this.datalakeId, n), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
+    const { coldBooted } = await ensureGateway(gw, cache.bootEnv);
+    const applied = coldBooted ? 0 : rec.appliedVersion; // a cold container lost its loaded config
+    if (applied < currentVersion) {
+      const r = await gwFwd(gw, "/ctrl/snapshot", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ snapshot: cache.snapshot, auth: cache.auth, lakeCatalog: cache.lakeCatalog ?? "memory" }),
+      });
+      if (r.status >= 300) throw new Error(`/ctrl/snapshot ${r.status}: ${JSON.stringify(r.json)}`);
+    }
+    reps[n] = { appliedVersion: currentVersion, lastActiveAt: now };
+    await this.ctx.storage.put("replicas", reps);
+  }
 }
 
 // ── presigned R2 (Model B; aws4fetch — from ws-probe) ──────────────────────────
@@ -326,60 +769,52 @@ async function route(request: Request, env: Env): Promise<Response> {
   const path = url.pathname;
   const body: any = request.method === "POST" ? await request.json().catch(() => ({})) : {};
 
-  // ── gateway control plane (control-api gateway-client) ─────────────────────────
+  // ── gateway control plane (control-api gateway-client) → the per-datalake pool ──
   if (path === "/gw/snapshot" && request.method === "POST") {
     const { endpointId, snapshot, auth, lakeCatalog, gatewayBoot } = body;
     if (!endpointId || !snapshot) return Response.json({ error: "missing endpointId/snapshot" }, { status: 400 });
-    const r = await pushGatewaySnapshot(env, endpointId, snapshot, auth, lakeCatalog, bootEnvFromConfig(gatewayBoot as GatewayBoot | undefined));
-    return Response.json(r.json, { status: r.status });
+    const r = await getPool(env, endpointId).applySnapshot(endpointId, {
+      snapshot, auth, lakeCatalog, bootEnv: bootEnvFromConfig(gatewayBoot as GatewayBoot | undefined),
+    });
+    return Response.json({ ok: true, version: r.version }, { status: r.status });
   }
   if (path === "/gw/status") {
     const endpointId = url.searchParams.get("endpointId");
     if (!endpointId) return Response.json({ error: "missing endpointId" }, { status: 400 });
-    const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
-    const r = await gwFwd(gw, "/ctrl/status", { method: "GET" });
-    return Response.json(r.json, { status: r.status });
+    // Derived from director state — does NOT wake a sleeping pool (scale-to-zero stays at zero).
+    const r = await getPool(env, endpointId).status();
+    return Response.json(r, { status: 200 });
   }
   if (path === "/gw/audit-drain" && request.method === "POST") {
-    // Drain the per-endpoint gateway's birdshot audit log → authorize/authenticate
-    // records for quack-path queries (control-api persists them as audit rows). We do
-    // NOT boot a cold gateway: if it died, nothing has run since, so there is nothing
-    // to drain → empty.
+    // Drain birdshot audit records from the datalake's WARM replicas (cold ones ran nothing).
     const { endpointId } = body;
     if (!endpointId) return Response.json({ error: "missing endpointId" }, { status: 400 });
-    const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
-    try {
-      const r = await gwFwd(gw, "/ctrl/audit-drain", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "{}",
-      });
-      return Response.json(r.json, { status: r.status });
-    } catch {
-      return Response.json({ records: [], count: 0, note: "gateway cold — nothing to drain" });
-    }
+    const r = await getPool(env, endpointId).drainAudit(endpointId);
+    return Response.json(r, { status: 200 });
   }
   if (path === "/gw/revoke" && request.method === "POST") {
-    // Forward-only jti/user/session denylist on the PER-ENDPOINT gateway. The denylist
-    // is in-memory on the gateway's trusted control connection, so we forward to the
-    // live container. A COLD gateway has no live sessions (and an empty denylist on its
-    // next boot), so a forward failure = nothing to revoke → no-op ok. We do NOT boot a
-    // cold gateway just to revoke.
+    // Forward-only jti/user/session denylist, fanned to the datalake's WARM replicas. The
+    // denylist is in-memory per replica; a cold replica has an empty denylist on its next boot,
+    // so it is skipped (nothing to revoke there). We do NOT wake sleeping replicas to revoke.
     const { endpointId, kind, id, reason, expiresUs } = body;
     if (!endpointId || !kind || !id) {
       return Response.json({ error: "missing endpointId/kind/id" }, { status: 400 });
     }
-    const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
+    const r = await getPool(env, endpointId).revoke(endpointId, { kind, id, reason, expiresUs });
+    return Response.json(r, { status: 200 });
+  }
+  // Cutover teardown — destroy a datalake's replica pool (and the abandoned LEGACY static
+  // gw:<id> DO from before pooling). Used once to "kill the current gateways".
+  if (path === "/gw/teardown-legacy" && request.method === "POST") {
+    const { endpointId } = body;
+    if (!endpointId) return Response.json({ error: "missing endpointId" }, { status: 400 });
+    let legacy = false;
     try {
-      const r = await gwFwd(gw, "/ctrl/revoke", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ kind, id, reason, expiresUs }),
-      });
-      return Response.json(r.json, { status: r.status });
-    } catch {
-      return Response.json({ ok: true, note: "gateway cold — no live session to revoke" });
-    }
+      await (getSandbox(env.GATEWAY, legacyGatewayDoId(endpointId)) as unknown as { destroy(): Promise<void> }).destroy();
+      legacy = true;
+    } catch { /* already gone / never booted */ }
+    const r = await getPool(env, endpointId).destroyAll(endpointId);
+    return Response.json({ ok: true, legacyDestroyed: legacy, ...r }, { status: 200 });
   }
 
   // ── workspace lifecycle (control-api configure; mcp-external query/run) ─────────
@@ -414,6 +849,34 @@ async function route(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true, shutdown });
   }
 
+  // ── quackboard lifecycle (control-api) ──────────────────────────────────────────
+  if (path === "/qb/selftest") return qbSelftest(env);
+  if (path === "/qb/configure" && request.method === "POST") {
+    const { orgId, gatewayBoot, snapshot } = body;
+    if (!orgId || !gatewayBoot) return Response.json({ error: "missing orgId/gatewayBoot" }, { status: 400 });
+    const out = await ensureQuackboard(env, orgId, gatewayBoot as GatewayBoot);
+    // Push the birdshot snapshot (per-agent grants over the quackboard tables) so queries are
+    // authorized. Without it birdshot denies — same fail-safe as the lake gateway.
+    let snap: any = null;
+    if (snapshot) {
+      snap = (await qbFwd(env, orgId, "/ctrl/snapshot", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(snapshot),
+      })).json;
+    }
+    return Response.json({ ok: true, ...out, snapshot: snap });
+  }
+  if (path === "/qb/query" && request.method === "POST") {
+    const { orgId, sql, lakeToken } = body;
+    if (!orgId || !sql || !lakeToken) return Response.json({ error: "missing orgId/sql/lakeToken" }, { status: 400 });
+    const r = await qbQuery(env, orgId, sql, lakeToken);
+    return Response.json(r.json, { status: r.status });
+  }
+  if (path === "/qb/persist" && request.method === "POST") {
+    const { orgId, r2Key } = body;
+    if (!orgId || !r2Key) return Response.json({ error: "missing orgId/r2Key" }, { status: 400 });
+    return Response.json(await qbPersist(env, orgId, r2Key));
+  }
+
   if (path === "/r2probe") {
     // Does the dataplane's R2 S3 cred reach an arbitrary (per-org) bucket, or only
     // R2_BUCKET? Presigned PUT + GET a tiny object against ?bucket=. Determines whether
@@ -434,13 +897,14 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  // Trusted data load: boot the per-endpoint gateway with its REAL lake config, then have
-  // it index HN stories into the lake (trusted connection → parquet to R2). Agents only
-  // READ the result through the birdshot-gated quack path.
+  // Trusted data load: boot the datalake's gateway (replica 0) with its REAL lake config, then
+  // have it index HN stories into the lake (trusted connection → parquet to R2). Agents only
+  // READ the result through the birdshot-gated quack path. This is a trusted seed op, so it
+  // boots the replica directly (it does not need a birdshot snapshot to load data).
   if (path === "/lakeload" && request.method === "POST") {
     const { endpointId, gatewayBoot, days, limit } = body;
     if (!endpointId || !gatewayBoot) return Response.json({ error: "missing endpointId/gatewayBoot" }, { status: 400 });
-    const gw = getSandbox(env.GATEWAY, gatewayDoId(endpointId)) as unknown as GatewayHandle;
+    const gw = getSandbox(env.GATEWAY, replicaDoId(endpointId, 0), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
     await ensureGateway(gw, bootEnvFromConfig(gatewayBoot as GatewayBoot));
     const r = await gwFwd(gw, "/ctrl/load-hn", {
       method: "POST", headers: { "content-type": "application/json" },
@@ -531,7 +995,7 @@ async function main() {
 main().catch(e => console.log('LAKEPROBE_RESULT:' + JSON.stringify({ error: String((e && e.message) || e) })));
 `.replace("${JSON_DSN}", () => JSON.stringify(dsn));
 
-  const gw = getSandbox(env.GATEWAY, gatewayDoId("lake-probe")) as unknown as GatewayHandle & {
+  const gw = getSandbox(env.GATEWAY, legacyGatewayDoId("lake-probe")) as unknown as GatewayHandle & {
     destroy(): Promise<void>;
   };
   try {
@@ -574,7 +1038,7 @@ async function gwEgressProbe(env: Env, url: URL): Promise<Response> {
       { status: 400 },
     );
   }
-  const gw = getSandbox(env.GATEWAY, gatewayDoId("egress-probe")) as unknown as GatewayHandle & {
+  const gw = getSandbox(env.GATEWAY, legacyGatewayDoId("egress-probe")) as unknown as GatewayHandle & {
     destroy(): Promise<void>;
   };
   try {
@@ -662,8 +1126,8 @@ async function selftest(env: Env, url: URL): Promise<Response> {
         userRoles: [{ userId: `agent:${ST_AGENT}`, role: `agent_${ST_AGENT}` }],
         roleGrants: [{ role: `agent_${ST_AGENT}`, tableRef: "main.orders", action: "read" }],
       };
-      const push = await pushGatewaySnapshot(env, ST_ENDPOINT, snapshot, auth, "memory");
-      const status = await gwFwd(getSandbox(env.GATEWAY, gatewayDoId(ST_ENDPOINT)) as unknown as GatewayHandle, "/ctrl/status", { method: "GET" });
+      const push = await getPool(env, ST_ENDPOINT).applySnapshot(ST_ENDPOINT, { snapshot, auth, lakeCatalog: "memory" });
+      const status = await gwFwd(getSandbox(env.GATEWAY, replicaDoId(ST_ENDPOINT, 0), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle, "/ctrl/status", { method: "GET" });
       const mode = status.json?.birdshot?.mode ?? "unknown";
 
       // Configure the workspace (boot, egress, restore-from-R2, ATTACH lake quack).
@@ -688,7 +1152,7 @@ async function selftest(env: Env, url: URL): Promise<Response> {
       const step1Ok = mode === "rs256" && cfg.lakeAttached && allowedRows && deniedByAuthz && s3Blocked && httpBlocked && snap.json?.ok === true;
       return Response.json({
         step: 1, ok: step1Ok,
-        birdshotMode: mode, snapshotPush: push.json, lakeAttached: cfg.lakeAttached,
+        birdshotMode: mode, snapshotPush: push, lakeAttached: cfg.lakeAttached,
         allowedRowCount: allowed.json?.rows?.length ?? 0, deniedByAuthz, deniedError: denied.json?.error ?? null,
         s3Blocked, httpBlocked, workspaceSnapshot: snap.json,
         next: "GET /selftest?step=2 (cold reconnect → workspace durability)",
@@ -707,7 +1171,7 @@ async function selftest(env: Env, url: URL): Promise<Response> {
       userRoles: [{ userId: `agent:${ST_AGENT}`, role: `agent_${ST_AGENT}` }],
       roleGrants: [{ role: `agent_${ST_AGENT}`, tableRef: "main.orders", action: "read" }],
     };
-    await pushGatewaySnapshot(env, ST_ENDPOINT, snapshot, auth, "memory");
+    await getPool(env, ST_ENDPOINT).applySnapshot(ST_ENDPOINT, { snapshot, auth, lakeCatalog: "memory" });
     const cfg = await configureWorkspace(env, { workspaceId: ST_WS, agentId: ST_AGENT, endpointId: ST_ENDPOINT, workspaceKey: ST_KEY, lakeToken: jwt, disableSsl: false });
     const read = await wsSidecar(ws, "/query", { sql: "SELECT v FROM keep" });
     const durable = read.status === 200 && Number(read.json?.rows?.[0]?.[0]) === 7;

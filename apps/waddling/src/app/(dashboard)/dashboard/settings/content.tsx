@@ -3,22 +3,71 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import {
+  RefreshCw,
+  UserPlus,
+  KeyRound,
+  Copy,
+  Check,
+  Trash2,
+  Loader2,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import {
   Card,
   CardHeader,
-  Badge,
-  Button,
-  Spinner,
-  ErrorState,
-  SectionTitle,
+  CardTitle,
+  CardDescription,
+  CardAction,
+  CardContent,
+} from '@/components/ui/card';
+import {
   Table,
-  Td,
-  Input,
-  Label,
-  Modal,
-  CodeBlock,
-} from '@/components/dashboard/ui';
-import { fetchCp, cpPost } from '@/components/dashboard/fetch';
+  TableHeader,
+  TableRow,
+  TableHead,
+  TableBody,
+  TableCell,
+} from '@/components/ui/table';
+import {
+  Tabs,
+  TabsList,
+  TabsTrigger,
+  TabsContent,
+} from '@/components/ui/tabs';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+} from '@/components/ui/select';
+import { Field, FieldLabel, FieldGroup, FieldError } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
+import { Separator } from '@/components/ui/separator';
+import {
+  Empty,
+  EmptyHeader,
+  EmptyTitle,
+  EmptyDescription,
+} from '@/components/ui/empty';
+import { fetchCp, cpPost, cpDelete } from '@/components/dashboard/fetch';
 import { authClient } from '@/lib/auth-client';
+import { cn } from '@/lib/utils';
+
+// ── Local types (mirrors the /api/cp/settings contract) ───────────────────────
 
 interface OrgInfo {
   id: string;
@@ -52,13 +101,48 @@ interface SettingsData {
   apiKeys: ApiKeyRow[];
 }
 
-function InviteMemberModal({
+// ── Role badge ─────────────────────────────────────────────────────────────────
+
+const ROLE_CLASS: Record<string, string> = {
+  owner:
+    'border-transparent bg-blue-500/15 text-blue-700 dark:text-blue-400',
+  admin:
+    'border-transparent bg-amber-500/15 text-amber-700 dark:text-amber-500',
+  member:
+    'border-transparent bg-muted text-muted-foreground',
+};
+
+function RoleBadge({ role }: { role: string }) {
+  return (
+    <Badge className={cn('font-medium capitalize', ROLE_CLASS[role] ?? ROLE_CLASS.member)}>
+      {role}
+    </Badge>
+  );
+}
+
+// ── Skeleton ───────────────────────────────────────────────────────────────────
+
+function SettingsSkeleton() {
+  return (
+    <div className="flex flex-col gap-6">
+      <Skeleton className="h-8 w-48" />
+      <Skeleton className="h-10 w-72" />
+      <Skeleton className="h-40 w-full" />
+      <Skeleton className="h-64 w-full" />
+      <Skeleton className="h-48 w-full" />
+    </div>
+  );
+}
+
+// ── Invite member dialog ───────────────────────────────────────────────────────
+
+function InviteMemberDialog({
   open,
-  onClose,
+  onOpenChange,
   orgId,
 }: {
   open: boolean;
-  onClose: () => void;
+  onOpenChange: (v: boolean) => void;
   orgId: string;
 }) {
   const [email, setEmail] = useState('');
@@ -66,6 +150,18 @@ function InviteMemberModal({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sent, setSent] = useState(false);
+
+  const reset = () => {
+    setEmail('');
+    setRole('member');
+    setError(null);
+    setSent(false);
+  };
+
+  const handleOpenChange = (v: boolean) => {
+    if (!v) reset();
+    onOpenChange(v);
+  };
 
   const submit = async () => {
     if (!email.trim()) {
@@ -88,75 +184,95 @@ function InviteMemberModal({
   };
 
   return (
-    <Modal title="Invite member" open={open} onClose={onClose}>
-      {sent ? (
-        <div className="space-y-3">
-          <p className="text-sm text-green-300">
-            Invitation sent to <strong>{email}</strong>.
-          </p>
-          <Button variant="secondary" onClick={onClose}>
-            Close
-          </Button>
-        </div>
-      ) : (
-        <div className="space-y-3">
-          <div>
-            <Label htmlFor="inv-email">Email</Label>
-            <Input
-              id="inv-email"
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="user@example.com"
-            />
-          </div>
-          <div>
-            <Label htmlFor="inv-role">Role</Label>
-            <select
-              id="inv-role"
-              value={role}
-              onChange={(e) => setRole(e.target.value as 'admin' | 'member')}
-              className="block w-full rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-sm text-neutral-100 focus:border-blue-500 focus:outline-none"
-            >
-              <option value="member">member</option>
-              <option value="admin">admin</option>
-            </select>
-          </div>
-          {error && <p className="text-xs text-red-400">{error}</p>}
-          <div className="flex gap-2">
-            <Button
-              variant="primary"
-              onClick={() => void submit()}
-              loading={loading}
-            >
-              Send invite
-            </Button>
-            <Button variant="ghost" onClick={onClose}>
-              Cancel
-            </Button>
-          </div>
-        </div>
-      )}
-    </Modal>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Invite member</DialogTitle>
+        </DialogHeader>
+        {sent ? (
+          <>
+            <p className="text-sm text-muted-foreground">
+              Invitation sent to <strong className="text-foreground">{email}</strong>.
+            </p>
+            <DialogFooter showCloseButton>
+            </DialogFooter>
+          </>
+        ) : (
+          <>
+            <FieldGroup>
+              <Field>
+                <FieldLabel htmlFor="inv-email">Email</FieldLabel>
+                <Input
+                  id="inv-email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="user@example.com"
+                />
+                {error ? <FieldError>{error}</FieldError> : null}
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="inv-role">Role</FieldLabel>
+                <Select
+                  value={role}
+                  onValueChange={(v) => setRole(v as 'admin' | 'member')}
+                >
+                  <SelectTrigger id="inv-role" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="member">Member</SelectItem>
+                      <SelectItem value="admin">Admin</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </Field>
+            </FieldGroup>
+            <DialogFooter>
+              <Button
+                variant="default"
+                onClick={() => void submit()}
+                disabled={loading}
+              >
+                {loading ? 'Sending…' : 'Send invite'}
+              </Button>
+            </DialogFooter>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
-function CreateApiKeyModal({
+// ── Create API key dialog ──────────────────────────────────────────────────────
+
+function CreateApiKeyDialog({
   open,
-  onClose,
+  onOpenChange,
   onCreated,
 }: {
   open: boolean;
-  onClose: () => void;
+  onOpenChange: (v: boolean) => void;
   onCreated: (key: ApiKeyRow, rawKey: string) => void;
 }) {
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const reset = () => {
+    setName('');
+    setError(null);
+  };
+
+  const handleOpenChange = (v: boolean) => {
+    if (!v) reset();
+    onOpenChange(v);
+  };
+
   const submit = async () => {
     if (!name.trim()) {
-      setError('Name required');
+      setError('Name is required');
       return;
     }
     setLoading(true);
@@ -171,83 +287,131 @@ function CreateApiKeyModal({
       return;
     }
     onCreated(res.data.agent as unknown as ApiKeyRow, res.data.key ?? '');
-    onClose();
+    handleOpenChange(false);
   };
 
   return (
-    <Modal title="Create API key" open={open} onClose={onClose}>
-      <div className="space-y-3">
-        <div>
-          <Label htmlFor="key-name">Key name / agent name</Label>
-          <Input
-            id="key-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="nightly-etl"
-          />
-        </div>
-        {error && <p className="text-xs text-red-400">{error}</p>}
-        <div className="flex gap-2">
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Create API key</DialogTitle>
+        </DialogHeader>
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="key-name">Key name / agent name</FieldLabel>
+            <Input
+              id="key-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="nightly-etl"
+            />
+            {error ? <FieldError>{error}</FieldError> : null}
+          </Field>
+        </FieldGroup>
+        <DialogFooter>
           <Button
-            variant="primary"
+            variant="default"
             onClick={() => void submit()}
-            loading={loading}
+            disabled={loading}
           >
-            Create
+            {loading ? 'Creating…' : 'Create'}
           </Button>
-          <Button variant="ghost" onClick={onClose}>
-            Cancel
-          </Button>
-        </div>
-      </div>
-    </Modal>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
-function RevealKeyModal({
+// ── Reveal key dialog (show once) ─────────────────────────────────────────────
+
+function RevealKeyDialog({
   open,
-  onClose,
+  onOpenChange,
   keyName,
   rawKey,
 }: {
   open: boolean;
-  onClose: () => void;
+  onOpenChange: (v: boolean) => void;
   keyName: string;
   rawKey: string;
 }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    await navigator.clipboard.writeText(rawKey);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   return (
-    <Modal title="API key — copy now" open={open} onClose={onClose}>
-      <p className="text-xs text-yellow-300 mb-3">
-        This key is shown exactly once and cannot be retrieved again.
-      </p>
-      <p className="text-xs text-neutral-500 mb-1">
-        Key: <span className="text-neutral-300">{keyName}</span>
-      </p>
-      <CodeBlock code={rawKey} />
-      <div className="mt-4">
-        <Button variant="primary" onClick={onClose}>
-          Done — I have copied the key
-        </Button>
-      </div>
-    </Modal>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>API key — copy now</DialogTitle>
+        </DialogHeader>
+        <Alert variant="destructive">
+          <AlertTitle>This key is shown exactly once</AlertTitle>
+          <AlertDescription>
+            It cannot be retrieved again after closing this dialog.
+          </AlertDescription>
+        </Alert>
+        <p className="text-xs text-muted-foreground">
+          Key: <span className="text-foreground">{keyName}</span>
+        </p>
+        <div className="flex items-center gap-2 rounded-lg border bg-muted px-3 py-2">
+          <code className="flex-1 overflow-x-auto font-mono text-xs break-all">
+            {rawKey}
+          </code>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => void copy()}
+            aria-label="Copy API key"
+          >
+            {copied ? (
+              <Check className="size-4" />
+            ) : (
+              <Copy className="size-4" />
+            )}
+          </Button>
+        </div>
+        <DialogFooter>
+          <Button variant="default" onClick={() => onOpenChange(false)}>
+            Done — I have copied the key
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
-function CreateOrgModal({
+// ── Create org dialog ──────────────────────────────────────────────────────────
+
+function CreateOrgDialog({
   open,
-  onClose,
+  onOpenChange,
 }: {
   open: boolean;
-  onClose: () => void;
+  onOpenChange: (v: boolean) => void;
 }) {
   const router = useRouter();
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const reset = () => {
+    setName('');
+    setError(null);
+  };
+
+  const handleOpenChange = (v: boolean) => {
+    if (!v) reset();
+    onOpenChange(v);
+  };
+
   const submit = async () => {
     if (!name.trim()) {
-      setError('Name required');
+      setError('Name is required');
       return;
     }
     setLoading(true);
@@ -259,54 +423,322 @@ function CreateOrgModal({
       setError(res.error.message ?? 'Failed to create org');
       return;
     }
-    onClose();
+    handleOpenChange(false);
     router.refresh();
   };
 
   return (
-    <Modal title="Create organization" open={open} onClose={onClose}>
-      <div className="space-y-3">
-        <div>
-          <Label htmlFor="org-name">Organization name</Label>
-          <Input
-            id="org-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Acme Corp"
-          />
-        </div>
-        {error && <p className="text-xs text-red-400">{error}</p>}
-        <div className="flex gap-2">
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Create organization</DialogTitle>
+        </DialogHeader>
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="org-name">Organization name</FieldLabel>
+            <Input
+              id="org-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Acme Corp"
+            />
+            {error ? <FieldError>{error}</FieldError> : null}
+          </Field>
+        </FieldGroup>
+        <DialogFooter>
           <Button
-            variant="primary"
+            variant="default"
             onClick={() => void submit()}
-            loading={loading}
+            disabled={loading}
           >
-            Create org
+            {loading ? 'Creating…' : 'Create org'}
           </Button>
-          <Button variant="ghost" onClick={onClose}>
-            Cancel
-          </Button>
-        </div>
-      </div>
-    </Modal>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
+
+// ── Organization tab ───────────────────────────────────────────────────────────
+
+function OrgRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-4 py-2">
+      <span className="text-sm text-muted-foreground">{label}</span>
+      <span className="text-sm">{children}</span>
+    </div>
+  );
+}
+
+function OrganizationTab({
+  org,
+  onCreateOrg,
+}: {
+  org: OrgInfo;
+  onCreateOrg: () => void;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Organization</CardTitle>
+        <CardDescription>Your active organization details.</CardDescription>
+        <CardAction>
+          <Button variant="outline" size="sm" onClick={onCreateOrg}>
+            <span>New org</span>
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <div className="flex flex-col">
+          <OrgRow label="Name">{org.name}</OrgRow>
+          <Separator />
+          <OrgRow label="Slug">
+            <code className="font-mono text-xs text-muted-foreground">
+              {org.slug}
+            </code>
+          </OrgRow>
+          <Separator />
+          <OrgRow label="ID">
+            <code className="font-mono text-xs text-muted-foreground">
+              {org.id}
+            </code>
+          </OrgRow>
+          <Separator />
+          <OrgRow label="Created">
+            {new Date(org.createdAt).toLocaleDateString()}
+          </OrgRow>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Members tab ────────────────────────────────────────────────────────────────
+
+function MembersTab({
+  members,
+  onInvite,
+}: {
+  members: MemberRow[];
+  onInvite: () => void;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Members</CardTitle>
+        <CardDescription>{members.length} member{members.length === 1 ? '' : 's'}</CardDescription>
+        <CardAction>
+          <Button size="sm" onClick={onInvite}>
+            <UserPlus data-icon="inline-start" />
+            Invite member
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        {members.length === 0 ? (
+          <Empty>
+            <EmptyHeader>
+              <EmptyTitle>No members yet</EmptyTitle>
+              <EmptyDescription>
+                Invite a team member to collaborate on this organization.
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Email</TableHead>
+                <TableHead>Role</TableHead>
+                <TableHead>Joined</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {members.map((m) => (
+                <TableRow key={m.id}>
+                  <TableCell>{m.name}</TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {m.email}
+                  </TableCell>
+                  <TableCell>
+                    <RoleBadge role={m.role} />
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {new Date(m.joinedAt).toLocaleDateString()}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── API keys tab ───────────────────────────────────────────────────────────────
+
+function ApiKeysTab({
+  apiKeys,
+  onCreateKey,
+  onRevoked,
+}: {
+  apiKeys: ApiKeyRow[];
+  onCreateKey: () => void;
+  onRevoked: () => void;
+}) {
+  const [revoking, setRevoking] = useState<ApiKeyRow | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const revoke = async () => {
+    if (!revoking?.agentId) return;
+    setBusy(true);
+    // Each key is 1:1 with an agent; revoking the agent revokes the key on the
+    // gateway (birdshot denylist) and kills its live sessions.
+    const res = await cpDelete<{ ok: boolean }>(
+      `/api/cp/agents/${revoking.agentId}`,
+    );
+    setBusy(false);
+    if (!res.ok) {
+      toast.error(res.error ?? 'Could not revoke key');
+      return;
+    }
+    toast.success('API key revoked');
+    setRevoking(null);
+    onRevoked();
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>API keys</CardTitle>
+        <CardDescription>Agent API keys for programmatic access via MCP.</CardDescription>
+        <CardAction>
+          <Button size="sm" onClick={onCreateKey}>
+            <KeyRound data-icon="inline-start" />
+            Create key
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        {apiKeys.length === 0 ? (
+          <Empty>
+            <EmptyHeader>
+              <EmptyTitle>No API keys yet</EmptyTitle>
+              <EmptyDescription>
+                Create an API key to grant an agent programmatic access.
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Prefix</TableHead>
+                <TableHead>Agent ID</TableHead>
+                <TableHead>Created</TableHead>
+                <TableHead>Last used</TableHead>
+                <TableHead className="text-right">
+                  <span className="sr-only">Actions</span>
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {apiKeys.map((k) => (
+                <TableRow key={k.id}>
+                  <TableCell>{k.name}</TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {k.prefix}…
+                  </TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {k.agentId ? k.agentId : '—'}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {new Date(k.createdAt).toLocaleDateString()}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {k.lastUsedAt
+                      ? new Date(k.lastUsedAt).toLocaleString()
+                      : 'Never'}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-destructive hover:text-destructive"
+                      onClick={() => setRevoking(k)}
+                      disabled={!k.agentId}
+                    >
+                      <Trash2 data-icon="inline-start" />
+                      Revoke
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+
+      <Dialog
+        open={!!revoking}
+        onOpenChange={(o) => {
+          if (!o) setRevoking(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Revoke API key</DialogTitle>
+            <DialogDescription>
+              This immediately revokes the agent
+              {revoking ? ` “${revoking.name}”` : ''} and kills its live
+              sessions. The key cannot be restored.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setRevoking(null)}
+              disabled={busy}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void revoke()}
+              disabled={busy}
+            >
+              {busy ? (
+                <Loader2 data-icon="inline-start" className="animate-spin" />
+              ) : null}
+              Revoke key
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </Card>
+  );
+}
+
+// ── Root export ────────────────────────────────────────────────────────────────
 
 export function SettingsContent() {
   const searchParams = useSearchParams();
   const [data, setData] = useState<SettingsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Dialog open states — all at root so they survive tab switches
   const [inviteOpen, setInviteOpen] = useState(false);
   const [createKeyOpen, setCreateKeyOpen] = useState(false);
   const [createOrgOpen, setCreateOrgOpen] = useState(
     searchParams.get('create') === 'org',
   );
-  const [revealKey, setRevealKey] = useState<{
-    name: string;
-    key: string;
-  } | null>(null);
+  const [revealKey, setRevealKey] = useState<{ name: string; key: string } | null>(
+    null,
+  );
 
   const load = useCallback(async () => {
     const res = await fetchCp<SettingsData>('/api/cp/settings');
@@ -314,6 +746,7 @@ export function SettingsContent() {
       setError(res.error);
     } else {
       setData(res.data);
+      setError(null);
     }
     setLoading(false);
   }, []);
@@ -322,169 +755,103 @@ export function SettingsContent() {
     void load();
   }, [load]);
 
-  if (loading)
+  if (loading) return <SettingsSkeleton />;
+
+  if (error) {
     return (
-      <div className="flex justify-center py-24">
-        <Spinner size="lg" />
-      </div>
+      <Alert variant="destructive">
+        <AlertTitle>Couldn't load settings</AlertTitle>
+        <AlertDescription className="flex flex-col items-start gap-3">
+          {error}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setLoading(true);
+              void load();
+            }}
+          >
+            <RefreshCw data-icon="inline-start" />
+            Retry
+          </Button>
+        </AlertDescription>
+      </Alert>
     );
-  if (error) return <ErrorState message={error} retry={() => { setLoading(true); void load(); }} />;
+  }
+
   if (!data) return null;
 
+  const handleKeyCreated = (apiKey: ApiKeyRow, rawKey: string) => {
+    setData((prev) =>
+      prev ? { ...prev, apiKeys: [...prev.apiKeys, apiKey] } : prev,
+    );
+    if (rawKey) setRevealKey({ name: apiKey.name, key: rawKey });
+  };
+
   return (
-    <div className="space-y-6">
-      <SectionTitle>Settings</SectionTitle>
-
-      {/* Org info */}
-      <Card>
-        <CardHeader
-          title="Organization"
-          action={
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setCreateOrgOpen(true)}
-            >
-              + New org
-            </Button>
-          }
-        />
-        <div className="space-y-2">
-          <Row label="Name">{data.org.name}</Row>
-          <Row label="Slug">
-            <code className="font-mono text-xs text-neutral-300">{data.org.slug}</code>
-          </Row>
-          <Row label="ID">
-            <code className="font-mono text-xs text-neutral-400">{data.org.id}</code>
-          </Row>
-          <Row label="Created">
-            {new Date(data.org.createdAt).toLocaleDateString()}
-          </Row>
+    <>
+      <div className="flex flex-col gap-6">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+          <p className="text-sm text-muted-foreground">
+            Manage your organization, members, and API keys.
+          </p>
         </div>
-      </Card>
 
-      {/* Members */}
-      <Card>
-        <CardHeader
-          title="Members"
-          subtitle={`${data.members.length} members`}
-          action={
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => setInviteOpen(true)}
-            >
-              Invite member
-            </Button>
-          }
-        />
-        <Table headers={['Name', 'Email', 'Role', 'Joined']}>
-          {data.members.map((m) => (
-            <tr key={m.id}>
-              <Td>{m.name}</Td>
-              <Td mono>{m.email}</Td>
-              <Td>
-                <Badge
-                  variant={
-                    m.role === 'owner'
-                      ? 'blue'
-                      : m.role === 'admin'
-                        ? 'yellow'
-                        : 'neutral'
-                  }
-                >
-                  {m.role}
-                </Badge>
-              </Td>
-              <Td>{new Date(m.joinedAt).toLocaleDateString()}</Td>
-            </tr>
-          ))}
-        </Table>
-      </Card>
+        <Tabs defaultValue="organization">
+          <TabsList>
+            <TabsTrigger value="organization">Organization</TabsTrigger>
+            <TabsTrigger value="members">Members</TabsTrigger>
+            <TabsTrigger value="api-keys">API keys</TabsTrigger>
+          </TabsList>
 
-      {/* API Keys */}
-      <Card>
-        <CardHeader
-          title="API keys"
-          subtitle="Agent API keys for programmatic access via MCP."
-          action={
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => setCreateKeyOpen(true)}
-            >
-              + Create key
-            </Button>
-          }
-        />
-        {data.apiKeys.length === 0 ? (
-          <p className="text-sm text-neutral-500">No API keys yet.</p>
-        ) : (
-          <Table headers={['Name', 'Prefix', 'Created', 'Expires', 'Last used']}>
-            {data.apiKeys.map((k) => (
-              <tr key={k.id}>
-                <Td>{k.name}</Td>
-                <Td mono>{k.prefix}…</Td>
-                <Td>{new Date(k.createdAt).toLocaleDateString()}</Td>
-                <Td>
-                  {k.expiresAt
-                    ? new Date(k.expiresAt).toLocaleDateString()
-                    : '—'}
-                </Td>
-                <Td>
-                  {k.lastUsedAt
-                    ? new Date(k.lastUsedAt).toLocaleString()
-                    : 'Never'}
-                </Td>
-              </tr>
-            ))}
-          </Table>
-        )}
-      </Card>
+          <TabsContent value="organization" className="mt-4">
+            <OrganizationTab
+              org={data.org}
+              onCreateOrg={() => setCreateOrgOpen(true)}
+            />
+          </TabsContent>
 
-      {/* Modals */}
-      <InviteMemberModal
+          <TabsContent value="members" className="mt-4">
+            <MembersTab
+              members={data.members}
+              onInvite={() => setInviteOpen(true)}
+            />
+          </TabsContent>
+
+          <TabsContent value="api-keys" className="mt-4">
+            <ApiKeysTab
+              apiKeys={data.apiKeys}
+              onCreateKey={() => setCreateKeyOpen(true)}
+              onRevoked={() => void load()}
+            />
+          </TabsContent>
+        </Tabs>
+      </div>
+
+      {/* Dialogs mounted at root — survive tab switches */}
+      <InviteMemberDialog
         open={inviteOpen}
-        onClose={() => setInviteOpen(false)}
+        onOpenChange={setInviteOpen}
         orgId={data.org.id}
       />
-      <CreateApiKeyModal
+      <CreateApiKeyDialog
         open={createKeyOpen}
-        onClose={() => setCreateKeyOpen(false)}
-        onCreated={(apiKey, rawKey) => {
-          setData((prev) =>
-            prev ? { ...prev, apiKeys: [...prev.apiKeys, apiKey] } : prev,
-          );
-          if (rawKey) setRevealKey({ name: apiKey.name, key: rawKey });
-        }}
+        onOpenChange={setCreateKeyOpen}
+        onCreated={handleKeyCreated}
       />
-      <CreateOrgModal
+      <CreateOrgDialog
         open={createOrgOpen}
-        onClose={() => setCreateOrgOpen(false)}
+        onOpenChange={setCreateOrgOpen}
       />
-      {revealKey && (
-        <RevealKeyModal
-          open={!!revealKey}
-          onClose={() => setRevealKey(null)}
+      {revealKey ? (
+        <RevealKeyDialog
+          open
+          onOpenChange={(v) => { if (!v) setRevealKey(null); }}
           keyName={revealKey.name}
           rawKey={revealKey.key}
         />
-      )}
-    </div>
-  );
-}
-
-function Row({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-4">
-      <span className="text-xs text-neutral-500">{label}</span>
-      <span className="text-sm text-neutral-300">{children}</span>
-    </div>
+      ) : null}
+    </>
   );
 }

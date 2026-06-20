@@ -139,26 +139,45 @@ agents.post('/', (c) =>
     });
 
     try {
-      const agent = await queryOne<{ id: string }>(
+      const agentRow = await queryOne<{ id: string; org_id: string; name: string; description: string | null; default_role: string; mode: AgentSummary['mode']; status: AgentSummary['status']; last_seen_at: string | null; api_key_id: string | null }>(
         // mode defaults to 'autonomous' (agent holds its own key); set explicitly
         // for clarity. Delegated agents are created via the OAuth/AAP flow (phase 2).
         `INSERT INTO waddling.agent (org_id, name, description, api_key_id, default_role, mode, status)
-         VALUES ($1,$2,$3,$4,$5,'autonomous','active') RETURNING id`,
+         VALUES ($1,$2,$3,$4,$5,'autonomous','active')
+         RETURNING id, org_id, name, description, default_role, mode, status, api_key_id, last_seen_at`,
         [caller.orgId, input.name, input.description ?? null, created.id, input.defaultRole],
       );
-      if (agent?.id) {
+      if (agentRow?.id) {
         // deferred (Stage C/D): server-side analytics for 'agent_created'
         // (via:dashboard). The original called getPostHogServer().capture, a Node-only
         // posthog-node path that does not bundle/run on workerd (see auth.ts /
         // agent-identity.ts neutered hooks). captureAgentEvent is agent-principal-only
         // and does not fit this user-funnel event.
       }
+      // agent + key: additive fields for the dashboard (backward-compatible with
+      // existing consumers that read agentId/apiKey/apiKeyId).
+      const agent: AgentSummary | undefined = agentRow
+        ? {
+            id: agentRow.id,
+            orgId: agentRow.org_id,
+            name: agentRow.name,
+            description: agentRow.description ?? undefined,
+            defaultRole: agentRow.default_role,
+            mode: agentRow.mode,
+            status: agentRow.status,
+            lastSeenAt: agentRow.last_seen_at ?? undefined,
+            apiKeyId: agentRow.api_key_id ?? undefined,
+          }
+        : undefined;
       return ok(
         c,
         {
-          agentId: agent?.id,
+          agentId: agentRow?.id,
           apiKey: created.key, // plaintext — shown once
           apiKeyId: created.id,
+          // additive fields (dashboard + future consumers):
+          agent,
+          key: created.key, // alias for apiKey — shown once
         },
         201,
       );
@@ -214,14 +233,14 @@ agents.get('/:id', (c) =>
       id: string;
       org_id: string;
       agent_id: string;
-      endpoint_id: string;
+      datalake_id: string;
       sid: string;
       status: 'active' | 'expired' | 'revoked' | 'killed';
       granted_roles: string[];
       started_at: string;
       expires_at: string;
     }>(
-      `SELECT id, org_id, agent_id, endpoint_id, sid, status, granted_roles, started_at, expires_at
+      `SELECT id, org_id, agent_id, datalake_id, sid, status, granted_roles, started_at, expires_at
          FROM waddling.agent_session WHERE agent_id = $1
         ORDER BY started_at DESC LIMIT 100`,
       [row.id],
@@ -230,7 +249,7 @@ agents.get('/:id', (c) =>
       id: s.id,
       orgId: s.org_id,
       agentId: s.agent_id,
-      endpointId: s.endpoint_id,
+      datalakeId: s.datalake_id,
       sid: s.sid,
       status: s.status,
       grantedRoles: s.granted_roles,
@@ -296,11 +315,9 @@ agents.delete('/:id', (c) =>
     // hold sessions on any of them).
     const endpoints = await query<{
       id: string;
-      gateway_host: string | null;
-      quack_port: number | null;
       server_token: string;
     }>(
-      `SELECT id, gateway_host, quack_port, server_token FROM waddling.endpoint
+      `SELECT id, server_token FROM waddling.datalake
         WHERE org_id = $1 AND status = 'running'`,
       [agent.org_id],
     );
@@ -308,7 +325,7 @@ agents.delete('/:id', (c) =>
     for (const ep of endpoints.rows) {
       try {
         await gatewayClientFor(ep).revoke({
-          endpointId: ep.id,
+          datalakeId: ep.id,
           kind: 'user',
           id: `agent:${id}`,
           reason: body.reason,

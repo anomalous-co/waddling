@@ -18,13 +18,15 @@ export interface Env {
   MASTER_KEY: SecretBinding;
   R2_ACCESS_KEY_ID: SecretBinding;
   R2_SECRET_ACCESS_KEY: SecretBinding;
+  // Native R2 binding for user avatars (upload + public serve). Distinct from the
+  // credential-based R2 path used for lake/workspace buckets.
+  AVATARS: R2Bucket;
 
   // ── Worker secret (set via `wrangler secret put`, NOT in vars) ───────────
   BETTER_AUTH_SECRET: string;
-  // PlanetScale API service token SECRET half (per-org managed Postgres catalog
-  // provisioning). The id half + org/cluster/region are non-secret vars below.
-  // Unset ⇒ the managed-postgres catalog path is disabled (getPlanetScaleClient → null).
-  PLANETSCALE_SERVICE_TOKEN?: string;
+  // Neon API key (account-scoped) for per-org managed Postgres catalog provisioning.
+  // Unset ⇒ the managed-postgres catalog path is disabled (getNeonClient → null).
+  NEON_API_KEY?: string;
   // R2 faucet (per-org lake bucket provisioning + scoped temp creds). The account-scoped
   // R2 API token VALUE (Cloudflare API Bearer); its Access Key ID is the parent below.
   // Unset ⇒ the R2 faucet is disabled (getR2Faucet → null).
@@ -75,14 +77,12 @@ export interface Env {
   STRIPE_PRICE_PRO: string;
   STRIPE_PRICE_ENTERPRISE: string;
 
-  // ── PlanetScale (per-org managed Postgres catalog) — non-secret vars ──────
-  // The service-token id half (public), the org slug that owns provisioned DBs, the
-  // Postgres cluster size, and an optional region. The token SECRET half is a Worker
-  // secret above. All optional: unset ⇒ managed-postgres catalog disabled.
-  PLANETSCALE_SERVICE_TOKEN_ID?: string;
-  PLANETSCALE_ORG?: string;
-  PLANETSCALE_CLUSTER_SIZE?: string;
-  PLANETSCALE_REGION?: string;
+  // ── Neon (per-org managed Postgres catalog) — non-secret vars ────────────
+  // The cloud region id (e.g. 'aws-us-east-1') new org catalog projects are created in, and
+  // the Postgres major version. Both optional: unset ⇒ Neon picks defaults. The API key is a
+  // Worker secret above.
+  NEON_REGION_ID?: string;
+  NEON_PG_VERSION?: string;
 
   // ── R2 faucet (per-org lake bucket) — non-secret ─────────────────────────
   // The parent R2 Access Key ID (the account-scoped token's S3 key id) to scope temp

@@ -88,7 +88,7 @@ export function captureAgentEvent(params: {
   onBehalfOf?: string;
   sessionId?: string;
   jti?: string;
-  endpointId?: string;
+  datalakeId?: string;
   /** ACL/grant detail — kept separate from capability (different layer). */
   extra?: Record<string, unknown>;
 }): void {

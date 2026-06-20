@@ -36,6 +36,19 @@ export interface GatewayConfig {
   /** ENCRYPTED ducklake attach. */
   encrypted: boolean;
 
+  /**
+   * Quackboard mode: boot birdshot + serve quack but do NOT ATTACH any DuckLake or object
+   * store. The opened {@link databasePath} IS the durable store (shared agent-coordination
+   * tables); the data plane restores/persists it from R2. birdshot still enforces ACLs.
+   */
+  quackboard: boolean;
+  /**
+   * DuckDB database to open. ':memory:' for a lake gateway (durable data lives in the
+   * ATTACHed lake). An absolute file path for a quackboard — the durable .duckdb the data
+   * plane restored from R2 — so quack serves its tables directly with no views.
+   */
+  databasePath: string;
+
   /** S3/R2/MinIO secret for the lake's object store. Unused when {@link localData}. */
   s3: {
     endpoint: string; // 'minio:9000' or 'r2-account.r2.cloudflarestorage.com'
@@ -72,8 +85,11 @@ function bool(name: string, fallback: boolean): boolean {
 }
 
 export function loadGatewayConfig(): GatewayConfig {
-  const ducklakeDataPath = req("DUCKLAKE_DATA_PATH");
-  const localData = !/^s3:\/\//i.test(ducklakeDataPath);
+  // Quackboard: no DuckLake at all, so the lake env vars (DATA_PATH/CATALOG_DSN/S3) are not
+  // required — the served database is DUCKDB_DATABASE_PATH (a file restored from R2).
+  const quackboard = bool("QUACKBOARD", false);
+  const ducklakeDataPath = quackboard ? opt("DUCKLAKE_DATA_PATH", "") : req("DUCKLAKE_DATA_PATH");
+  const localData = quackboard || !/^s3:\/\//i.test(ducklakeDataPath);
   const ducklakeCatalogFile = opt("DUCKLAKE_CATALOG_FILE", "");
 
   return {
@@ -82,8 +98,10 @@ export function loadGatewayConfig(): GatewayConfig {
     serverToken: req("GW_SERVER_TOKEN"),
     ctrlPort: Number(opt("CTRL_PORT", "9510")),
 
-    // postgres-catalog DSN is required only when no local catalog file is given.
-    ducklakeCatalogDsn: ducklakeCatalogFile ? opt("DUCKLAKE_CATALOG_DSN", "") : req("DUCKLAKE_CATALOG_DSN"),
+    // postgres-catalog DSN is required only when no local catalog file is given (and never
+    // for a quackboard, which mounts no catalog).
+    ducklakeCatalogDsn:
+      quackboard || ducklakeCatalogFile ? opt("DUCKLAKE_CATALOG_DSN", "") : req("DUCKLAKE_CATALOG_DSN"),
     ducklakeCatalogFile,
     ducklakeDataPath,
     localData,
@@ -91,6 +109,9 @@ export function loadGatewayConfig(): GatewayConfig {
     // Per-endpoint metadata schema (postgres catalog only). Empty ⇒ DuckLake default 'main'.
     metadataSchema: opt("DUCKLAKE_METADATA_SCHEMA", ""),
     encrypted: bool("DUCKLAKE_ENCRYPTED", false),
+
+    quackboard,
+    databasePath: opt("DUCKDB_DATABASE_PATH", ":memory:"),
 
     // S3 creds are required only for an s3:// data path; in local mode they are unused.
     s3: {

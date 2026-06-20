@@ -64,6 +64,9 @@ function construct(env: Env, pool: Pool) {
     .filter(Boolean);
   const cookieDomain = env.COOKIE_DOMAIN?.trim() || undefined;
   const crossOrigin = webOrigins.length > 0;
+  // The UI render-plane origin (app.getwaddling.com) the OAuth/MCP sign-in + consent
+  // pages live on. Falls back to the API origin for single-origin local dev.
+  const uiOrigin = webOrigins[0] ?? env.BETTER_AUTH_URL;
 
   return betterAuth({
     baseURL: env.BETTER_AUTH_URL,
@@ -155,10 +158,22 @@ function construct(env: Env, pool: Pool) {
       // MCP / OAuth provider (delegated mode). Turns this Better Auth instance
       // into the OAuth 2.1 authorization server Claude Desktop/Code drive:
       // dynamic client registration, PKCE authorize/token, discovery metadata,
-      // all under /api/auth/*. Unauthenticated authorize requests go to the
-      // dashboard sign-in page. Adds the oauthApplication / oauthAccessToken /
+      // all under /api/auth/*. Adds the oauthApplication / oauthAccessToken /
       // oauthConsent tables (created by getMigrations).
-      mcp({ loginPage: '/sign-in' }),
+      //
+      // loginPage + consentPage are ABSOLUTE to the UI origin: Better Auth resolves
+      // them against baseURL (the API origin), but the dashboard sign-in + the agent
+      // approval screen live on the render plane (app.getwaddling.com). The mcp plugin
+      // redirects an unauthenticated authorize to loginPage with the full OAuth query,
+      // and (when prompt=consent — forced by the shim in index.ts) to consentPage with
+      // consent_code/client_id/scope. uiOrigin falls back to BETTER_AUTH_URL for
+      // single-origin local dev.
+      mcp({
+        loginPage: `${uiOrigin}/sign-in`,
+        // loginPage is repeated here only to satisfy OIDCOptions' type (the mcp plugin
+        // overrides it with the top-level value); consentPage is the field we need.
+        oidcConfig: { loginPage: `${uiOrigin}/sign-in`, consentPage: `${uiOrigin}/oauth/consent` },
+      }),
       stripe({
         stripeClient: stripeClientInstance,
         stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET,

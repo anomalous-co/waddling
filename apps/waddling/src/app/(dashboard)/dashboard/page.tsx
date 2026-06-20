@@ -2,33 +2,52 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
-import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-} from 'recharts';
+import { Area, AreaChart, CartesianGrid, XAxis } from 'recharts';
+import { RefreshCw } from 'lucide-react';
 import {
   Card,
   CardHeader,
-  Badge,
-  statusVariant,
-  Spinner,
-  ErrorState,
-  EmptyState,
-  SectionTitle,
+  CardTitle,
+  CardDescription,
+  CardContent,
+} from '@/components/ui/card';
+import {
   Table,
-  Td,
-} from '@/components/dashboard/ui';
+  TableHeader,
+  TableRow,
+  TableHead,
+  TableBody,
+  TableCell,
+} from '@/components/ui/table';
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  type ChartConfig,
+} from '@/components/ui/chart';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import {
+  Empty,
+  EmptyHeader,
+  EmptyTitle,
+  EmptyDescription,
+} from '@/components/ui/empty';
+import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp } from '@/components/dashboard/fetch';
-import { useTheme } from 'fumadocs-ui/provider/base';
-import type { EndpointSummary, AgentSummary, SessionSummary } from '@/lib/types';
+import type {
+  DatalakeSummary,
+  AgentSummary,
+  SessionSummary,
+} from '@/lib/types';
 
-// recharts neutrals styled via JS props (can't ride the CSS ramp inversion).
-const CHART_DARK = { tick: '#525252', tipBg: '#171717', tipBorder: '#404040', label: '#a3a3a3' };
-const CHART_LIGHT = { tick: '#78716c', tipBg: '#ffffff', tipBorder: '#d6d3d1', label: '#57534e' };
+// ── Reference patterns ────────────────────────────────────────────────────────
+// This page is the canonical example every other dashboard view follows:
+//   • Card stat tiles · shadcn Chart (themed via CSS vars) · shadcn Table
+//   • StatusBadge for lifecycle words · Skeleton while loading · Alert on error
+//   • Empty for empty states · Promise.all (no fetch waterfall) · 15s refresh
+// ──────────────────────────────────────────────────────────────────────────────
 
 interface UsagePoint {
   ts: string;
@@ -37,13 +56,18 @@ interface UsagePoint {
 }
 
 interface OverviewData {
-  endpoints: EndpointSummary[];
+  datalakes: DatalakeSummary[];
   agents: AgentSummary[];
   liveSessions: SessionSummary[];
   usageSeries: UsagePoint[];
   totalQueries: number;
   totalSessions: number;
 }
+
+const chartConfig = {
+  queries: { label: 'Queries', color: 'var(--chart-1)' },
+  sessions: { label: 'Sessions', color: 'var(--chart-2)' },
+} satisfies ChartConfig;
 
 function StatCard({
   label,
@@ -56,25 +80,50 @@ function StatCard({
 }) {
   return (
     <Card>
-      <p className="text-xs text-neutral-500 uppercase tracking-wider">{label}</p>
-      <p className="text-2xl font-mono font-semibold text-neutral-100 mt-1">
-        {value}
-      </p>
-      {sub && <p className="text-xs text-neutral-600 mt-0.5">{sub}</p>}
+      <CardHeader>
+        <CardDescription className="uppercase tracking-wider">
+          {label}
+        </CardDescription>
+        <CardTitle className="font-mono text-2xl tabular-nums">{value}</CardTitle>
+      </CardHeader>
+      {sub ? (
+        <CardContent>
+          <p className="text-xs text-muted-foreground">{sub}</p>
+        </CardContent>
+      ) : null}
     </Card>
   );
+}
+
+function OverviewSkeleton() {
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        {[0, 1, 2, 3].map((i) => (
+          <Skeleton key={i} className="h-24 w-full" />
+        ))}
+      </div>
+      <Skeleton className="h-48 w-full" />
+      <Skeleton className="h-64 w-full" />
+    </div>
+  );
+}
+
+function shortTime(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime())
+    ? ts
+    : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 export default function OverviewPage() {
   const [data, setData] = useState<OverviewData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const { resolvedTheme } = useTheme();
-  const ck = resolvedTheme === 'light' ? CHART_LIGHT : CHART_DARK;
 
   const load = useCallback(async () => {
     const [endRes, agentRes, sessRes, usageRes] = await Promise.all([
-      fetchCp<{ endpoints: EndpointSummary[] }>('/api/cp/endpoints'),
+      fetchCp<{ datalakes: DatalakeSummary[] }>('/api/cp/datalakes'),
       fetchCp<{ agents: AgentSummary[] }>('/api/cp/agents'),
       fetchCp<{ sessions: SessionSummary[] }>('/api/cp/sessions?status=active'),
       fetchCp<{ series: UsagePoint[]; totalQueries: number; totalSessions: number }>(
@@ -89,51 +138,73 @@ export default function OverviewPage() {
     }
 
     setData({
-      endpoints: endRes.data.endpoints,
+      datalakes: endRes.data.datalakes,
       agents: agentRes.data.agents,
       liveSessions: sessRes.data.sessions,
-      usageSeries: usageRes.data.series,
-      totalQueries: usageRes.data.totalQueries,
-      totalSessions: usageRes.data.totalSessions,
+      usageSeries: usageRes.data.series ?? [],
+      totalQueries: usageRes.data.totalQueries ?? 0,
+      totalSessions: usageRes.data.totalSessions ?? 0,
     });
+    setError(null);
     setLoading(false);
   }, []);
 
   useEffect(() => {
     void load();
-    // Auto-refresh every 15s
     const t = setInterval(() => void load(), 15_000);
     return () => clearInterval(t);
   }, [load]);
 
-  if (loading)
+  if (loading) return <OverviewSkeleton />;
+
+  if (error)
     return (
-      <div className="flex justify-center py-24">
-        <Spinner size="lg" />
-      </div>
+      <Alert variant="destructive">
+        <AlertTitle>Couldn’t load the dashboard</AlertTitle>
+        <AlertDescription className="flex flex-col items-start gap-3">
+          {error}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setLoading(true);
+              void load();
+            }}
+          >
+            <RefreshCw data-icon="inline-start" />
+            Retry
+          </Button>
+        </AlertDescription>
+      </Alert>
     );
-  if (error) return <ErrorState message={error} retry={() => { setLoading(true); void load(); }} />;
+
   if (!data) return null;
 
-  const runningEndpoints = data.endpoints.filter((e) => e.status === 'running').length;
-  // Resolve session UUIDs → human names for the Live sessions table.
+  const runningDatalakes = data.datalakes.filter(
+    (e) => e.status === 'running',
+  ).length;
+  const activeAgents = data.agents.filter((a) => a.status === 'active').length;
   const agentById = new Map(data.agents.map((a) => [a.id, a]));
-  const endpointById = new Map(data.endpoints.map((e) => [e.id, e]));
+  const datalakeById = new Map(data.datalakes.map((e) => [e.id, e]));
 
   return (
-    <div className="space-y-6">
-      <SectionTitle>Overview</SectionTitle>
+    <div className="flex flex-col gap-6">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
+        <p className="text-sm text-muted-foreground">
+          Live health across your data lakes, agents, and sessions.
+        </p>
+      </div>
 
-      {/* Stats row */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatCard
-          label="Endpoints"
-          value={runningEndpoints}
-          sub={`${data.endpoints.length} total`}
+          label="Data Lakes"
+          value={runningDatalakes}
+          sub={`${data.datalakes.length} total`}
         />
         <StatCard
           label="Active agents"
-          value={data.agents.filter((a) => a.status === 'active').length}
+          value={activeAgents}
           sub={`${data.agents.length} total`}
         />
         <StatCard
@@ -147,153 +218,192 @@ export default function OverviewPage() {
         />
       </div>
 
-      {/* Sparklines */}
       <Card>
-        <CardHeader title="Queries & Sessions — last 24h" />
-        {data.usageSeries.length === 0 ? (
-          <EmptyState title="No usage data yet" />
-        ) : (
-          <ResponsiveContainer width="100%" height={120}>
-            <AreaChart
-              data={data.usageSeries}
-              margin={{ top: 4, right: 0, bottom: 0, left: 0 }}
-            >
-              <defs>
-                <linearGradient id="gQ" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="gS" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <XAxis
-                dataKey="ts"
-                tick={{ fontSize: 10, fill: ck.tick }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <YAxis hide />
-              <Tooltip
-                contentStyle={{
-                  background: ck.tipBg,
-                  border: `1px solid ${ck.tipBorder}`,
-                  borderRadius: 4,
-                  fontSize: 11,
-                }}
-                labelStyle={{ color: ck.label }}
-              />
-              <Area
-                type="monotone"
-                dataKey="queries"
-                stroke="#3b82f6"
-                strokeWidth={1.5}
-                fill="url(#gQ)"
-                dot={false}
-                name="Queries"
-              />
-              <Area
-                type="monotone"
-                dataKey="sessions"
-                stroke="#10b981"
-                strokeWidth={1.5}
-                fill="url(#gS)"
-                dot={false}
-                name="Sessions"
-              />
-            </AreaChart>
-          </ResponsiveContainer>
-        )}
+        <CardHeader>
+          <CardTitle>Queries &amp; sessions</CardTitle>
+          <CardDescription>Last 24 hours</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {data.usageSeries.length === 0 ? (
+            <Empty>
+              <EmptyHeader>
+                <EmptyTitle>No usage data yet</EmptyTitle>
+                <EmptyDescription>
+                  Connect an agent and run a query to see activity here.
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : (
+            <ChartContainer config={chartConfig} className="h-[160px] w-full">
+              <AreaChart data={data.usageSeries} margin={{ left: 0, right: 0 }}>
+                <defs>
+                  <linearGradient id="fillQueries" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="var(--color-queries)" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="var(--color-queries)" stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="fillSessions" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="var(--color-sessions)" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="var(--color-sessions)" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid vertical={false} />
+                <XAxis
+                  dataKey="ts"
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  tickFormatter={shortTime}
+                />
+                <ChartTooltip
+                  content={
+                    <ChartTooltipContent
+                      labelFormatter={(value) => shortTime(String(value))}
+                    />
+                  }
+                />
+                <Area
+                  dataKey="queries"
+                  type="monotone"
+                  stroke="var(--color-queries)"
+                  fill="url(#fillQueries)"
+                  strokeWidth={2}
+                />
+                <Area
+                  dataKey="sessions"
+                  type="monotone"
+                  stroke="var(--color-sessions)"
+                  fill="url(#fillSessions)"
+                  strokeWidth={2}
+                />
+              </AreaChart>
+            </ChartContainer>
+          )}
+        </CardContent>
       </Card>
 
-      {/* Live sessions */}
       <Card>
-        <CardHeader
-          title="Live sessions"
-          subtitle={`${data.liveSessions.length} active`}
-        />
-        {data.liveSessions.length === 0 ? (
-          <EmptyState title="No active sessions" description="Connect an agent to see live sessions here." />
-        ) : (
-          <Table headers={['Session', 'Agent', 'Owner', 'Endpoint', 'Started', 'Expires', 'Status']}>
-            {data.liveSessions.map((s) => {
-              const agent = agentById.get(s.agentId);
-              const endpoint = endpointById.get(s.endpointId);
-              return (
-                <tr key={s.id}>
-                  <Td>
-                    <Link
-                      href={`/dashboard/sessions/${s.id}`}
-                      className="font-mono text-xs text-blue-400 hover:underline"
-                    >
-                      {`${s.sid.slice(0, 8)}…`}
-                    </Link>
-                  </Td>
-                  <Td>
-                    <Link
-                      href={`/dashboard/agents/${s.agentId}`}
-                      className="text-blue-400 hover:underline"
-                    >
-                      {agent?.name ?? `${s.agentId.slice(0, 8)}…`}
-                    </Link>
-                  </Td>
-                  <Td className="text-neutral-400">{agent?.owner ?? '—'}</Td>
-                  <Td>
-                    {endpoint ? (
+        <CardHeader>
+          <CardTitle>Live sessions</CardTitle>
+          <CardDescription>{data.liveSessions.length} active</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {data.liveSessions.length === 0 ? (
+            <Empty>
+              <EmptyHeader>
+                <EmptyTitle>No active sessions</EmptyTitle>
+                <EmptyDescription>
+                  Connect an agent to see live sessions here.
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Session</TableHead>
+                  <TableHead>Agent</TableHead>
+                  <TableHead>Data Lake</TableHead>
+                  <TableHead>Started</TableHead>
+                  <TableHead>Expires</TableHead>
+                  <TableHead>Status</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {data.liveSessions.map((s) => {
+                  const agent = agentById.get(s.agentId);
+                  const datalake = datalakeById.get(s.datalakeId);
+                  return (
+                    <TableRow key={s.id}>
+                      <TableCell className="font-mono text-xs">
+                        {`${s.sid.slice(0, 8)}…`}
+                      </TableCell>
+                      <TableCell>
+                        <Link
+                          href={`/dashboard/agents/${s.agentId}`}
+                          className="text-primary hover:underline"
+                        >
+                          {agent?.name ?? `${s.agentId.slice(0, 8)}…`}
+                        </Link>
+                      </TableCell>
+                      <TableCell>
+                        {datalake ? (
+                          <Link
+                            href={`/dashboard/datalakes/${s.datalakeId}`}
+                            className="text-primary hover:underline"
+                          >
+                            {datalake.name}
+                          </Link>
+                        ) : (
+                          <span className="font-mono text-xs">
+                            {`${s.datalakeId.slice(0, 8)}…`}
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {new Date(s.startedAt).toLocaleTimeString()}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {new Date(s.expiresAt).toLocaleTimeString()}
+                      </TableCell>
+                      <TableCell>
+                        <StatusBadge status={s.status} />
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Data Lakes</CardTitle>
+          <CardDescription>{data.datalakes.length} configured</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {data.datalakes.length === 0 ? (
+            <Empty>
+              <EmptyHeader>
+                <EmptyTitle>No data lakes yet</EmptyTitle>
+                <EmptyDescription>
+                  Provision a data lake to start governing data access.
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead>Slug</TableHead>
+                  <TableHead>Status</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {data.datalakes.map((dl) => (
+                  <TableRow key={dl.id}>
+                    <TableCell>
                       <Link
-                        href={`/dashboard/endpoints/${s.endpointId}`}
-                        className="text-blue-400 hover:underline"
+                        href={`/dashboard/datalakes/${dl.id}`}
+                        className="text-primary hover:underline"
                       >
-                        {endpoint.name}
+                        {dl.name}
                       </Link>
-                    ) : (
-                      <span className="font-mono text-xs">{`${s.endpointId.slice(0, 8)}…`}</span>
-                    )}
-                  </Td>
-                  <Td>{new Date(s.startedAt).toLocaleTimeString()}</Td>
-                  <Td>{new Date(s.expiresAt).toLocaleTimeString()}</Td>
-                  <Td>
-                    <Badge variant={statusVariant(s.status)}>{s.status}</Badge>
-                  </Td>
-                </tr>
-              );
-            })}
-          </Table>
-        )}
-      </Card>
-
-      {/* Endpoint health */}
-      <Card>
-        <CardHeader title="Endpoints" />
-        {data.endpoints.length === 0 ? (
-          <EmptyState
-            title="No endpoints yet"
-            description="Provision an endpoint to start governing data access."
-          />
-        ) : (
-          <Table headers={['Name', 'Slug', 'Status', 'Gateway']}>
-            {data.endpoints.map((ep) => (
-              <tr key={ep.id}>
-                <Td>
-                  <Link
-                    href={`/dashboard/endpoints/${ep.id}`}
-                    className="text-blue-400 hover:underline"
-                  >
-                    {ep.name}
-                  </Link>
-                </Td>
-                <Td mono>{ep.slug}</Td>
-                <Td>
-                  <Badge variant={statusVariant(ep.status)}>{ep.status}</Badge>
-                </Td>
-                <Td mono className="text-neutral-500">
-                  {ep.schemas?.join(', ') ?? '—'}
-                </Td>
-              </tr>
-            ))}
-          </Table>
-        )}
+                    </TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">
+                      {dl.slug}
+                    </TableCell>
+                    <TableCell>
+                      <StatusBadge status={dl.status} />
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
       </Card>
     </div>
   );

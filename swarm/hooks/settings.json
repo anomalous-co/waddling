@@ -1,0 +1,18 @@
+{
+  "_comment": "Pass to a top-level session via: claude --settings swarm/hooks/settings.json. Paths are absolute because hook commands in JSON cannot self-locate by dirname. Regenerate if you relocate swarm/. NOTE: Workflow-tool subagents do NOT inherit these hooks — see HOOKS.md.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/Users/orchid/mirrir/waddling/swarm/hooks/hook-trace.sh start", "timeout": 10 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "/Users/orchid/mirrir/waddling/swarm/hooks/hook-trace.sh end", "timeout": 10 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "/Users/orchid/mirrir/waddling/swarm/hooks/hook-tool.sh pre", "timeout": 10 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "/Users/orchid/mirrir/waddling/swarm/hooks/hook-tool.sh post", "timeout": 10 } ] },
+      { "matcher": "Bash", "hooks": [ { "type": "command", "if": "Bash(*/bin/bb observe*)", "command": "/Users/orchid/mirrir/waddling/swarm/hooks/hook-notify.sh", "timeout": 15 } ] }
+    ]
+  }
+}

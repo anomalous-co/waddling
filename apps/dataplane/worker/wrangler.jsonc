@@ -49,18 +49,35 @@
       // bottleneck (every session needs both). 100 × standard-1 (4 GiB / 0.5 vCPU) =
       // 400 GiB / 50 vCPU.
       "max_instances": 100
+    },
+    {
+      // Quackboard: the SAME gateway image (DuckDB + quack + birdshot), booted with
+      // QUACKBOARD=1 so the entrypoint serves the restored .duckdb file directly with no
+      // lake. One RUNNING container per active org (DO key qb:<orgId>); idle orgs sleep.
+      "class_name": "QuackboardDO",
+      "image": "../../cf-stagec-gw-probe/container/Dockerfile",
+      "instance_type": "standard-2",
+      "max_instances": 50
     }
   ],
 
   "durable_objects": {
     "bindings": [
       { "class_name": "GatewayDO", "name": "GATEWAY" },
-      { "class_name": "WorkspaceSandbox", "name": "WORKSPACE" }
+      { "class_name": "WorkspaceSandbox", "name": "WORKSPACE" },
+      // The per-datalake autoscaling director (plain DO, SQLite-backed). Decides which gateway
+      // replicas are live, scales under load, sleeps to zero when idle, and guarantees a replica
+      // is armed with the current birdshot snapshot before it serves an agent query.
+      { "class_name": "GatewayPoolDO", "name": "GATEWAY_POOL" },
+      // Per-org quackboard: a governed DuckDB (no lake), single writer, R2-durable.
+      { "class_name": "QuackboardDO", "name": "QUACKBOARD" }
     ]
   },
 
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["GatewayDO", "WorkspaceSandbox"] }
+    { "tag": "v1", "new_sqlite_classes": ["GatewayDO", "WorkspaceSandbox"] },
+    { "tag": "v2", "new_sqlite_classes": ["GatewayPoolDO"] },
+    { "tag": "v3", "new_sqlite_classes": ["QuackboardDO"] }
   ],
 
   // REAL R2 S3-API creds (Secrets Store), read by the WorkspaceSandbox DO to MINT

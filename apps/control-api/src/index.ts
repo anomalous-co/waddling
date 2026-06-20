@@ -17,10 +17,14 @@ import { Pool } from "pg";
 import type { Env } from "./lib/env";
 import { runInDbScope, query } from "./lib/db";
 import { buildAuth, runMigrations, runInAuthScope } from "./lib/auth";
+import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
 import { initDataplane } from "./lib/gateway-client";
-import { resolveCaller } from "./lib/cp-shared";
-import { endpoints } from "./routes/endpoints";
+import { resolveCaller, AuthError } from "./lib/cp-shared";
+import { handleMcp } from "./mcp/server";
+import type { LoopbackResult } from "./mcp/tools";
+import { datalakes } from "./routes/datalakes";
+import { whoami } from "./routes/whoami";
 import { agents } from "./routes/agents";
 import { notebooks } from "./routes/notebooks";
 import { views } from "./routes/views";
@@ -29,9 +33,11 @@ import { usage } from "./routes/usage";
 import { audit } from "./routes/audit";
 import { billing } from "./routes/billing";
 import { acl } from "./routes/acl";
+import { delegations } from "./routes/delegations";
 import { sessions } from "./routes/sessions";
 import { deviceLink } from "./routes/device-link";
 import { catalog } from "./routes/catalog";
+import { account } from "./routes/account";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -68,6 +74,28 @@ app.use("/api/*", (c, next) => {
   })(c, next);
 });
 
+// ─── CORS for the hosted MCP endpoint + OAuth discovery ──────────────────────
+// The MCP endpoint (/mcp) and the apex OAuth metadata are reached by third-party
+// MCP clients (Claude.ai, etc.). MCP auth rides the `Authorization` Bearer header,
+// not cookies, so this is NOT credentialed CORS — `*` origin is allowed. The
+// `WWW-Authenticate` header MUST be exposed so OAuth-capable clients can start the
+// consent flow. Registered BEFORE the `*` DB/auth scope so an OPTIONS preflight
+// short-circuits here without opening a pool.
+app.use(
+  "/mcp",
+  cors({
+    origin: "*",
+    allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization", "Accept", "mcp-protocol-version", "mcp-session-id", "last-event-id"],
+    exposeHeaders: ["WWW-Authenticate", "mcp-session-id", "mcp-protocol-version"],
+    maxAge: 600,
+  }),
+);
+app.use(
+  "/.well-known/*",
+  cors({ origin: "*", allowMethods: ["GET", "OPTIONS"], allowHeaders: ["Content-Type"], maxAge: 600 }),
+);
+
 app.use("*", async (c, next) => {
   initCrypto(c.env.WADDLING_SECRET_KEY ?? c.env.BETTER_AUTH_SECRET);
   initDataplane(c.env.DATAPLANE);
@@ -82,7 +110,94 @@ app.use("*", async (c, next) => {
 // ─── Better Auth ──────────────────────────────────────────────────────────────
 // All auth/OAuth/MCP endpoints live under /api/auth/*. buildAuth returns this
 // request's instance (constructed once per request inside runInAuthScope).
+// Force an explicit approval screen on every MCP OAuth connection. The mcp plugin's
+// authorize auto-issues the code right after login UNLESS prompt=consent (then it
+// redirects to the consentPage and the /oauth2/consent endpoint engages). So we inject
+// prompt=consent when absent. Registered BEFORE the /api/auth/* wildcard so it wins;
+// the sign-in resume already carries prompt=consent → delegates straight through (no loop).
+app.get("/api/auth/mcp/authorize", (c) => {
+  const url = new URL(c.req.url);
+  if (!url.searchParams.has("prompt")) {
+    url.searchParams.set("prompt", "consent");
+    return c.redirect(url.toString(), 302);
+  }
+  return buildAuth(c.env).handler(c.req.raw);
+});
+
 app.on(["GET", "POST"], "/api/auth/*", (c) => buildAuth(c.env).handler(c.req.raw));
+
+// ─── Hosted MCP server (first-party, day-0) ──────────────────────────────────
+// `/mcp` is the zero-install remote MCP endpoint third-party agents connect to.
+// It supports BOTH day-0 auth paths via resolveCaller(allowDelegated=true): an
+// `sk_agent_` API key (autonomous agents) OR a delegated OAuth access token
+// (Claude.ai "add connector" → consent). An unauthenticated request returns 401
+// with a `WWW-Authenticate` challenge pointing at the protected-resource metadata,
+// which kicks off the OAuth flow in capable clients.
+//
+// The tools are NOT re-implemented here: each forwards the caller's inbound
+// Authorization header to this Worker's own `/api/cp/*` routes (loopback app.fetch,
+// the same in-process dispatch /probe/caller proves), so the existing handlers
+// re-resolve + enforce exactly as for any external caller.
+
+// OAuth Authorization Server Metadata (RFC 8414) at the apex — some clients default
+// here instead of /api/auth/.well-known/*. Proxies to Better Auth's discovery doc.
+app.get("/.well-known/oauth-authorization-server", (c) =>
+  oAuthDiscoveryMetadata(buildAuth(c.env))(c.req.raw),
+);
+
+// OAuth Protected Resource Metadata (RFC 9728) — points clients at the auth server.
+// `resource` MUST equal MCP_RESOURCE_URL (the audience cp-shared binds tokens to).
+app.get("/.well-known/oauth-protected-resource", (c) =>
+  c.json({
+    resource: c.env.MCP_RESOURCE_URL,
+    authorization_servers: [c.env.BETTER_AUTH_URL],
+    bearer_methods_supported: ["header"],
+  }),
+);
+
+app.on(["GET", "POST", "DELETE"], "/mcp", async (c) => {
+  // Gate: authenticate the caller (both API-key and delegated-OAuth paths). org is
+  // resolved per-tool, so requireOrg=false here.
+  try {
+    await resolveCaller(c, false, true);
+  } catch (e) {
+    if (e instanceof AuthError) {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (e.status === 401) {
+        headers["WWW-Authenticate"] =
+          `Bearer resource_metadata="${c.env.MCP_RESOURCE_URL}/.well-known/oauth-protected-resource"`;
+      }
+      return new Response(JSON.stringify({ error: e.code, reason: e.message }), { status: e.status, headers });
+    }
+    throw e;
+  }
+
+  // Loopback client: forward the caller's credential into our own /api/cp/* routes.
+  const authorization = c.req.header("authorization") ?? "";
+  const loopback = async (
+    path: string,
+    init?: { method?: string; body?: unknown },
+  ): Promise<LoopbackResult> => {
+    const res = await app.fetch(
+      new Request(`https://control.internal${path}`, {
+        method: init?.method ?? "GET",
+        headers: { authorization, "content-type": "application/json" },
+        body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+      }),
+      c.env,
+    );
+    const text = await res.text();
+    let data: unknown;
+    try {
+      data = text ? JSON.parse(text) : undefined;
+    } catch {
+      data = text;
+    }
+    return { ok: res.ok, status: res.status, data };
+  };
+
+  return handleMcp(c.req.raw, { loopback });
+});
 
 // ─── /probe/db ──────────────────────────────────────────────────────────────
 // Opens a pg Pool against the Hyperdrive connection string and runs two trivial
@@ -297,7 +412,7 @@ async function probeMigrate(env: Env) {
 // packages/control-schema (schema.sql + migrations), NOT from Better Auth's
 // getMigrations (which only creates auth.* + plugin tables). On a PlanetScale that
 // has only had /probe/migrate run, the agent INSERT and the endpoints SELECT both
-// hit `relation "waddling.agent"/"waddling.endpoint" does not exist`. That is a
+// hit `relation "waddling.agent"/"waddling.datalake" does not exist`. That is a
 // MISSING-SCHEMA signal, not a workerd failure — the raw PG error is surfaced
 // verbatim so the two are distinguishable. Apply control-schema to PlanetScale
 // before expecting this probe to go green.
@@ -389,7 +504,10 @@ async function probeCaller(env: Env) {
 // ─── /api/cp/* control-plane routes ─────────────────────────────────────────────
 // B2 mounts one representative router (endpoints). The bulk port (B3) mounts the
 // remaining /api/cp/* routes here the same way.
-app.route("/api/cp/endpoints", endpoints);
+app.route("/api/cp/datalakes", datalakes);
+// Deprecated alias: the old path keeps resolving to the same handler during the
+// endpoint→datalake cutover (external callers + any not-yet-updated UI link).
+app.route("/api/cp/endpoints", datalakes);
 app.route("/api/cp/agents", agents);
 app.route("/api/cp/notebooks", notebooks);
 app.route("/api/cp/views", views);
@@ -398,9 +516,12 @@ app.route("/api/cp/usage", usage);
 app.route("/api/cp/audit", audit);
 app.route("/api/cp/billing", billing);
 app.route("/api/cp/acl", acl);
+app.route("/api/cp/delegations", delegations);
 app.route("/api/cp/sessions", sessions);
+app.route("/api/cp/whoami", whoami);
 app.route("/api/cp/device-link", deviceLink);
 app.route("/api/cp/catalog", catalog);
+app.route("/api/cp/account", account);
 
 app.get("/", (c) =>
   c.text(

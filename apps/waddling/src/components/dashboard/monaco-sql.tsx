@@ -5,7 +5,7 @@ import { useEffect, useRef } from 'react';
 import { useMonaco } from '@monaco-editor/react';
 import { useTheme } from 'fumadocs-ui/provider/base';
 import type { languages } from 'monaco-editor';
-import { Spinner } from './ui';
+import { Loader2 } from 'lucide-react';
 import type { TableInfo } from '@/lib/types';
 
 // Monaco is browser-only (web workers, DOM). Load client-side only.
@@ -15,7 +15,7 @@ const Editor = dynamic(() => import('@monaco-editor/react').then((m) => m.Editor
   ssr: false,
   loading: () => (
     <div className="flex h-[160px] items-center justify-center rounded-md border border-neutral-800 bg-neutral-900">
-      <Spinner />
+      <Loader2 className="size-4 animate-spin text-muted-foreground" />
     </div>
   ),
 });

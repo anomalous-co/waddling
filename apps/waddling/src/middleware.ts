@@ -19,7 +19,9 @@ const SITE_HOST = 'getwaddling.com';
 const APP_HOST = 'app.getwaddling.com';
 
 // Path prefixes that belong to the APP host. Everything else is marketing.
-const APP_PREFIXES = ['/dashboard', '/sign-in', '/sign-up', '/link'];
+// `/oauth` is the OAuth/MCP consent screen — it must stay on the app host (where the
+// session cookie + sign-in live), never bounce to marketing.
+const APP_PREFIXES = ['/dashboard', '/sign-in', '/sign-up', '/link', '/oauth'];
 
 function isAppPath(pathname: string): boolean {
   return APP_PREFIXES.some((p) => pathname === p || pathname.startsWith(`${p}/`));

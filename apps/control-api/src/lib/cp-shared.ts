@@ -16,7 +16,6 @@
  *   - browser session  → getSession → active org else first membership
  */
 import { z } from 'zod';
-import { verifyAccessToken } from 'better-auth/oauth2';
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { buildAuth } from './auth';
@@ -150,24 +149,17 @@ export async function resolveCaller(
         'OAuth/delegated tokens may only open data sessions',
       );
     }
-    let payload: { sub?: string; client_id?: string };
-    try {
-      payload = (await verifyAccessToken(bearer, {
-        // SECURITY BOUNDARY (RFC 8707): the token MUST be audience-bound to our MCP
-        // resource. mcp-external forwards the bearer blind, so this audience check is
-        // the only chokepoint against token redirection — never widen it.
-        verifyOptions: { issuer: c.env.BETTER_AUTH_URL, audience: c.env.MCP_RESOURCE_URL },
-        jwksUrl: `${c.env.BETTER_AUTH_URL}/api/auth/jwks`,
-      })) as { sub?: string; client_id?: string };
-    } catch {
-      throw new AuthError(
-        'invalid_token',
-        401,
-        'OAuth access token is invalid, expired, or not bound to this resource',
-      );
+    // MCP access tokens are OPAQUE random strings stored in oauthAccessToken — NOT JWTs.
+    // getMcpSession looks the bearer up in our own DB and checks expiry; that DB lookup
+    // IS the resource binding (the token only exists here), so no separate audience/JWT
+    // verification is needed (and a JWT verify would always fail on an opaque token).
+    const mcpSession = (await buildAuth(c.env).api.getMcpSession({
+      headers: c.req.raw.headers,
+    })) as { userId?: string; clientId?: string } | null;
+    if (!mcpSession?.userId) {
+      throw new AuthError('invalid_token', 401, 'OAuth access token is invalid or expired');
     }
-    const userId = payload.sub;
-    if (!userId) throw new AuthError('invalid_token', 401, 'OAuth token has no subject');
+    const userId = mcpSession.userId;
     // Org from first membership; the sessions route re-derives + checks membership
     // against the chosen endpoint's org (authoritative for tenant isolation).
     const member = await queryOne<{ organizationId: string }>(
@@ -178,7 +170,7 @@ export async function resolveCaller(
     if (requireOrg && !orgId) {
       throw new AuthError('no_organization', 403, 'Delegating user has no organization');
     }
-    return { kind: 'user', orgId, callerId: userId, delegated: true, clientId: payload.client_id };
+    return { kind: 'user', orgId, callerId: userId, delegated: true, clientId: mcpSession.clientId };
   }
 
   // ── Browser session path (dashboard) ──

@@ -2,17 +2,32 @@
 
 import { use, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
+import { RefreshCw } from 'lucide-react';
 import {
   Card,
   CardHeader,
-  Badge,
-  statusVariant,
-  Spinner,
-  ErrorState,
+  CardTitle,
+  CardDescription,
+  CardContent,
+} from '@/components/ui/card';
+import {
   Table,
-  Td,
-  SectionTitle,
-} from '@/components/dashboard/ui';
+  TableHeader,
+  TableRow,
+  TableHead,
+  TableBody,
+  TableCell,
+} from '@/components/ui/table';
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Empty,
+  EmptyHeader,
+  EmptyTitle,
+  EmptyDescription,
+} from '@/components/ui/empty';
+import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp } from '@/components/dashboard/fetch';
 
 interface SessionDetail {
@@ -25,7 +40,9 @@ interface SessionDetail {
   agentId: string;
   agentName?: string;
   owner?: string;
-  endpointId: string;
+  datalakeId: string;
+  // The route still returns `endpointName` (the gateway name column wasn't
+  // renamed alongside datalakeId).
   endpointName?: string;
   actor?: string;
   actorName?: string;
@@ -37,16 +54,28 @@ interface QueryRow {
   reason?: string;
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+function InfoRow({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex items-baseline gap-3 py-1.5">
-      <span className="w-28 shrink-0 text-xs uppercase tracking-wider text-neutral-500">{label}</span>
-      <span className="text-sm text-neutral-200">{children}</span>
+      <span className="w-28 shrink-0 text-xs uppercase tracking-wider text-muted-foreground">
+        {label}
+      </span>
+      <span className="text-sm">{children}</span>
     </div>
   );
 }
 
-export default function SessionDetailPage({ params }: { params: Promise<{ id: string }> }) {
+export default function SessionDetailPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
   const { id } = use(params);
   const [session, setSession] = useState<SessionDetail | null>(null);
   const [queries, setQueries] = useState<QueryRow[]>([]);
@@ -60,6 +89,7 @@ export default function SessionDetailPage({ params }: { params: Promise<{ id: st
     if (res.ok) {
       setSession(res.data.session);
       setQueries(res.data.queries);
+      setError(null);
     } else {
       setError(res.error);
     }
@@ -72,74 +102,151 @@ export default function SessionDetailPage({ params }: { params: Promise<{ id: st
 
   if (loading)
     return (
-      <div className="flex justify-center py-24">
-        <Spinner size="lg" />
+      <div className="flex flex-col gap-4">
+        <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-64 w-full" />
+        <Skeleton className="h-48 w-full" />
       </div>
     );
-  if (error) return <ErrorState message={error} retry={() => { setLoading(true); void load(); }} />;
+
+  if (error)
+    return (
+      <Alert variant="destructive">
+        <AlertTitle>Couldn’t load this session</AlertTitle>
+        <AlertDescription className="flex flex-col items-start gap-3">
+          {error}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setLoading(true);
+              void load();
+            }}
+          >
+            <RefreshCw data-icon="inline-start" />
+            Retry
+          </Button>
+        </AlertDescription>
+      </Alert>
+    );
+
   if (!session) return null;
 
   // "run as agent" when a human actor opened a session for an agent.
   const isRunAs = !!session.actor && session.actor !== session.agentId;
 
   return (
-    <div className="space-y-4">
-      <SectionTitle>
-        Session <span className="font-mono text-blue-300">{session.sid.slice(0, 8)}…</span>
-      </SectionTitle>
+    <div className="flex flex-col gap-4">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          Session <span className="font-mono text-primary">{session.sid.slice(0, 8)}…</span>
+        </h1>
+      </div>
 
       <Card>
-        <CardHeader title="Session info" />
-        <Row label="Session ID">
-          <code className="font-mono text-xs text-neutral-300">{session.sid}</code>
-        </Row>
-        <Row label="Status">
-          <Badge variant={statusVariant(session.status)}>{session.status}</Badge>
-        </Row>
-        <Row label="Source agent">
-          <Link href={`/dashboard/agents/${session.agentId}`} className="text-blue-400 hover:underline">
-            {session.agentName ?? `${session.agentId.slice(0, 8)}…`}
-          </Link>
-        </Row>
-        <Row label="Owner">{session.owner ?? '—'}</Row>
-        {isRunAs && (
-          <Row label="Run by">
-            <span className="text-yellow-300">{session.actorName ?? session.actor}</span>{' '}
-            <span className="text-xs text-neutral-500">(run-as-agent)</span>
-          </Row>
-        )}
-        <Row label="Endpoint">
-          <Link
-            href={`/dashboard/endpoints/${session.endpointId}`}
-            className="text-blue-400 hover:underline"
-          >
-            {session.endpointName ?? `${session.endpointId.slice(0, 8)}…`}
-          </Link>
-        </Row>
-        <Row label="Started">{new Date(session.startedAt).toLocaleString()}</Row>
-        <Row label="Expires">{new Date(session.expiresAt).toLocaleString()}</Row>
+        <CardHeader>
+          <CardTitle>Session info</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <InfoRow label="Session ID">
+            <code className="font-mono text-xs text-muted-foreground">
+              {session.sid}
+            </code>
+          </InfoRow>
+          <InfoRow label="Status">
+            <StatusBadge status={session.status} />
+          </InfoRow>
+          <InfoRow label="Source agent">
+            <Link
+              href={`/dashboard/agents/${session.agentId}`}
+              className="text-primary hover:underline"
+            >
+              {session.agentName ?? `${session.agentId.slice(0, 8)}…`}
+            </Link>
+          </InfoRow>
+          <InfoRow label="Owner">{session.owner ?? '—'}</InfoRow>
+          {isRunAs ? (
+            <InfoRow label="Run by">
+              <span className="text-amber-600 dark:text-amber-500">
+                {session.actorName ?? session.actor}
+              </span>{' '}
+              <span className="text-xs text-muted-foreground">
+                (run-as-agent)
+              </span>
+            </InfoRow>
+          ) : null}
+          <InfoRow label="Data Lake">
+            <Link
+              href={`/dashboard/datalakes/${session.datalakeId}`}
+              className="text-primary hover:underline"
+            >
+              {session.endpointName ?? `${session.datalakeId.slice(0, 8)}…`}
+            </Link>
+          </InfoRow>
+          <InfoRow label="Roles">
+            {session.grantedRoles?.length ? (
+              <span className="font-mono text-xs">
+                {session.grantedRoles.join(', ')}
+              </span>
+            ) : (
+              '—'
+            )}
+          </InfoRow>
+          <InfoRow label="Started">
+            {new Date(session.startedAt).toLocaleString()}
+          </InfoRow>
+          <InfoRow label="Expires">
+            {new Date(session.expiresAt).toLocaleString()}
+          </InfoRow>
+        </CardContent>
       </Card>
 
       <Card>
-        <CardHeader title="Queries" subtitle={`${queries.length} in this session`} />
-        {queries.length === 0 ? (
-          <p className="text-sm text-neutral-500">No queries run in this session yet.</p>
-        ) : (
-          <Table headers={['Time', 'Decision', 'Query', 'Reason']}>
-            {queries.map((q, i) => (
-              <tr key={i}>
-                <Td>{new Date(q.ts).toLocaleTimeString()}</Td>
-                <Td>
-                  {q.decision && (
-                    <Badge variant={q.decision === 'allow' ? 'green' : 'yellow'}>{q.decision}</Badge>
-                  )}
-                </Td>
-                <Td mono className="max-w-md truncate">{q.query}</Td>
-                <Td className="text-neutral-500">{q.reason ?? '—'}</Td>
-              </tr>
-            ))}
-          </Table>
-        )}
+        <CardHeader>
+          <CardTitle>Queries</CardTitle>
+          <CardDescription>{queries.length} in this session</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {queries.length === 0 ? (
+            <Empty>
+              <EmptyHeader>
+                <EmptyTitle>No queries yet</EmptyTitle>
+                <EmptyDescription>
+                  This session hasn’t run any queries.
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Time</TableHead>
+                  <TableHead>Decision</TableHead>
+                  <TableHead>Query</TableHead>
+                  <TableHead>Reason</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {queries.map((q, i) => (
+                  <TableRow key={i}>
+                    <TableCell className="text-muted-foreground">
+                      {new Date(q.ts).toLocaleTimeString()}
+                    </TableCell>
+                    <TableCell>
+                      {q.decision ? <StatusBadge status={q.decision} /> : null}
+                    </TableCell>
+                    <TableCell className="max-w-md truncate font-mono text-xs">
+                      {q.query}
+                    </TableCell>
+                    <TableCell className="text-muted-foreground">
+                      {q.reason ?? '—'}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
       </Card>
     </div>
   );

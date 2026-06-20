@@ -4,27 +4,36 @@
 
 CREATE SCHEMA IF NOT EXISTS waddling;
 
--- ── Lakehouse endpoints (one per org's DuckLake; an org may have several) ──
-CREATE TABLE IF NOT EXISTS waddling.endpoint (
-  id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-  org_id          TEXT NOT NULL,                       -- → auth.organization.id
-  name            TEXT NOT NULL,                        -- 'prod-lake', 'analytics'
-  slug            TEXT NOT NULL,                        -- url-safe; unique per org
-  status          TEXT NOT NULL DEFAULT 'provisioning'  -- provisioning|running|stopped|error
-                    CHECK (status IN ('provisioning','running','stopped','error')),
-  -- DuckLake binding
-  catalog_dsn     TEXT NOT NULL,        -- postgres DSN for the DuckLake metadata catalog
-  data_path       TEXT NOT NULL,        -- 's3://org-<id>/lake/'  (R2)
-  region          TEXT NOT NULL DEFAULT 'auto',
-  encrypted       BOOLEAN NOT NULL DEFAULT true,
-  -- gateway runtime
-  gateway_host    TEXT,                 -- 'gw-<slug>.getwaddling.com'
-  quack_port      INTEGER,              -- assigned from 9500-9999 pool
-  server_token    TEXT NOT NULL,        -- birdshot server_token for this gateway (secret)
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (org_id, slug)
-);
+-- ── Datalakes (one per org's DuckLake data source; an org may have several) ──
+-- Created here under its legacy name `endpoint`; migration 008 renames it to `datalake`
+-- and drops the dead gateway-compute columns (gateway_host, quack_port — the gateway is
+-- now a dynamic scale-to-zero pool, see apps/dataplane GatewayPoolDO). Guarded so a re-run
+-- AFTER 008 (when `datalake` already exists) does not resurrect a phantom `endpoint`.
+DO $$
+BEGIN
+  IF to_regclass('waddling.datalake') IS NULL THEN
+    CREATE TABLE IF NOT EXISTS waddling.endpoint (
+      id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+      org_id          TEXT NOT NULL,                        -- → auth.organization.id
+      name            TEXT NOT NULL,                        -- 'prod-lake', 'analytics'
+      slug            TEXT NOT NULL,                        -- url-safe; unique per org
+      status          TEXT NOT NULL DEFAULT 'provisioning'  -- provisioning|running|stopped|error
+                        CHECK (status IN ('provisioning','running','stopped','error')),
+      -- DuckLake binding
+      catalog_dsn     TEXT NOT NULL,        -- postgres DSN for the DuckLake metadata catalog
+      data_path       TEXT NOT NULL,        -- 's3://org-<id>/lake/'  (R2)
+      region          TEXT NOT NULL DEFAULT 'auto',
+      encrypted       BOOLEAN NOT NULL DEFAULT true,
+      -- gateway runtime (dropped by 008 — superseded by the dynamic pool)
+      gateway_host    TEXT,
+      quack_port      INTEGER,
+      server_token    TEXT NOT NULL,        -- birdshot server_token (secret) — boots every replica
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (org_id, slug)
+    );
+  END IF;
+END $$;
 
 -- ── Agents: machine principals that hold API keys & receive ACL grants ──
 CREATE TABLE IF NOT EXISTS waddling.agent (
@@ -38,6 +47,8 @@ CREATE TABLE IF NOT EXISTS waddling.agent (
                     CHECK (status IN ('active','suspended','revoked')),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_seen_at    TIMESTAMPTZ,
+  -- Populated by delegated connect path; NULL for autonomous agents. No FK: cross-schema.
+  owner_user_id   TEXT,                                  -- → auth.user.id (nullable)
   UNIQUE (org_id, name)
 );
 
@@ -46,13 +57,26 @@ CREATE TABLE IF NOT EXISTS waddling.acl_rule (
   id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
   org_id          TEXT NOT NULL,
   endpoint_id     TEXT NOT NULL REFERENCES waddling.endpoint(id) ON DELETE CASCADE,
-  agent_id        TEXT REFERENCES waddling.agent(id) ON DELETE CASCADE, -- NULL = org-wide
+  -- Subject selector (migration 010 adds subject_kind/user_id; endpoint_id renamed to
+  -- datalake_id by migration 008, so the column here uses the legacy name for fresh
+  -- schema.sql apply order — migration 008 renames it afterward).
+  agent_id        TEXT REFERENCES waddling.agent(id) ON DELETE CASCADE, -- NULL = org/user-wide
+  subject_kind    TEXT NOT NULL DEFAULT 'agent'
+                    CHECK (subject_kind IN ('agent','user','org')),
+  user_id         TEXT,                                  -- → auth.user.id (no FK: cross-schema)
   -- resource selector (catalog.schema.table.column)
   schema_name     TEXT NOT NULL DEFAULT '*',             -- '*', 'sales', ...
   table_name      TEXT NOT NULL DEFAULT '*',             -- '*', 'orders', ...
   columns         TEXT[],                                -- NULL = all columns; else allow-list
-  -- verb
+  -- verb (legacy; capability supersedes for new rows — kept for backcompat + compiler)
   verb            TEXT NOT NULL CHECK (verb IN ('read','write')),
+  -- capability (full taxonomy; defaults 'read' so old rows are unchanged)
+  capability      TEXT NOT NULL DEFAULT 'read'
+                    CHECK (capability IN (
+                      'read','write','create','drop','alter',
+                      'read_source','copy_to','copy_from',
+                      'attach','detach','install','load','etl'
+                    )),
   effect          TEXT NOT NULL DEFAULT 'allow' CHECK (effect IN ('allow','deny')),
   -- dynamic dimensions (enforced at the layer noted in §3)
   row_limit       INTEGER,                                -- gateway caps result rows (NULL=∞)
@@ -68,8 +92,73 @@ CREATE TABLE IF NOT EXISTS waddling.acl_rule (
 -- Note: spec called for WHERE expires_at IS NULL OR expires_at > now() but now() is STABLE
 -- not IMMUTABLE so Postgres rejects it in index predicates. Using plain index instead;
 -- application-level filtering handles active-rule queries.
-CREATE INDEX IF NOT EXISTS acl_rule_endpoint_agent_idx
-  ON waddling.acl_rule (endpoint_id, agent_id);
+-- Guarded: pre-008 the column is endpoint_id (index acl_rule_endpoint_agent_idx); 008
+-- renames both. Post-rename this is a no-op (the renamed index already exists).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema='waddling' AND table_name='acl_rule' AND column_name='endpoint_id') THEN
+    CREATE INDEX IF NOT EXISTS acl_rule_endpoint_agent_idx ON waddling.acl_rule (endpoint_id, agent_id);
+  END IF;
+END $$;
+
+-- Composite lookup index on acl_rule for the derive+compile spine (datalake_id only
+-- exists after migration 008; subject_kind/user_id only after migration 010; guard on
+-- BOTH so a post-008/pre-010 re-run (reachable on partial failure) skips safely and
+-- lets migration 010 add the columns before the index is created.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema='waddling' AND table_name='acl_rule' AND column_name='datalake_id')
+     AND EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='waddling' AND table_name='acl_rule' AND column_name='subject_kind') THEN
+    CREATE INDEX IF NOT EXISTS acl_rule_datalake_subject_idx
+      ON waddling.acl_rule (datalake_id, subject_kind, user_id, agent_id);
+  END IF;
+END $$;
+
+-- ── Delegation scopes (per-user, per-agent capability subsets; migration 010+) ──
+-- Only created when waddling.datalake already exists (post-migration-008). On a
+-- fresh install schema.sql runs first (before 008 renames endpoint→datalake), so
+-- migration 010 itself creates this table. On a re-run against a post-010 DB this
+-- block is a no-op (CREATE TABLE IF NOT EXISTS + FK target exists).
+DO $$
+BEGIN
+  IF to_regclass('waddling.datalake') IS NOT NULL THEN
+    CREATE TABLE IF NOT EXISTS waddling.delegation (
+      id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+      org_id       TEXT NOT NULL,                        -- → auth.organization.id
+      -- Subject (who is permitted to act): at least one of agent_id / client_id NOT NULL.
+      user_id      TEXT NOT NULL,                        -- → auth.user.id (no FK: cross-schema)
+      agent_id     TEXT REFERENCES waddling.agent(id) ON DELETE CASCADE,
+      client_id    TEXT,                                 -- OAuth client_id (Better Auth)
+      -- Resource scope (NULL = all / wildcard)
+      datalake_id  TEXT REFERENCES waddling.datalake(id) ON DELETE CASCADE,
+      schema_name  TEXT NOT NULL DEFAULT '*',
+      table_name   TEXT NOT NULL DEFAULT '*',
+      columns      TEXT[],                               -- NULL = all columns
+      -- Capability (must be a subset of the delegating user's own grants)
+      capability   TEXT NOT NULL
+        CHECK (capability IN (
+          'read','write','create','drop','alter',
+          'read_source','copy_to','copy_from',
+          'attach','detach','install','load','etl'
+        )),
+      -- Dynamic constraints
+      row_limit    INTEGER,
+      window_start TIME,
+      window_end   TIME,
+      expires_at   TIMESTAMPTZ,
+      -- Audit
+      created_by   TEXT NOT NULL,                       -- auth.user.id who created scope
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CONSTRAINT delegation_subject_not_null
+        CHECK (agent_id IS NOT NULL OR client_id IS NOT NULL)
+    );
+    CREATE INDEX IF NOT EXISTS delegation_lookup_idx
+      ON waddling.delegation (user_id, datalake_id, agent_id, client_id);
+  END IF;
+END $$;
 
 -- ── Agent sessions (live ATTACH sessions; NOT Better Auth session) ──
 CREATE TABLE IF NOT EXISTS waddling.agent_session (

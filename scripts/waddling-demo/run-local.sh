@@ -4,13 +4,16 @@
 # Brings up the whole stack:
 #   0. lake-catalog Postgres (Docker, postgres:16) — DuckLake catalog, so the
 #      gateway + ingest jobs can write the lake CONCURRENTLY / LIVE.
-#   1. PGlite socket server  (control-plane Postgres on :5470, pure JS)
-#   2. seed                  (control DB on PGlite; lake schema in the PG catalog
+#   1. PGlite socket server  (control-plane Postgres, pure JS, open port)
+#   2. migrate control DB
+#   3. seed                  (control DB on PGlite; lake schema in the PG catalog
 #                             + local data dir for the parquet — no MinIO)
-#   3. gateway               (DuckDB + the macOS birdshot extension + quack :9500,
+#   4. gateway               (DuckDB + the macOS birdshot extension + quack :9500,
 #                             ctrl :9510)
-#   4. Next.js app           (control plane + dashboard on :3100)
-#   5. external MCP server   (streamable HTTP on :8810)
+#   5. waddling landing page (control plane + dashboard on :3100)
+#   6. web app instance A    (PGlite federated analytics on :3000)
+#   7. web app instance B    (PGlite federated analytics on :3001)
+#   8. external MCP server   (streamable HTTP on :8810)
 #
 # Then prints the login + URLs. Pass --demo to also run the scripted §8 agent
 # walkthrough at the end and exit.
@@ -47,6 +50,19 @@ QUACK_PORT="${QUACK_PORT:-9500}"
 CTRL_PORT="${CTRL_PORT:-9510}"
 APP_PORT="${APP_PORT:-3100}"
 MCP_PORT="${MCP_PORT:-8810}"
+
+# Web app (federated analytics) ─────────────────────────────────────────────────
+WEB_A_PORT="${WEB_A_PORT:-3000}"
+WEB_A_PG_PORT="${WEB_A_PG_PORT:-5432}"
+WEB_A_AUTH_PG_PORT="${WEB_A_AUTH_PG_PORT:-5442}"
+WEB_A_QUACK_PORT="${WEB_A_QUACK_PORT:-9494}"
+WEB_A_DATA_DIR="${WEB_A_DATA_DIR:-${REPO_ROOT}/pgdata-a}"
+
+WEB_B_PORT="${WEB_B_PORT:-3001}"
+WEB_B_PG_PORT="${WEB_B_PG_PORT:-5433}"
+WEB_B_AUTH_PG_PORT="${WEB_B_AUTH_PG_PORT:-5443}"
+WEB_B_QUACK_PORT="${WEB_B_QUACK_PORT:-9495}"
+WEB_B_DATA_DIR="${WEB_B_DATA_DIR:-${REPO_ROOT}/pgdata-b}"
 
 # 127.0.0.1 (not 'localhost') forces IPv4 → our PGlite socket server, side-stepping
 # any leftover Docker proxy that may be bound to the same port over IPv6.
@@ -108,8 +124,10 @@ cd "${REPO_ROOT}"
 # data dir + the local lake files, and drop the lake-catalog container + its volume
 # so step 0 recreates an empty catalog. Everything then reseeds from scratch.
 if [ "${FRESH:-}" = "1" ]; then
-  echo "==> [fresh] wiping control DB + lake for a clean-slate boot"
+  echo "==> [fresh] wiping control DB + lake + web app data for a clean-slate boot"
   rm -rf "${LOCAL_DIR}/pgdata" "${LOCAL_DIR}/lake"
+  rm -rf "${WEB_A_DATA_DIR}" "${WEB_A_DATA_DIR}-auth" "${WEB_A_DATA_DIR}-private"
+  rm -rf "${WEB_B_DATA_DIR}" "${WEB_B_DATA_DIR}-auth" "${WEB_B_DATA_DIR}-private"
   docker rm -f "${LAKE_PG_CONTAINER}" >/dev/null 2>&1 || true
   docker volume rm waddling_lake_pg >/dev/null 2>&1 || true
 fi
@@ -120,10 +138,10 @@ fi
 # Port: reuse a running container's mapped host port; otherwise bind an OPEN one.
 if [ -n "$(docker ps -q -f name="^${LAKE_PG_CONTAINER}$")" ]; then
   LAKE_PG_PORT="$(docker port "${LAKE_PG_CONTAINER}" 5432/tcp | head -1 | sed 's/.*://')"
-  echo "==> [0/7] lake-catalog Postgres (reusing running ${LAKE_PG_CONTAINER} :${LAKE_PG_PORT})"
+  echo "==> [0/8] lake-catalog Postgres (reusing running ${LAKE_PG_CONTAINER} :${LAKE_PG_PORT})"
 else
   LAKE_PG_PORT="${LAKE_PG_PORT:-$(free_port)}"
-  echo "==> [0/7] lake-catalog Postgres (new ${LAKE_PG_CONTAINER} :${LAKE_PG_PORT})"
+  echo "==> [0/8] lake-catalog Postgres (new ${LAKE_PG_CONTAINER} :${LAKE_PG_PORT})"
   docker rm -f "${LAKE_PG_CONTAINER}" >/dev/null 2>&1 || true
   docker run -d --name "${LAKE_PG_CONTAINER}" \
     -e POSTGRES_USER=waddling -e POSTGRES_PASSWORD=waddling -e POSTGRES_DB=ducklake \
@@ -136,7 +154,7 @@ export DUCKLAKE_CATALOG_DSN="dbname=ducklake host=127.0.0.1 port=${LAKE_PG_PORT}
 wait_ready "docker exec ${LAKE_PG_CONTAINER} pg_isready -U waddling" "lake-postgres"
 
 # 1. PGlite control-plane Postgres ────────────────────────────────────────────
-echo "==> [1/7] PGlite control-plane Postgres on :${PG_PORT}"
+echo "==> [1/8] PGlite control-plane Postgres on :${PG_PORT}"
 PGDATA_DIR="${LOCAL_DIR}/pgdata" PG_PORT="${PG_PORT}" \
   ${TSX} "${SCRIPT_DIR}/local/pg-server.ts" >"${LOG_DIR}/pg-server.log" 2>&1 &
 PIDS+=($!)
@@ -145,20 +163,20 @@ wait_ready "node -e \"require('net').connect(${PG_PORT},'127.0.0.1').on('connect
 # 2. Migrate control DB BEFORE anything reads it: waddling schema + every
 #    migrations-NNN-*.sql + Better Auth getMigrations (creates the OAuth/mcp
 #    tables). Idempotent; runs against the just-started control-plane port.
-echo "==> [2/7] migrating control DB (schema + migrations + better-auth/oauth)"
+echo "==> [2/8] migrating control DB (schema + migrations + better-auth/oauth)"
 ${TSX} "${REPO_ROOT}/scripts/migrate.ts" >"${LOG_DIR}/migrate.log" 2>&1 || {
   echo "!! migrate failed — tail:"; tail -20 "${LOG_DIR}/migrate.log"; exit 1; }
 echo "==> migrate complete"
 
 # 3. Seed (runs to completion, then EXITS so the gateway can open the lake) ─────
-echo "==> [3/7] seeding control DB + local DuckLake"
+echo "==> [3/8] seeding control DB + local DuckLake"
 GATEWAY_HOST=localhost \
   ${TSX} "${SCRIPT_DIR}/seed.ts" >"${LOG_DIR}/seed.log" 2>&1 || {
     echo "!! seed failed — tail:"; tail -20 "${LOG_DIR}/seed.log"; exit 1; }
 echo "==> seed complete"
 
 # 4. Gateway (DuckDB + birdshot + quack) ───────────────────────────────────────
-echo "==> [4/7] gateway (quack :${QUACK_PORT}, ctrl :${CTRL_PORT})"
+echo "==> [4/8] gateway (quack :${QUACK_PORT}, ctrl :${CTRL_PORT})"
 QUACK_PORT="${QUACK_PORT}" CTRL_PORT="${CTRL_PORT}" \
 JWKS_URL="http://localhost:${APP_PORT}/api/auth/jwks" \
   ${TSX} "${REPO_ROOT}/packages/gateway/src/index.ts" >"${LOG_DIR}/gateway.log" 2>&1 &
@@ -168,7 +186,7 @@ wait_ready "curl -sf http://localhost:${CTRL_PORT}/gw/health" "gateway"
 # 5. Next.js app / control plane ───────────────────────────────────────────────
 # DATABASE_URL is passed inline → it's in process.env, which Next.js will NOT
 # override from .env.local, so the app always uses the freshly-seeded control DB.
-echo "==> [5/7] control plane app on :${APP_PORT}"
+echo "==> [5/8] waddling landing page on :${APP_PORT}"
 ( cd "${REPO_ROOT}/apps/waddling" && \
   DATABASE_URL="${DATABASE_URL}" PORT="${APP_PORT}" \
   GATEWAY_INTERNAL_URL="http://localhost:${CTRL_PORT}" \
@@ -177,8 +195,48 @@ echo "==> [5/7] control plane app on :${APP_PORT}"
 PIDS+=($!)
 wait_ready "curl -sf http://localhost:${APP_PORT}/api/auth/jwks" "app" 90
 
-# 6. External MCP server ────────────────────────────────────────────────────────
-echo "==> [6/7] external MCP server on :${MCP_PORT}"
+# 6. Web app instance A (federated analytics, PGlite + DuckDB + quack) ────────
+echo "==> [6/8] web app instance A on :${WEB_A_PORT}"
+( cd "${REPO_ROOT}/apps/web" && \
+  NEXT_DIST_DIR=.next-a \
+  PORT="${WEB_A_PORT}" \
+  PG_PORT="${WEB_A_PG_PORT}" \
+  AUTH_PG_PORT="${WEB_A_AUTH_PG_PORT}" \
+  BASE_URL="http://localhost:${WEB_A_PORT}" \
+  BETTER_AUTH_SECRET="instance-a-secret-0123456789abcdef" \
+  BIRDSHOT_EXTENSION_PATH="${BIRDSHOT_EXTENSION_PATH}" \
+  DATA_DIR="${WEB_A_DATA_DIR}" \
+  INSTANCE=A \
+  QUACK_PORT="${WEB_A_QUACK_PORT}" \
+  QUACK_TOKEN="token-a" \
+  PEER_QUACK_PORT="${WEB_B_QUACK_PORT}" \
+  PEER_QUACK_TOKEN="token-b" \
+  npx next dev -p "${WEB_A_PORT}" ) >"${LOG_DIR}/web-a.log" 2>&1 &
+PIDS+=($!)
+wait_ready "curl -sf http://localhost:${WEB_A_PORT}/api/auth/jwks" "web-a" 90
+
+# 7. Web app instance B ────────────────────────────────────────────────────────
+echo "==> [7/8] web app instance B on :${WEB_B_PORT}"
+( cd "${REPO_ROOT}/apps/web" && \
+  NEXT_DIST_DIR=.next-b \
+  PORT="${WEB_B_PORT}" \
+  PG_PORT="${WEB_B_PG_PORT}" \
+  AUTH_PG_PORT="${WEB_B_AUTH_PG_PORT}" \
+  BASE_URL="http://localhost:${WEB_B_PORT}" \
+  BETTER_AUTH_SECRET="instance-b-secret-fedcba9876543210" \
+  BIRDSHOT_EXTENSION_PATH="${BIRDSHOT_EXTENSION_PATH}" \
+  DATA_DIR="${WEB_B_DATA_DIR}" \
+  INSTANCE=B \
+  QUACK_PORT="${WEB_B_QUACK_PORT}" \
+  QUACK_TOKEN="token-b" \
+  PEER_QUACK_PORT="${WEB_A_QUACK_PORT}" \
+  PEER_QUACK_TOKEN="token-a" \
+  npx next dev -p "${WEB_B_PORT}" ) >"${LOG_DIR}/web-b.log" 2>&1 &
+PIDS+=($!)
+wait_ready "curl -sf http://localhost:${WEB_B_PORT}/api/auth/jwks" "web-b" 90
+
+# 8. External MCP server ────────────────────────────────────────────────────────
+echo "==> [8/8] external MCP server on :${MCP_PORT}"
 WADDLING_URL="http://localhost:${APP_PORT}" MCP_HTTP_PORT="${MCP_PORT}" WADDLING_TELEMETRY=0 \
   WADDLING_MCP_RESOURCE="${WADDLING_MCP_RESOURCE}" WADDLING_MCP_OAUTH=1 \
   ${TSX} "${REPO_ROOT}/packages/mcp-external/src/index.ts" --http >"${LOG_DIR}/mcp-external.log" 2>&1 &
@@ -189,13 +247,16 @@ echo ""
 echo "════════════════════════════════════════════════════════════"
 echo " waddling demo is UP (host-native, no Docker)"
 echo "════════════════════════════════════════════════════════════"
-echo "  Dashboard : http://localhost:${APP_PORT}"
-echo "  Login     : admin@acme.test  /  waddling-demo"
-echo "  MCP (HTTP): http://localhost:${MCP_PORT}   (Bearer = agent API key)"
+echo "  Waddling landing  : http://localhost:${APP_PORT}"
+echo "  Login             : admin@acme.test  /  waddling-demo"
+echo "  MCP (HTTP)        : http://localhost:${MCP_PORT}   (Bearer = agent API key)"
 echo "  Agent keys: analyst  sk_agent_analyst_demo"
 echo "              etl-bot  sk_agent_etlbot_demo"
 echo "              admin    sk_agent_admin_demo"
-echo "  Logs      : ${LOG_DIR}/"
+echo ""
+echo "  Web app instance A : http://localhost:${WEB_A_PORT}"
+echo "  Web app instance B : http://localhost:${WEB_B_PORT}"
+echo "  Logs               : ${LOG_DIR}/"
 echo "════════════════════════════════════════════════════════════"
 
 if [ "${1:-}" = "--demo" ]; then

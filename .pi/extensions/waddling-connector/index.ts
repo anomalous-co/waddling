@@ -4,7 +4,10 @@
  *
  * Configure:
  *   export WADDLING_API_KEY=sk_agent_analyst_demo
- *   export WADDLING_MCP_URL=http://localhost:8810    # default
+ *   export WADDLING_MCP_URL=http://localhost:8810    # override for local dev
+ *
+ * Defaults to the deployed control plane (https://app.getwaddling.com).
+ * Set WADDLING_MCP_URL to point at a local MCP server for development.
  *
  * The connector registers all 10 waddling MCP tools as pi tools.
  * Sessions (waddling_connect → waddling_query) are tracked automatically.
@@ -20,7 +23,7 @@ import { Type } from "typebox";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const MCP_URL = process.env.WADDLING_MCP_URL ?? "http://localhost:8810";
+const MCP_URL = process.env.WADDLING_MCP_URL ?? "https://app.getwaddling.com";
 const API_KEY = process.env.WADDLING_API_KEY;
 
 // ── MCP client (JSON-RPC over streamable HTTP) ────────────────────────────────

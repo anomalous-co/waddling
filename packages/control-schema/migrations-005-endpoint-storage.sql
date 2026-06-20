@@ -13,27 +13,34 @@
 -- Additive: the legacy plaintext catalog_dsn/server_token columns are left as-is
 -- (new endpoints stop writing secrets to catalog_dsn — see api/cp/endpoints).
 
-ALTER TABLE waddling.endpoint
-  ADD COLUMN IF NOT EXISTS storage_provider  TEXT,     -- 'config' (static creds) | 'credential_chain'
-  ADD COLUMN IF NOT EXISTS storage_endpoint  TEXT,     -- S3 endpoint host (R2/MinIO); NULL/'' = AWS default
-  ADD COLUMN IF NOT EXISTS storage_region    TEXT,     -- 'auto', 'eu-north-1', …
-  ADD COLUMN IF NOT EXISTS storage_url_style TEXT,     -- 'vhost' | 'path' (MinIO needs path)
-  ADD COLUMN IF NOT EXISTS storage_use_ssl   BOOLEAN,  -- false for MinIO; true for R2/S3
-  ADD COLUMN IF NOT EXISTS catalog_mode      TEXT,     -- 'managed-local' | 'byo-postgres' (NULL = legacy)
-  ADD COLUMN IF NOT EXISTS catalog_file      TEXT;     -- local DuckLake catalog file (managed-local mode)
+-- Guarded so the chain stays re-run-safe after migration 008 renames endpoint→datalake:
+-- post-rename `endpoint` is gone (these columns/secret live on datalake/datalake_secret),
+-- so this becomes a no-op. Pre-008 (legacy DB) it runs exactly as before.
+DO $$
+BEGIN
+  IF to_regclass('waddling.endpoint') IS NOT NULL THEN
+    ALTER TABLE waddling.endpoint
+      ADD COLUMN IF NOT EXISTS storage_provider  TEXT,
+      ADD COLUMN IF NOT EXISTS storage_endpoint  TEXT,
+      ADD COLUMN IF NOT EXISTS storage_region    TEXT,
+      ADD COLUMN IF NOT EXISTS storage_url_style TEXT,
+      ADD COLUMN IF NOT EXISTS storage_use_ssl   BOOLEAN,
+      ADD COLUMN IF NOT EXISTS catalog_mode      TEXT,
+      ADD COLUMN IF NOT EXISTS catalog_file      TEXT;
 
--- Envelope-encrypted secret material. One row per (endpoint, kind):
---   'storage' → { keyId, secret, sessionToken? }   (object-store creds)
---   'catalog' → { dsn }                             (BYO postgres catalog DSN)
--- Managed-local catalogs have no 'catalog' row; credential_chain storage has no
--- 'storage' row. iv/auth_tag/ciphertext are the AES-256-GCM parts (see secret-crypto).
-CREATE TABLE IF NOT EXISTS waddling.endpoint_secret (
-  endpoint_id  TEXT NOT NULL REFERENCES waddling.endpoint(id) ON DELETE CASCADE,
-  kind         TEXT NOT NULL CHECK (kind IN ('storage','catalog')),
-  iv           BYTEA NOT NULL,
-  auth_tag     BYTEA NOT NULL,
-  ciphertext   BYTEA NOT NULL,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (endpoint_id, kind)
-);
+    -- Envelope-encrypted secret material. One row per (endpoint, kind):
+    --   'storage' → { keyId, secret, sessionToken? } ; 'catalog' → { dsn }
+    -- iv/auth_tag/ciphertext are the AES-256-GCM parts (see secret-crypto). Renamed to
+    -- waddling.datalake_secret by migration 008.
+    CREATE TABLE IF NOT EXISTS waddling.endpoint_secret (
+      endpoint_id  TEXT NOT NULL REFERENCES waddling.endpoint(id) ON DELETE CASCADE,
+      kind         TEXT NOT NULL CHECK (kind IN ('storage','catalog')),
+      iv           BYTEA NOT NULL,
+      auth_tag     BYTEA NOT NULL,
+      ciphertext   BYTEA NOT NULL,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (endpoint_id, kind)
+    );
+  END IF;
+END $$;

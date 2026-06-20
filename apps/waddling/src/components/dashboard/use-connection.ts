@@ -14,7 +14,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { fetchCp, cpPost } from './fetch';
 import { cpUrl } from '@/lib/control-api';
 import type {
-  EndpointSummary,
+  // The hook's internal vars/fields still read `endpoint*` (a deliberate
+  // non-rename — the public datalake concept lives in the page UI, not this
+  // run-as-agent gateway plumbing). Alias the renamed summary type to match.
+  DatalakeSummary as EndpointSummary,
   AgentSummary,
   ConnectResult,
   QueryResult,
@@ -78,12 +81,12 @@ export function useGatewayConnection(): GatewayConnection {
   useEffect(() => {
     void (async () => {
       const [e, a] = await Promise.all([
-        fetchCp<{ endpoints: EndpointSummary[] }>('/api/cp/endpoints'),
+        fetchCp<{ datalakes: EndpointSummary[] }>('/api/cp/datalakes'),
         fetchCp<{ agents: AgentSummary[] }>('/api/cp/agents'),
       ]);
       if (e.ok) {
-        setEndpoints(e.data.endpoints);
-        const running = e.data.endpoints.find((x) => x.status === 'running');
+        setEndpoints(e.data.datalakes);
+        const running = e.data.datalakes.find((x) => x.status === 'running');
         if (running) setEndpointIdState(running.id);
       }
       if (a.ok) {

@@ -24,7 +24,7 @@ const PLAN_COPY = [
     ctaHref: appUrl('/dashboard'),
     highlight: false,
     features: [
-      '1 endpoint · 2 agents',
+      '1 data lake · 2 agents',
       'Static reader / writer roles',
       'Audit log (7-day retention)',
       'Dashboard + usage view',
@@ -44,7 +44,7 @@ const PLAN_COPY = [
     ctaHref: appUrl('/dashboard?plan=pro'),
     highlight: true,
     features: [
-      'Up to 5 endpoints',
+      'Up to 5 data lakes',
       '25 agents',
       'Full dynamic ACL (column · row limit · time window · TTL · instant revoke)',
       'Internal MCP admin server',
@@ -63,7 +63,7 @@ const PLAN_COPY = [
     ctaHref: '/enterprise',
     highlight: false,
     features: [
-      'Unlimited endpoints + agents',
+      'Unlimited data lakes + agents',
       'Dedicated isolated gateways',
       'Dedicated encrypted R2 buckets',
       'SSO / SAML',
@@ -173,7 +173,7 @@ export default function PricingPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800/60">
-              <Row label="endpoints" free={freeEndpoints} pro={proEndpoints} enterprise="unlimited" />
+              <Row label="data lakes" free={freeEndpoints} pro={proEndpoints} enterprise="unlimited" />
               <Row label="agents" free={freeAgents} pro={proAgents} enterprise="unlimited" />
               <Row label="dynamic ACL (column · row · time)" free="✗" pro="✓" enterprise="✓" proGreen />
               <Row label="instant revoke (birdshot denylist)" free="✗" pro="✓" enterprise="✓" proGreen />

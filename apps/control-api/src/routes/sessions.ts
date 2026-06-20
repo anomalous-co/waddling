@@ -25,7 +25,7 @@
  * Session JWT claims (§3a + birdshot identity mapping):
  *   id  = agent:<agentId>   ← birdshot reads THIS as the principal
  *   sub = agent:<agentId>   ← belt-and-suspenders
- *   iss = JWT_ISSUER, aud = gw:<endpointId>, exp = now+15m, jti = <uuid>
+ *   iss = JWT_ISSUER, aud = gw:<datalakeId>, exp = now+15m, jti = <uuid>
  *   header.kid = jwks row id (matches /api/auth/jwks → birdshot_add_jwk)
  * The private key is the plaintext private JWK from the `jwks` table — readable
  * because the jwt plugin runs with disablePrivateKeyEncryption:true (see lib/auth).
@@ -44,7 +44,8 @@ import { Hono } from 'hono';
 import { importJWK, SignJWT, type JWK } from 'jose';
 import { query, queryOne, withTransaction } from '../lib/db';
 import type { Env } from '../lib/env';
-import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
+import { grantsForAgent } from '../lib/policy-compiler';
+import { compileEndpointPolicy } from '../lib/effective-policy';
 import {
   resolveAgentIdentity,
   captureAgentEvent,
@@ -109,17 +110,17 @@ async function dpFetch(
  * and swallow errors so it never affects the query response.
  */
 async function recordQueryAudit(
-  sess: { org_id: string; agent_id: string; endpoint_id: string },
+  sess: { org_id: string; agent_id: string; datalake_id: string },
 ): Promise<void> {
   // Usage — exactly one query ran in this session.
   await query(
-    `INSERT INTO waddling.usage_event (org_id, agent_id, endpoint_id, kind, quantity)
+    `INSERT INTO waddling.usage_event (org_id, agent_id, datalake_id, kind, quantity)
        VALUES ($1, $2, $3, 'query', 1)`,
-    [sess.org_id, sess.agent_id, sess.endpoint_id],
+    [sess.org_id, sess.agent_id, sess.datalake_id],
   );
 
   // Drain birdshot's audit log from the per-endpoint gateway and persist each record.
-  const drained = await gatewayClientFor().drainAudit(sess.endpoint_id);
+  const drained = await gatewayClientFor().drainAudit(sess.datalake_id);
   const records = drained?.records ?? [];
   if (records.length === 0) return;
 
@@ -139,7 +140,7 @@ async function recordQueryAudit(
       rec.tsUs,
       rec.event,
       agentId,
-      sess.endpoint_id,
+      sess.datalake_id,
       rec.decision || null,
       rec.reason || null,
       rec.query || null,
@@ -148,7 +149,7 @@ async function recordQueryAudit(
   if (tuples.length === 0) return;
   await query(
     `INSERT INTO waddling.audit_event
-       (org_id, ts, source, event, agent_id, endpoint_id, decision, reason, query)
+       (org_id, ts, source, event, agent_id, datalake_id, decision, reason, query)
      VALUES ${tuples.join(', ')}`,
     params,
   );
@@ -166,18 +167,23 @@ function sessionPolicy(env: Env): 'supersede' | 'reject' {
   return env.WADDLING_AGENT_SESSION_POLICY === 'reject' ? 'reject' : 'supersede';
 }
 
-const ConnectSchema = z.object({
-  endpointId: z.string().min(1),
-  agentId: z.string().optional(),
-});
+// Accept `endpointId` too: the MCP waddling_connect tool (an external agent-facing
+// contract) still sends the legacy key. Either resolves to the datalake id.
+const ConnectSchema = z
+  .object({
+    datalakeId: z.string().min(1).optional(),
+    endpointId: z.string().min(1).optional(),
+    agentId: z.string().optional(),
+  })
+  .refine((s) => Boolean(s.datalakeId || s.endpointId), {
+    message: 'datalakeId (or endpointId) is required',
+  });
 const KillSchema = z.object({ sessionId: z.string().min(1), reason: z.string().optional() });
 
 interface EndpointRow {
   id: string;
   org_id: string;
   status: string;
-  gateway_host: string | null;
-  quack_port: number | null;
   server_token: string;
 }
 
@@ -217,7 +223,7 @@ interface SessionListRow {
   id: string;
   org_id: string;
   agent_id: string;
-  endpoint_id: string;
+  datalake_id: string;
   sid: string;
   status: 'active' | 'expired' | 'revoked' | 'killed';
   granted_roles: string[];
@@ -236,7 +242,7 @@ interface SessionDetailRow {
   agent_id: string;
   agent_name: string | null;
   owner: string | null;
-  endpoint_id: string;
+  datalake_id: string;
   endpoint_name: string | null;
 }
 
@@ -251,7 +257,7 @@ sessions.get('/', (c) =>
     const agentId = u.searchParams.get('agentId');
 
     const rows = await query<SessionListRow>(
-      `SELECT id, org_id, agent_id, endpoint_id, sid, status, granted_roles, started_at, expires_at
+      `SELECT id, org_id, agent_id, datalake_id, sid, status, granted_roles, started_at, expires_at
          FROM waddling.agent_session
         WHERE org_id = $1
           AND ($2::text IS NULL OR status = $2)
@@ -264,7 +270,7 @@ sessions.get('/', (c) =>
       id: r.id,
       orgId: r.org_id,
       agentId: r.agent_id,
-      endpointId: r.endpoint_id,
+      datalakeId: r.datalake_id,
       sid: r.sid,
       status: r.status,
       grantedRoles: r.granted_roles,
@@ -280,12 +286,14 @@ sessions.post('/', (c) =>
     // allowDelegated=true: this is the one data-plane route OAuth/MCP tokens may use.
     // requireOrg=false: the org is derived from the chosen endpoint below.
     const caller = await resolveCaller(c, false, true);
-    const { endpointId, agentId: requestedAgentId } = await parseBody(c, ConnectSchema);
+    const connectBody = await parseBody(c, ConnectSchema);
+    const datalakeId = (connectBody.datalakeId ?? connectBody.endpointId)!;
+    const requestedAgentId = connectBody.agentId;
 
     const endpoint = await queryOne<EndpointRow>(
-      `SELECT id, org_id, status, gateway_host, quack_port, server_token
-         FROM waddling.endpoint WHERE id = $1`,
-      [endpointId],
+      `SELECT id, org_id, status, server_token
+         FROM waddling.datalake WHERE id = $1`,
+      [datalakeId],
     );
     if (!endpoint) return err(c, 'endpoint_not_found', 404);
     if (endpoint.status !== 'running') {
@@ -314,11 +322,11 @@ sessions.post('/', (c) =>
       // Idempotent upsert on (org_id, name) — deterministic per user, so concurrent
       // first-connects don't race to insert. No API key (api_key_id stays NULL).
       const prov = await queryOne<{ id: string }>(
-        `INSERT INTO waddling.agent (org_id, name, description, mode, status)
-         VALUES ($1, $2, $3, 'delegated', 'active')
-         ON CONFLICT (org_id, name) DO UPDATE SET last_seen_at = now()
+        `INSERT INTO waddling.agent (org_id, name, description, mode, status, owner_user_id)
+         VALUES ($1, $2, $3, 'delegated', 'active', $4)
+         ON CONFLICT (org_id, name) DO UPDATE SET last_seen_at = now(), owner_user_id = EXCLUDED.owner_user_id
          RETURNING id`,
-        [endpoint.org_id, `claude:${caller.callerId}`, `Delegated MCP agent for user ${caller.callerId}`],
+        [endpoint.org_id, `claude:${caller.callerId}`, `Delegated MCP agent for user ${caller.callerId}`, caller.callerId],
       );
       if (!prov) return err(c, 'agent_provision_failed', 500);
       agentId = prov.id;
@@ -360,14 +368,14 @@ sessions.post('/', (c) =>
       // one-active unique index.
       await query(
         `UPDATE waddling.agent_session SET status='expired', ended_at=now()
-          WHERE agent_id = $1 AND endpoint_id = $2 AND status = 'active'
+          WHERE agent_id = $1 AND datalake_id = $2 AND status = 'active'
             AND origin = 'agent' AND expires_at <= now()`,
-        [agentId, endpointId],
+        [agentId, datalakeId],
       );
       const existing = await query<{ id: string; jwt_jti: string }>(
         `SELECT id, jwt_jti FROM waddling.agent_session
-          WHERE agent_id = $1 AND endpoint_id = $2 AND status = 'active' AND origin = 'agent'`,
-        [agentId, endpointId],
+          WHERE agent_id = $1 AND datalake_id = $2 AND status = 'active' AND origin = 'agent'`,
+        [agentId, datalakeId],
       );
       if (existing.rows.length > 0 && sessionPolicy(c.env) === 'reject') {
         return err(
@@ -381,23 +389,61 @@ sessions.post('/', (c) =>
     }
 
     // Compile the WHOLE endpoint's policy (every agent), NOT just this agent's. The
-    // GatewayDO is shared per endpoint (`gw:<endpointId>`) and applySnapshot does a
+    // GatewayDO is shared per endpoint (`gw:<datalakeId>`) and applySnapshot does a
     // full birdshot_reset_config → re-add → commit, so pushing only the connecting
     // agent's grants would WIPE every other agent's grants on the shared gateway. The
     // per-agent `granted` view is then extracted from the same full compile.
+    //
+    // compileEndpointPolicy loads all acl_rule rows, derives effective grants for every
+    // delegated/owned agent via owner ∩ delegation-scope, unions with direct agent rows,
+    // and calls compilePolicy — so delegated and autonomous-owned agents get derived
+    // grants without requiring direct subject_kind='agent' rows.
     const now = new Date();
-    const ruleRows = await query<AclRuleRow>(
-      `SELECT * FROM waddling.acl_rule WHERE endpoint_id = $1`,
-      [endpointId],
-    );
-    const compiled = compilePolicy(ruleRows.rows, now);
+    const compiled = await compileEndpointPolicy(datalakeId, now);
     const granted = grantsForAgent(compiled, agentId);
     if (granted.tables.length === 0) {
+      // Distinguish the two zero-grant cases so the agent gets a meaningful message:
+      //  - "no user grants on this lake"    → the owner has no subject_kind='user'
+      //    grants on this datalake at all; the agent can't have any either.
+      //  - "delegation scope is empty"      → the owner has user grants but none
+      //    survived the owner ∩ scope intersection (the delegation scope is too
+      //    narrow, expired, or not yet created).
+      // onBehalfOf is the owner user id for both delegated (=callerId) and
+      // autonomous (=identity.onBehalfOf resolved above). For run-as sessions
+      // there is no delegation model, so fall through to the generic message.
+      const ownerUserId =
+        origin === 'delegated'
+          ? caller.callerId
+          : origin === 'agent'
+            ? identity.onBehalfOf ?? null
+            : null;
+      if (ownerUserId) {
+        const userGrant = await query(
+          `SELECT 1 FROM waddling.acl_rule
+            WHERE datalake_id = $1 AND subject_kind = 'user' AND user_id = $2
+            LIMIT 1`,
+          [datalakeId, ownerUserId],
+        );
+        if (userGrant.rows.length > 0) {
+          return err(
+            c,
+            'delegation_scope_empty',
+            403,
+            'This agent has no effective grants on this endpoint: the delegation scope does not overlap with the owner\'s grants (scope may be too narrow, expired, or not yet created)',
+          );
+        }
+        return err(
+          c,
+          'no_grants',
+          403,
+          'The owner user has no grants on this endpoint — an admin must add a user-subject ACL rule before this agent can connect',
+        );
+      }
       return err(c, 'no_grants', 403, 'Agent has no active ACL rules for this endpoint');
     }
 
     // Push the FULL birdshot policy snapshot to the gateway control channel (over the
-    // DATAPLANE binding → boots gw:<endpointId> if cold). Column + window ACLs ride
+    // DATAPLANE binding → boots gw:<datalakeId> if cold). Column + window ACLs ride
     // INSIDE the snapshot (`roleConstraints`), enforced by birdshot's bind-walk.
     const { kid, publicJwk, privateJwk } = await loadSigningKey();
     const gw = gatewayClientFor(endpoint);
@@ -410,7 +456,7 @@ sessions.post('/', (c) =>
     // retryable 503 (the org's PlanetScale DB isn't ready yet).
     let boot;
     try {
-      boot = await resolveGatewayBoot(c.env, endpointId);
+      boot = await resolveGatewayBoot(c.env, datalakeId);
     } catch (e) {
       if (e instanceof CatalogNotReadyError) {
         return err(c, 'catalog_provisioning', 503, e.message);
@@ -422,10 +468,10 @@ sessions.post('/', (c) =>
     }
 
     const snapshotReq: SnapshotRequest = {
-      endpointId,
+      datalakeId,
       auth: {
         issuer: c.env.JWT_ISSUER,
-        audience: `gw:${endpointId}`,
+        audience: `gw:${datalakeId}`,
         mode: 'rs256',
         jwks,
       },
@@ -456,7 +502,7 @@ sessions.post('/', (c) =>
       .setProtectedHeader({ alg: 'RS256', kid })
       .setSubject(principal)
       .setIssuer(c.env.JWT_ISSUER)
-      .setAudience(`gw:${endpointId}`)
+      .setAudience(`gw:${datalakeId}`)
       .setIssuedAt()
       .setJti(jti)
       .setExpirationTime(`${SESSION_TTL_SECONDS}s`)
@@ -472,12 +518,12 @@ sessions.post('/', (c) =>
     // failure surfaces as 500 BEFORE any session row is written (fail-safe: the agent's
     // prior live session, if any, stays intact since the supersede is in the insert txn
     // below).
-    const ws = await resolveWorkspaceForSession(endpoint.org_id, endpointId, agentId);
+    const ws = await resolveWorkspaceForSession(endpoint.org_id, datalakeId, agentId);
     const workspaceKey = await ensureWorkspaceKey(ws.workspaceId, agentId);
     const cfg = await dpFetch(c.env, '/configure', {
       workspaceId: ws.workspaceId,
       agentId,
-      endpointId,
+      datalakeId,
       workspaceKey,
       lakeToken: sessionJwt,
       disableSsl: false, // quack speaks HTTPS:443 (intercepted by the CF egress handler)
@@ -516,13 +562,13 @@ sessions.post('/', (c) =>
         }
         const r = await q<{ id: string }>(
           `INSERT INTO waddling.agent_session
-             (org_id, agent_id, endpoint_id, sid, jwt_jti, status, granted_roles, origin, ip, user_agent, expires_at)
+             (org_id, agent_id, datalake_id, sid, jwt_jti, status, granted_roles, origin, ip, user_agent, expires_at)
            VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10)
            RETURNING id`,
           [
             endpoint.org_id,
             agentId,
-            endpointId,
+            datalakeId,
             jti, // sid = jti (quack sid unknown until ATTACH)
             jti,
             grantedRoles,
@@ -554,7 +600,7 @@ sessions.post('/', (c) =>
           // e2e-gated on Stage D gateway reachability — best-effort; the session is
           // already marked superseded in the DB regardless.
           await gw.revoke({
-            endpointId,
+            datalakeId,
             kind: 'jti',
             id: s.jwt_jti,
             reason: 'superseded by new connect (one-key-per-agent)',
@@ -564,10 +610,10 @@ sessions.post('/', (c) =>
         }
         await query(
           `INSERT INTO waddling.audit_event
-             (org_id, source, event, agent_id, session_id, endpoint_id, decision, reason, actor, agent_mode, on_behalf_of, capability)
+             (org_id, source, event, agent_id, session_id, datalake_id, decision, reason, actor, agent_mode, on_behalf_of, capability)
            VALUES ($1,'control-plane','revoke',$2,$3,$4,'deny',$5,$6,$7,$8,$9)`,
           [
-            endpoint.org_id, agentId, s.id, endpointId,
+            endpoint.org_id, agentId, s.id, datalakeId,
             'superseded by new connect (one-key-per-agent)',
             caller.callerId, identity.mode, onBehalfOf ?? null, CAPABILITY.connect,
           ],
@@ -579,7 +625,7 @@ sessions.post('/', (c) =>
         event: 'agent_session_superseded',
         capability: CAPABILITY.connect,
         onBehalfOf,
-        endpointId,
+        datalakeId,
         extra: { superseded_count: toSupersede.length },
       });
     }
@@ -588,10 +634,10 @@ sessions.post('/', (c) =>
     // stamped on the event so a single agent is legible vs others under the same user.
     await query(
       `INSERT INTO waddling.audit_event
-         (org_id, source, event, agent_id, session_id, endpoint_id, decision, actor, agent_mode, on_behalf_of, capability)
+         (org_id, source, event, agent_id, session_id, datalake_id, decision, actor, agent_mode, on_behalf_of, capability)
        VALUES ($1,'control-plane','attach',$2,$3,$4,'allow',$5,$6,$7,$8)`,
       [
-        endpoint.org_id, agentId, inserted?.id ?? null, endpointId, caller.callerId,
+        endpoint.org_id, agentId, inserted?.id ?? null, datalakeId, caller.callerId,
         identity.mode, onBehalfOf ?? null, CAPABILITY.connect,
       ],
     );
@@ -604,7 +650,7 @@ sessions.post('/', (c) =>
       onBehalfOf,
       sessionId: inserted?.id ?? jti,
       jti,
-      endpointId,
+      datalakeId,
       // ACL/grant detail kept separate from capability (different layer).
       extra: { granted_tables: granted.tables.length, origin },
     });
@@ -623,56 +669,105 @@ sessions.post('/', (c) =>
   }),
 );
 
+type KillResult =
+  | { found: true }
+  | { found: false; notFound: true }
+  | { found: false; forbidden: true };
+
+/**
+ * Shared kill implementation: jti denylist on the gateway + mark 'killed' in the DB
+ * + audit event. Returns a discriminated union so callers can map not-found / forbidden
+ * to proper HTTP responses without re-fetching. Throws only on unexpected DB errors.
+ */
+async function killSessionCore(
+  sessionId: string,
+  callerOrgId: string,
+  callerId: string,
+  reason: string | undefined,
+): Promise<KillResult> {
+  const sess = await queryOne<{
+    id: string;
+    org_id: string;
+    datalake_id: string;
+    jwt_jti: string;
+    agent_id: string;
+  }>(
+    `SELECT id, org_id, datalake_id, jwt_jti, agent_id
+       FROM waddling.agent_session WHERE id = $1`,
+    [sessionId],
+  );
+  if (!sess) return { found: false, notFound: true };
+  // Expose as 404 (not 403) to avoid leaking session ids across orgs.
+  if (sess.org_id !== callerOrgId) return { found: false, notFound: true };
+
+  const endpoint = await queryOne<EndpointRow>(
+    `SELECT id, org_id, status, server_token
+       FROM waddling.datalake WHERE id = $1`,
+    [sess.datalake_id],
+  );
+  if (endpoint) {
+    try {
+      // e2e-gated on Stage D gateway reachability — best-effort; the session is
+      // marked 'killed' below regardless so it can't be reused.
+      await gatewayClientFor(endpoint).revoke({
+        datalakeId: endpoint.id,
+        kind: 'jti',
+        id: sess.jwt_jti,
+        reason: reason ?? 'killed by control plane',
+      });
+    } catch {
+      // gateway may be down; still mark killed so the session can't be reused.
+    }
+  }
+
+  await query(
+    `UPDATE waddling.agent_session SET status='killed', ended_at=now() WHERE id=$1`,
+    [sessionId],
+  );
+  await query(
+    `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, session_id, datalake_id, decision, reason, actor)
+     VALUES ($1,'control-plane','kill',$2,$3,$4,'deny',$5,$6)`,
+    [sess.org_id, sess.agent_id, sessionId, sess.datalake_id, reason ?? null, callerId],
+  );
+
+  return { found: true };
+}
+
 sessions.delete('/', (c) =>
   handle(c, async () => {
     const caller = await resolveCaller(c);
     const { sessionId, reason } = await parseBody(c, KillSchema);
 
-    const sess = await queryOne<{
-      id: string;
-      org_id: string;
-      endpoint_id: string;
-      jwt_jti: string;
-      agent_id: string;
-    }>(
-      `SELECT id, org_id, endpoint_id, jwt_jti, agent_id
-         FROM waddling.agent_session WHERE id = $1`,
-      [sessionId],
-    );
-    if (!sess) return err(c, 'session_not_found', 404);
-    assertOrg(caller, sess.org_id);
-
-    const endpoint = await queryOne<EndpointRow>(
-      `SELECT id, org_id, status, gateway_host, quack_port, server_token
-         FROM waddling.endpoint WHERE id = $1`,
-      [sess.endpoint_id],
-    );
-    if (endpoint) {
-      try {
-        // e2e-gated on Stage D gateway reachability — best-effort; the session is
-        // marked 'killed' below regardless so it can't be reused.
-        await gatewayClientFor(endpoint).revoke({
-          endpointId: endpoint.id,
-          kind: 'jti',
-          id: sess.jwt_jti,
-          reason: reason ?? 'killed by control plane',
-        });
-      } catch {
-        // gateway may be down; still mark killed so the session can't be reused.
-      }
-    }
-
-    await query(
-      `UPDATE waddling.agent_session SET status='killed', ended_at=now() WHERE id=$1`,
-      [sessionId],
-    );
-    await query(
-      `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, session_id, endpoint_id, decision, reason, actor)
-       VALUES ($1,'control-plane','kill',$2,$3,$4,'deny',$5,$6)`,
-      [sess.org_id, sess.agent_id, sessionId, sess.endpoint_id, reason ?? null, caller.callerId],
-    );
+    const result = await killSessionCore(sessionId, caller.orgId, caller.callerId, reason);
+    if (!result.found) return err(c, 'session_not_found', 404);
 
     return ok(c, { success: true, affectedSessions: 1 });
+  }),
+);
+
+/**
+ * POST /:id/kill — org-scoped session kill for the dashboard.
+ * The dashboard calls POST /api/cp/sessions/:id/kill (not DELETE /). This route
+ * implements the same jti-denylist + mark-killed logic as DELETE / but binds the
+ * session id to the URL path param instead of the request body. Returns { ok: true }.
+ * Body is optional; a `reason` string field is forwarded if present.
+ */
+sessions.post('/:id/kill', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const id = c.req.param('id');
+    let reason: string | undefined;
+    try {
+      const body = await c.req.json();
+      if (body && typeof body.reason === 'string') reason = body.reason;
+    } catch {
+      // body is optional — a bodyless POST is fine
+    }
+
+    const result = await killSessionCore(id, caller.orgId, caller.callerId, reason);
+    if (!result.found) return err(c, 'session_not_found', 404);
+
+    return ok(c, { ok: true });
   }),
 );
 
@@ -687,12 +782,12 @@ sessions.get('/:id', (c) =>
               se.started_at, se.expires_at,
               se.agent_id, a.name AS agent_name,
               COALESCE(u.name, u.email) AS owner,
-              se.endpoint_id, e.name AS endpoint_name
+              se.datalake_id, e.name AS endpoint_name
          FROM waddling.agent_session se
          LEFT JOIN waddling.agent a  ON a.id = se.agent_id
          LEFT JOIN "apikey" k        ON k.id = a.api_key_id
          LEFT JOIN "user" u          ON u.id = k."referenceId"
-         LEFT JOIN waddling.endpoint e ON e.id = se.endpoint_id
+         LEFT JOIN waddling.datalake e ON e.id = se.datalake_id
         WHERE se.id = $1`,
       [id],
     );
@@ -734,7 +829,7 @@ sessions.get('/:id', (c) =>
         agentId: s.agent_id,
         agentName: s.agent_name ?? undefined,
         owner: s.owner ?? undefined,
-        endpointId: s.endpoint_id,
+        datalakeId: s.datalake_id,
         endpointName: s.endpoint_name ?? undefined,
         actor: attach?.actor ?? undefined,
         actorName: attach?.actor_name ?? undefined,
@@ -780,10 +875,10 @@ sessions.post('/:id/query', (c) =>
       id: string;
       org_id: string;
       agent_id: string;
-      endpoint_id: string;
+      datalake_id: string;
       status: string;
     }>(
-      `SELECT id, org_id, agent_id, endpoint_id, status
+      `SELECT id, org_id, agent_id, datalake_id, status
          FROM waddling.agent_session WHERE id = $1`,
       [id],
     );
@@ -800,7 +895,7 @@ sessions.post('/:id/query', (c) =>
 
     // Re-resolve the workspace deterministically (idempotent upsert) — the data plane
     // is keyed by (workspaceId, agentId), not the sessionId.
-    const ws = await resolveWorkspaceForSession(sess.org_id, sess.endpoint_id, sess.agent_id);
+    const ws = await resolveWorkspaceForSession(sess.org_id, sess.datalake_id, sess.agent_id);
     const r = await dpFetch(c.env, '/query', {
       workspaceId: ws.workspaceId,
       agentId: sess.agent_id,

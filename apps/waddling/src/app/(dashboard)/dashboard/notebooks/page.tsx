@@ -1,23 +1,45 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Loader2, Play, Pin, Trash2, Plus } from 'lucide-react';
 import {
   Card,
   CardHeader,
-  Button,
-  Input,
+  CardTitle,
+  CardDescription,
+  CardContent,
+} from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
+import {
+  Empty,
+  EmptyHeader,
+  EmptyTitle,
+  EmptyDescription,
+} from '@/components/ui/empty';
+import {
   Select,
-  Badge,
-  Spinner,
-  SectionTitle,
-  EmptyState,
-  Modal,
-} from '@/components/dashboard/ui';
-import { MonacoSql } from '@/components/dashboard/monaco-sql';
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
+import { StatusDot } from '@/components/dashboard/status';
 import { DataTable } from '@/components/dashboard/data-table';
-import { useToast } from '@/components/dashboard/toast';
-import { useGatewayConnection } from '@/components/dashboard/use-connection';
 import { fetchCp, cpPost } from '@/components/dashboard/fetch';
+import { useGatewayConnection } from '@/components/dashboard/use-connection';
+import { toast } from 'sonner';
 import type { QueryResult, TableInfo } from '@/lib/types';
 
 interface NotebookCell {
@@ -25,12 +47,14 @@ interface NotebookCell {
   sql: string;
   title?: string;
 }
+
 interface NotebookSummary {
   id: string;
   name: string;
   cellCount: number;
   updatedAt: string;
 }
+
 interface Notebook {
   id: string;
   name: string;
@@ -51,13 +75,176 @@ const LAST_NB_KEY = 'waddling:lastNotebookId';
 
 const STARTER_SQL = 'SELECT * FROM sales.orders LIMIT 10';
 let cellSeq = 0;
+
 function newCell(sql = STARTER_SQL): NotebookCell {
   cellSeq += 1;
   return { id: `cell-${Date.now()}-${cellSeq}`, sql };
 }
 
+// ── PinDialog ────────────────────────────────────────────────────────────────
+
+function PinDialog({
+  cell,
+  onCancel,
+  onConfirm,
+}: {
+  cell: NotebookCell | null;
+  onCancel: () => void;
+  onConfirm: (name: string) => void;
+}) {
+  const [viewName, setViewName] = useState('');
+
+  useEffect(() => {
+    if (cell) setViewName(cell.title ?? '');
+  }, [cell]);
+
+  return (
+    <Dialog open={cell !== null} onOpenChange={(open) => { if (!open) onCancel(); }}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Pin as view</DialogTitle>
+          <DialogDescription>
+            Save this query as a named view. Views run through a chosen agent on the Views page.
+          </DialogDescription>
+        </DialogHeader>
+        <Input
+          value={viewName}
+          onChange={(e) => setViewName(e.target.value)}
+          placeholder="View name"
+          aria-label="View name"
+          autoFocus
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && viewName.trim()) onConfirm(viewName.trim());
+          }}
+        />
+        <DialogFooter>
+          <Button variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button
+            disabled={!viewName.trim()}
+            onClick={() => onConfirm(viewName.trim())}
+          >
+            Pin view
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── CellCard ────────────────────────────────────────────────────────────────
+
+function CellCard({
+  cell,
+  index,
+  state,
+  onSqlChange,
+  onRun,
+  onPin,
+  onDelete,
+}: {
+  cell: NotebookCell;
+  index: number;
+  state: CellState;
+  onSqlChange: (sql: string) => void;
+  onRun: () => void;
+  onPin: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between gap-3">
+          <CardTitle className="text-sm font-medium text-muted-foreground">
+            Cell {index + 1}
+          </CardTitle>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              onClick={onRun}
+              disabled={state.pending ?? !cell.sql.trim()}
+            >
+              {state.pending ? (
+                <Loader2 data-icon="inline-start" className="animate-spin" />
+              ) : (
+                <Play data-icon="inline-start" />
+              )}
+              Run
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onPin}
+              disabled={!cell.sql.trim()}
+            >
+              <Pin data-icon="inline-start" />
+              Pin as view
+            </Button>
+            <Button variant="ghost" size="sm" onClick={onDelete}>
+              <Trash2 data-icon="inline-start" />
+              Delete
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <Textarea
+          value={cell.sql}
+          onChange={(e) => onSqlChange(e.target.value)}
+          placeholder="SELECT ..."
+          className="min-h-[120px] font-mono text-sm"
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+              e.preventDefault();
+              onRun();
+            }
+          }}
+        />
+
+        {state.denial ? (
+          <Alert>
+            <AlertTitle>Authorization denied</AlertTitle>
+            <AlertDescription>
+              {state.denial.table ? (
+                <span className="font-mono text-xs">{state.denial.table} · </span>
+              ) : null}
+              {state.denial.reason}
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {state.error ? (
+          <Alert variant="destructive">
+            <AlertTitle>Query error</AlertTitle>
+            <AlertDescription>{state.error}</AlertDescription>
+          </Alert>
+        ) : null}
+
+        {state.result ? (
+          <div>
+            {state.result.rows.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No rows returned.</p>
+            ) : (
+              <>
+                <DataTable columns={state.result.columns} rows={state.result.rows} />
+                {state.result.truncated ? (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Results truncated by row limit.
+                  </p>
+                ) : null}
+              </>
+            )}
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── NotebooksPage ────────────────────────────────────────────────────────────
+
 export default function NotebooksPage() {
-  const toast = useToast();
   const gw = useGatewayConnection();
 
   const [notebooks, setNotebooks] = useState<NotebookSummary[]>([]);
@@ -70,6 +257,7 @@ export default function NotebooksPage() {
 
   // Schema for autocomplete: columns + types of the connected agent's granted
   // tables, fetched via the governed describe endpoint after connect.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [schema, setSchema] = useState<TableInfo[]>([]);
 
   // Pin-as-view dialog target (a cell whose SQL should be saved as a view).
@@ -84,7 +272,8 @@ export default function NotebooksPage() {
       setNotebooks(res.data.notebooks);
       if (!restoredRef.current) {
         restoredRef.current = true;
-        const last = typeof window !== 'undefined' ? localStorage.getItem(LAST_NB_KEY) : null;
+        const last =
+          typeof window !== 'undefined' ? localStorage.getItem(LAST_NB_KEY) : null;
         // Only restore if it still exists in this org's notebooks.
         if (last && res.data.notebooks.some((nb) => nb.id === last)) {
           setSelectedId(last);
@@ -106,7 +295,7 @@ export default function NotebooksPage() {
 
   // Probe the connected agent's schema (columns + types) for autocomplete.
   // Scoped to the agent's grants by the describe endpoint; a failed probe just
-  // leaves autocomplete on table names + keywords (it never blocks queries).
+  // leaves autocomplete unavailable (it never blocks queries).
   useEffect(() => {
     if (!gw.conn) {
       setSchema([]);
@@ -114,8 +303,8 @@ export default function NotebooksPage() {
     }
     let active = true;
     void (async () => {
-      const res = await fetchCp<{ endpointId: string; tables: TableInfo[] }>(
-        `/api/cp/endpoints/${gw.conn!.endpointId}/describe?agentId=${encodeURIComponent(gw.conn!.agentId)}`,
+      const res = await fetchCp<{ datalakeId: string; tables: TableInfo[] }>(
+        `/api/cp/datalakes/${gw.conn!.endpointId}/describe?agentId=${encodeURIComponent(gw.conn!.agentId)}`,
       );
       if (active && res.ok) setSchema(res.data.tables);
     })();
@@ -167,7 +356,7 @@ export default function NotebooksPage() {
     await refreshList();
     setSaving(false);
     if (res.ok) toast.success('Notebook saved');
-    else toast.error(res.error);
+    else toast.error((res as { ok: false; error: string }).error);
   }
 
   async function deleteNotebook() {
@@ -184,12 +373,15 @@ export default function NotebooksPage() {
   function patchCell(id: string, patch: Partial<NotebookCell>) {
     setCells((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c)));
   }
-  function setState(id: string, patch: CellState) {
+
+  function patchCellState(id: string, patch: CellState) {
     setCellState((s) => ({ ...s, [id]: { ...s[id], ...patch } }));
   }
+
   function addCell() {
     setCells((cs) => [...cs, newCell('')]);
   }
+
   function deleteCell(id: string) {
     setCells((cs) => cs.filter((c) => c.id !== id));
     setCellState((s) => {
@@ -201,14 +393,19 @@ export default function NotebooksPage() {
 
   async function runCell(cell: NotebookCell) {
     if (!cell.sql.trim()) return;
-    setState(cell.id, { pending: true, error: undefined, denial: undefined, result: undefined });
+    patchCellState(cell.id, {
+      pending: true,
+      error: undefined,
+      denial: undefined,
+      result: undefined,
+    });
     const outcome = await gw.run(cell.sql);
     if (outcome.kind === 'result') {
-      setState(cell.id, { pending: false, result: outcome.result });
+      patchCellState(cell.id, { pending: false, result: outcome.result });
     } else if (outcome.kind === 'denial') {
-      setState(cell.id, { pending: false, denial: outcome.denial });
+      patchCellState(cell.id, { pending: false, denial: outcome.denial });
     } else {
-      setState(cell.id, { pending: false, error: outcome.error });
+      patchCellState(cell.id, { pending: false, error: outcome.error });
     }
   }
 
@@ -217,50 +414,53 @@ export default function NotebooksPage() {
     const res = await cpPost('/api/cp/views', { name: viewName, sql: pinTarget.sql });
     setPinTarget(null);
     if (res.ok) toast.success(`Pinned "${viewName}" to Views`);
-    else toast.error(res.error);
+    else toast.error((res as { ok: false; error: string }).error);
   }
 
   return (
-    <div className="space-y-6">
-      <SectionTitle>Notebooks</SectionTitle>
+    <div className="flex flex-col gap-6">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Notebooks</h1>
+        <p className="text-sm text-muted-foreground">
+          Write governed SQL and run it as any agent through its ACL.
+        </p>
+      </div>
 
       {/* Notebook picker + actions */}
       <div className="flex flex-wrap items-center gap-3">
-        <Select
-          value={selectedId}
-          onChange={(e) => setSelectedId(e.target.value)}
-          className="w-64"
-        >
-          <option value="">Select a notebook…</option>
-          {notebooks.map((nb) => (
-            <option key={nb.id} value={nb.id}>
-              {nb.name} ({nb.cellCount})
-            </option>
-          ))}
-        </Select>
-        <Button variant="secondary" onClick={createNotebook}>
-          + New notebook
+        {loadingList ? (
+          <Skeleton className="h-8 w-64" />
+        ) : (
+          <Select
+            value={selectedId || undefined}
+            onValueChange={(v) => setSelectedId(v)}
+          >
+            <SelectTrigger className="w-64">
+              <SelectValue placeholder="Select a notebook…" />
+            </SelectTrigger>
+            <SelectContent>
+              {notebooks.map((nb) => (
+                <SelectItem key={nb.id} value={nb.id}>
+                  {nb.name} ({nb.cellCount})
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        <Button variant="secondary" onClick={() => void createNotebook()}>
+          <Plus data-icon="inline-start" />
+          New notebook
         </Button>
-        {selectedId && (
-          <Button variant="ghost" onClick={deleteNotebook}>
+        {selectedId ? (
+          <Button variant="ghost" onClick={() => void deleteNotebook()}>
+            <Trash2 data-icon="inline-start" />
             Delete
           </Button>
-        )}
+        ) : null}
       </div>
 
-      {!selectedId ? (
-        loadingList ? (
-          <div className="flex justify-center py-16">
-            <Spinner size="lg" />
-          </div>
-        ) : (
-          <EmptyState
-            title="No notebook open"
-            description="Create a notebook or pick one above to start writing governed SQL."
-          />
-        )
-      ) : (
-        <div className="space-y-5">
+      {selectedId ? (
+        <div className="flex flex-col gap-5">
           {/* Name + save */}
           <div className="flex items-center gap-3">
             <Input
@@ -269,204 +469,150 @@ export default function NotebooksPage() {
               aria-label="Notebook name"
               className="max-w-sm"
             />
-            <Button variant="primary" onClick={save} loading={saving}>
+            <Button onClick={() => void save()} disabled={saving}>
+              {saving ? (
+                <Loader2 data-icon="inline-start" className="animate-spin" />
+              ) : null}
               Save
             </Button>
           </div>
 
-          {/* Run-as context */}
+          {/* Run context */}
           <Card>
-            <CardHeader
-              title="Run context"
-              subtitle="Cells execute AS this agent, through its ACL — exactly what the agent may touch."
-            />
-            <div className="flex flex-wrap items-end gap-3">
-              <div>
-                <label className="text-xs text-neutral-500 block mb-1">Endpoint</label>
-                <Select
-                  value={gw.endpointId}
-                  onChange={(e) => gw.setEndpointId(e.target.value)}
-                  className="w-52"
+            <CardHeader>
+              <CardTitle>Run context</CardTitle>
+              <CardDescription>
+                Cells execute as this agent, through its ACL — exactly what the agent may touch.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="flex flex-wrap items-end gap-3">
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs text-muted-foreground">Data Lake</label>
+                  <Select
+                    value={gw.endpointId || undefined}
+                    onValueChange={(v) => gw.setEndpointId(v)}
+                  >
+                    <SelectTrigger className="w-52">
+                      <SelectValue placeholder="Select data lake…" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {gw.endpoints.map((ep) => (
+                        <SelectItem key={ep.id} value={ep.id}>
+                          {ep.name}
+                          {ep.status !== 'running' ? ` (${ep.status})` : ''}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs text-muted-foreground">Run as agent</label>
+                  <Select
+                    value={gw.agentId || undefined}
+                    onValueChange={(v) => gw.setAgentId(v)}
+                  >
+                    <SelectTrigger className="w-52">
+                      <SelectValue placeholder="Select agent…" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {gw.agents.map((a) => (
+                        <SelectItem key={a.id} value={a.id}>
+                          {a.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <Button
+                  onClick={() => void gw.connect()}
+                  disabled={
+                    gw.connecting ||
+                    !gw.endpointId ||
+                    !gw.agentId ||
+                    gw.selectedEndpoint?.status !== 'running'
+                  }
                 >
-                  {gw.endpoints.map((ep) => (
-                    <option key={ep.id} value={ep.id}>
-                      {ep.name} {ep.status === 'running' ? '' : `(${ep.status})`}
-                    </option>
-                  ))}
-                </Select>
+                  {gw.connecting ? (
+                    <Loader2 data-icon="inline-start" className="animate-spin" />
+                  ) : null}
+                  {gw.conn ? 'Reconnect' : 'Connect'}
+                </Button>
+
+                {gw.conn ? (
+                  <div className="flex items-center gap-1.5 text-sm">
+                    <StatusDot status="active" />
+                    <span>
+                      connected as{' '}
+                      <span className="font-medium">
+                        {gw.selectedAgent?.name ?? 'agent'}
+                      </span>
+                      {' · '}
+                      {gw.conn.grantedTables.length} table
+                      {gw.conn.grantedTables.length === 1 ? '' : 's'}
+                    </span>
+                  </div>
+                ) : gw.connectError ? (
+                  <div className="flex items-center gap-1.5 text-sm text-destructive">
+                    <StatusDot status="error" />
+                    <span>{gw.connectError}</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                    <StatusDot status="idle" />
+                    <span>not connected</span>
+                  </div>
+                )}
               </div>
-              <div>
-                <label className="text-xs text-neutral-500 block mb-1">Run as agent</label>
-                <Select
-                  value={gw.agentId}
-                  onChange={(e) => gw.setAgentId(e.target.value)}
-                  className="w-52"
-                >
-                  {gw.agents.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.name}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <Button
-                variant="primary"
-                onClick={() => gw.connect()}
-                loading={gw.connecting}
-                disabled={
-                  !gw.endpointId || !gw.agentId || gw.selectedEndpoint?.status !== 'running'
-                }
-              >
-                {gw.conn ? 'Reconnect' : 'Connect'}
-              </Button>
-              {gw.conn ? (
-                <Badge variant="green">
-                  connected as {gw.selectedAgent?.name ?? 'agent'} · {gw.conn.grantedTables.length}{' '}
-                  table{gw.conn.grantedTables.length === 1 ? '' : 's'}
-                </Badge>
-              ) : gw.connectError ? (
-                <Badge variant="red">{gw.connectError}</Badge>
-              ) : (
-                <Badge variant="neutral">not connected</Badge>
-              )}
-            </div>
-            {gw.conn && gw.conn.grantedTables.length > 0 && (
-              <p className="mt-2 text-xs text-neutral-500">
-                Granted:{' '}
-                <span className="font-mono text-neutral-400">
-                  {gw.conn.grantedTables.join(', ')}
-                </span>
-              </p>
-            )}
+
+              {gw.conn && gw.conn.grantedTables.length > 0 ? (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  Granted:{' '}
+                  <span className="font-mono">{gw.conn.grantedTables.join(', ')}</span>
+                </p>
+              ) : null}
+            </CardContent>
           </Card>
 
           {/* Cells */}
-          {cells.map((cell, i) => {
-            const st = cellState[cell.id] ?? {};
-            return (
-              <Card key={cell.id}>
-                <CardHeader
-                  title={`Cell ${i + 1}`}
-                  action={
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        onClick={() => runCell(cell)}
-                        loading={st.pending}
-                        disabled={!cell.sql.trim()}
-                      >
-                        ▶ Run
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => setPinTarget(cell)}
-                        disabled={!cell.sql.trim()}
-                      >
-                        ⊕ Pin as view
-                      </Button>
-                      <Button variant="ghost" size="sm" onClick={() => deleteCell(cell.id)}>
-                        Delete
-                      </Button>
-                    </div>
-                  }
-                />
-                <MonacoSql
-                  value={cell.sql}
-                  onChange={(sql) => patchCell(cell.id, { sql })}
-                  tables={gw.conn?.grantedTables ?? []}
-                  schema={schema}
-                  onRun={() => runCell(cell)}
-                />
+          {cells.map((cell, i) => (
+            <CellCard
+              key={cell.id}
+              cell={cell}
+              index={i}
+              state={cellState[cell.id] ?? {}}
+              onSqlChange={(sql) => patchCell(cell.id, { sql })}
+              onRun={() => void runCell(cell)}
+              onPin={() => setPinTarget(cell)}
+              onDelete={() => deleteCell(cell.id)}
+            />
+          ))}
 
-                {st.denial && (
-                  <div className="mt-3 rounded-md border border-yellow-800 bg-yellow-900/30 px-3 py-2 text-sm">
-                    <span className="font-medium text-yellow-300">Authorization denied</span>
-                    {st.denial.table && (
-                      <span className="text-yellow-400/80"> · {st.denial.table}</span>
-                    )}
-                    <p className="mt-0.5 text-yellow-200/80">{st.denial.reason}</p>
-                  </div>
-                )}
-                {st.error && (
-                  <div className="mt-3 rounded-md border border-red-800 bg-red-900/30 px-3 py-2 text-sm text-red-300">
-                    {st.error}
-                  </div>
-                )}
-                {st.result && (
-                  <div className="mt-3">
-                    {st.result.rows.length === 0 ? (
-                      <p className="text-sm text-neutral-500">No rows returned.</p>
-                    ) : (
-                      <>
-                        <DataTable columns={st.result.columns} rows={st.result.rows} />
-                        {st.result.truncated && (
-                          <p className="mt-1 text-xs text-neutral-600">
-                            Results truncated by row limit.
-                          </p>
-                        )}
-                      </>
-                    )}
-                  </div>
-                )}
-              </Card>
-            );
-          })}
-
-          <Button variant="secondary" onClick={addCell}>
-            + Add cell
-          </Button>
+          <div>
+            <Button variant="secondary" onClick={addCell}>
+              <Plus data-icon="inline-start" />
+              Add cell
+            </Button>
+          </div>
         </div>
+      ) : (
+        !loadingList ? (
+          <Empty>
+            <EmptyHeader>
+              <EmptyTitle>No notebook open</EmptyTitle>
+              <EmptyDescription>
+                Create a notebook or pick one above to start writing governed SQL.
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        ) : null
       )}
 
       <PinDialog
         cell={pinTarget}
         onCancel={() => setPinTarget(null)}
-        onConfirm={pinAsView}
+        onConfirm={(n) => void pinAsView(n)}
       />
     </div>
-  );
-}
-
-function PinDialog({
-  cell,
-  onCancel,
-  onConfirm,
-}: {
-  cell: NotebookCell | null;
-  onCancel: () => void;
-  onConfirm: (name: string) => void;
-}) {
-  const [name, setName] = useState('');
-
-  useEffect(() => {
-    if (cell) setName(cell.title ?? '');
-  }, [cell]);
-
-  return (
-    <Modal title="Pin as view" open={cell !== null} onClose={onCancel}>
-      <p className="mb-3 text-xs text-neutral-500">
-        Save this query as a named view. Views run through a chosen agent on the Views page.
-      </p>
-      <Input
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        placeholder="View name"
-        aria-label="View name"
-        autoFocus
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && name.trim()) onConfirm(name.trim());
-        }}
-      />
-      <div className="mt-4 flex justify-end gap-2">
-        <Button variant="ghost" onClick={onCancel}>
-          Cancel
-        </Button>
-        <Button variant="primary" disabled={!name.trim()} onClick={() => onConfirm(name.trim())}>
-          Pin view
-        </Button>
-      </div>
-    </Modal>
   );
 }
