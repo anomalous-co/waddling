@@ -313,11 +313,13 @@
   --border: oklch(0.898 0 0);
   --input: oklch(0.898 0 0);
   --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
+  /* Okabe-Ito colorblind-safe palette. chart-1/chart-2 (the two lines) are a
+     blue/orange pair: separable under every CVD type and by lightness alone. */
+  --chart-1: #0072b2;
+  --chart-2: #e69f00;
+  --chart-3: #009e73;
+  --chart-4: #d55e00;
+  --chart-5: #cc79a7;
   --radius: 5px;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
@@ -348,11 +350,13 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
+  /* Okabe-Ito, tuned for a dark background: sky-blue + orange lines stay
+     high-contrast and CVD-safe. */
+  --chart-1: #56b4e9;
+  --chart-2: #e69f00;
+  --chart-3: #009e73;
+  --chart-4: #d55e00;
+  --chart-5: #cc79a7;
   --sidebar: oklch(0.205 0 0);
   --sidebar-foreground: oklch(0.985 0 0);
   --sidebar-primary: oklch(0.488 0.243 264.376);
@@ -372,5 +376,9 @@
   }
   html {
     @apply font-sans;
+    /* Disable the document rubber-band bounce: without this, scrolling past
+       the top edge bounces the whole page down, dragging the sticky navbar
+       (sticky top-0) down with it. */
+    overscroll-behavior-y: none;
   }
 }

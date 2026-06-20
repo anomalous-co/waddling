@@ -193,38 +193,26 @@ function UserMenu({
   const initial = (user.name || user.email).charAt(0).toUpperCase();
 
   return (
-    <SidebarMenu>
-      <SidebarMenuItem>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <SidebarMenuButton
-              size="lg"
-              className="data-[state=open]:bg-sidebar-accent"
-            >
-              <Avatar className="size-8 rounded-md">
-                {user.image ? (
-                  <AvatarImage
-                    src={user.image}
-                    alt={user.name}
-                    className="rounded-md"
-                  />
-                ) : null}
-                <AvatarFallback className="rounded-md">{initial}</AvatarFallback>
-              </Avatar>
-              <div className="grid flex-1 text-left leading-tight">
-                <span className="truncate font-semibold">{user.name}</span>
-                <span className="truncate text-xs text-muted-foreground">
-                  {user.email}
-                </span>
-              </div>
-              <ChevronsUpDown className="ml-auto text-muted-foreground" />
-            </SidebarMenuButton>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            align="end"
-            side="top"
-            className="w-(--radix-dropdown-menu-trigger-width) min-w-56"
-          >
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label="User menu"
+          className="flex shrink-0 items-center rounded-md outline-none ring-offset-background transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:ring-2 data-[state=open]:ring-ring"
+        >
+          <Avatar className="size-8 rounded-md after:rounded-md">
+            {user.image ? (
+              <AvatarImage
+                src={user.image}
+                alt={user.name}
+                className="rounded-md"
+              />
+            ) : null}
+            <AvatarFallback className="rounded-md">{initial}</AvatarFallback>
+          </Avatar>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" side="bottom" sideOffset={8} className="min-w-56">
             <DropdownMenuLabel className="flex flex-col gap-0.5">
               <span className="truncate font-medium">{user.name}</span>
               <span className="truncate text-xs font-normal text-muted-foreground">
@@ -309,20 +297,12 @@ function UserMenu({
               <LogOut data-icon="inline-start" />
               Sign out
             </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </SidebarMenuItem>
-    </SidebarMenu>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
-function AppSidebar({
-  user,
-  activeOrgId,
-}: {
-  user: UserInfo;
-  activeOrgId?: string;
-}) {
+function AppSidebar() {
   const pathname = usePathname();
   const { state } = useSidebar();
   const collapsed = state === 'collapsed';
@@ -359,8 +339,7 @@ function AppSidebar({
           </SidebarGroup>
         ))}
       </SidebarContent>
-      <SidebarFooter className={cn('flex items-center gap-0', collapsed ? 'flex-col gap-1' : 'flex-row')}>
-        <UserMenu user={user} activeOrgId={activeOrgId} />
+      <SidebarFooter className={cn('flex', collapsed ? 'items-center' : 'items-start')}>
         <SidebarTrigger className="shrink-0" />
       </SidebarFooter>
       <SidebarRail />
@@ -481,6 +460,7 @@ export function DashboardShell({
                 align="center"
               />
             </Link>
+            <div className="w-px shrink-0 self-stretch bg-border" aria-hidden="true" />
             <div className="min-w-0 flex-1 overflow-hidden">
               <Breadcrumbs pathname={pathname} />
             </div>
@@ -492,10 +472,11 @@ export function DashboardShell({
                   <span className="hidden sm:inline">Connect</span>
                 </Link>
               </Button>
+              <UserMenu user={user} activeOrgId={activeOrgId} />
             </div>
           </header>
           <div className="flex flex-1">
-            <AppSidebar user={user} activeOrgId={activeOrgId} />
+            <AppSidebar />
             <SidebarInset className="min-w-0">
               <div className="flex min-w-0 flex-1 flex-col gap-4 p-6">
                 {children}

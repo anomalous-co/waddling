@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Area, AreaChart, Bar, BarChart, CartesianGrid, XAxis, YAxis } from 'recharts';
+import { Bar, BarChart, CartesianGrid, Line, LineChart, XAxis, YAxis } from 'recharts';
 import { RefreshCw } from 'lucide-react';
 import {
   Card,
@@ -278,20 +278,10 @@ export default function UsagePage() {
                 </Empty>
               ) : (
                 <ChartContainer config={chartConfig} className="h-[180px] w-full">
-                  <AreaChart
+                  <LineChart
                     data={data.series}
-                    margin={{ left: 0, right: 0, top: 4, bottom: 0 }}
+                    margin={{ left: 0, right: 0, top: 12, bottom: 0 }}
                   >
-                    <defs>
-                      <linearGradient id="fillUsageQueries" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="var(--color-queries)" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="var(--color-queries)" stopOpacity={0} />
-                      </linearGradient>
-                      <linearGradient id="fillUsageSessions" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="var(--color-sessions)" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="var(--color-sessions)" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
                     <CartesianGrid vertical={false} />
                     <XAxis
                       dataKey="ts"
@@ -309,21 +299,21 @@ export default function UsagePage() {
                         />
                       }
                     />
-                    <Area
+                    <Line
                       dataKey="queries"
                       type="monotone"
                       stroke="var(--color-queries)"
-                      fill="url(#fillUsageQueries)"
                       strokeWidth={2}
+                      dot={false}
                     />
-                    <Area
+                    <Line
                       dataKey="sessions"
                       type="monotone"
                       stroke="var(--color-sessions)"
-                      fill="url(#fillUsageSessions)"
                       strokeWidth={2}
+                      dot={false}
                     />
-                  </AreaChart>
+                  </LineChart>
                 </ChartContainer>
               )}
             </CardContent>
@@ -354,7 +344,7 @@ export default function UsagePage() {
                 >
                   <BarChart
                     data={data.series}
-                    margin={{ left: 0, right: 0, top: 4, bottom: 0 }}
+                    margin={{ left: 0, right: 0, top: 12, bottom: 0 }}
                   >
                     <CartesianGrid vertical={false} />
                     <XAxis

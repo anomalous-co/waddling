@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
-import { Area, AreaChart, CartesianGrid, XAxis } from 'recharts';
+import { CartesianGrid, Line, LineChart, XAxis } from 'recharts';
 import { RefreshCw } from 'lucide-react';
 import {
   Card,
@@ -236,17 +236,7 @@ export default function OverviewPage() {
             </Empty>
           ) : (
             <ChartContainer config={chartConfig} className="h-[160px] w-full">
-              <AreaChart data={data.usageSeries} margin={{ left: 0, right: 0 }}>
-                <defs>
-                  <linearGradient id="fillQueries" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="var(--color-queries)" stopOpacity={0.3} />
-                    <stop offset="95%" stopColor="var(--color-queries)" stopOpacity={0} />
-                  </linearGradient>
-                  <linearGradient id="fillSessions" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="var(--color-sessions)" stopOpacity={0.3} />
-                    <stop offset="95%" stopColor="var(--color-sessions)" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
+              <LineChart data={data.usageSeries} margin={{ top: 12, left: 0, right: 0 }}>
                 <CartesianGrid vertical={false} />
                 <XAxis
                   dataKey="ts"
@@ -262,21 +252,21 @@ export default function OverviewPage() {
                     />
                   }
                 />
-                <Area
+                <Line
                   dataKey="queries"
                   type="monotone"
                   stroke="var(--color-queries)"
-                  fill="url(#fillQueries)"
                   strokeWidth={2}
+                  dot={false}
                 />
-                <Area
+                <Line
                   dataKey="sessions"
                   type="monotone"
                   stroke="var(--color-sessions)"
-                  fill="url(#fillSessions)"
                   strokeWidth={2}
+                  dot={false}
                 />
-              </AreaChart>
+              </LineChart>
             </ChartContainer>
           )}
         </CardContent>
