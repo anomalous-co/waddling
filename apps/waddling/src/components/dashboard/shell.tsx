@@ -356,9 +356,9 @@ function AppSidebar({
           </SidebarGroup>
         ))}
       </SidebarContent>
-      <SidebarFooter className="flex flex-row items-center gap-0">
-        <SidebarTrigger className="shrink-0" />
+      <SidebarFooter className="flex flex-col items-center gap-1">
         <UserMenu user={user} activeOrgId={activeOrgId} />
+        <SidebarTrigger className="shrink-0" />
       </SidebarFooter>
       <SidebarRail />
     </Sidebar>
