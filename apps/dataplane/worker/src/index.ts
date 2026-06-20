@@ -676,6 +676,49 @@ export class GatewayPoolDO extends DurableObject<Env> {
     return { destroyed };
   }
 
+  // ── pool-director reset (Step 4 of the gateway-lifecycle plan) ──────────────────
+  // Two recovery ops for a corrupt/stale director state, distinct from destroyAll
+  // (which tears down compute). Neither runs agent SQL; both are explicit admin actions.
+
+  /** Clear the cached snapshot + reset currentVersion to 0. The director returns to
+   *  'unconfigured': pickReplica refuses to route (fail-closed — no cached policy ⇒
+   *  no ACLs ⇒ serve nothing) until the next /gw/snapshot re-establishes it. Warm
+   *  replica CONTAINERS are left running but their in-memory birdshot policy is now
+   *  untracked by the director; the next snapshot re-arms them. Use when the cached
+   *  snapshot itself is suspected corrupt (a bad compile got pushed) — it forces a
+   *  clean re-push from the control plane's source of truth. */
+  async resetPool(datalakeId: string): Promise<{ ok: boolean; clearedReplicas: number }> {
+    this.datalakeId = datalakeId;
+    const reps = await this.replicas();
+    const clearedReplicas = Object.keys(reps).length;
+    await this.ctx.storage.delete("cache");
+    await this.ctx.storage.put("meta", { currentVersion: 0 });
+    // Mark every replica stale so doArm re-applies the (next) snapshot rather than
+    // trusting a warm container's in-memory policy the director can no longer vouch for.
+    for (const k of Object.keys(reps)) {
+      reps[Number(k)] = { appliedVersion: 0, lastActiveAt: reps[Number(k)].lastActiveAt };
+    }
+    await this.ctx.storage.put("replicas", reps);
+    return { ok: true, clearedReplicas };
+  }
+
+  /** Keep the cached snapshot + currentVersion but mark every replica as stale
+   *  (appliedVersion=0). Warm containers stay up; the NEXT pick (or an explicit rearm)
+   *  re-applies the SAME cached snapshot. Lighter than resetPool: the policy is fine,
+   *  we just don't trust that the replicas actually have it loaded (e.g. after a suspected
+   *  in-memory corruption on one replica, or to force a clean re-commit everywhere). */
+  async clearSnapshot(datalakeId: string): Promise<{ ok: boolean; markedStale: number; version: number }> {
+    this.datalakeId = datalakeId;
+    const { currentVersion } = await this.meta();
+    const reps = await this.replicas();
+    const markedStale = Object.keys(reps).length;
+    for (const k of Object.keys(reps)) {
+      reps[Number(k)] = { appliedVersion: 0, lastActiveAt: reps[Number(k)].lastActiveAt };
+    }
+    await this.ctx.storage.put("replicas", reps);
+    return { ok: true, markedStale, version: currentVersion };
+  }
+
   private async fanOut(path: string, body: string): Promise<{ ok: boolean; fanned: number }> {
     const reps = await this.replicas();
     const now = Date.now();
@@ -726,6 +769,108 @@ export class GatewayPoolDO extends DurableObject<Env> {
     reps[n] = { appliedVersion: currentVersion, lastActiveAt: now };
     await this.ctx.storage.put("replicas", reps);
   }
+
+  // ── per-replica lifecycle RPCs (Step 3 of the gateway-lifecycle plan) ──────────
+  // These are the ops-recovery levers for a single replica, exposed over the
+  // service-binding /gw/replica/:n/{wake,sleep,destroy,rearm} routes. They DO NOT
+  // run agent SQL and do NOT take in-flight load into account — they are explicit
+  // admin actions. The director's load-based autoscaler (pickReplica) is unaffected.
+
+  /** Force-boot replica n and arm it with the current snapshot. Creates the replica
+   *  slot if missing (wake can bring up a specific index up to MAX_REPLICAS). This is
+   *  the inverse of sleep: it guarantees a cold container is up + serving the current
+   *  policy before returning. Used by the wake lifecycle route + the dashboard's
+   *  "start replica" button. */
+  async wakeReplica(datalakeId: string, n: number): Promise<{ replicaKey: string; appliedVersion: number }> {
+    this.datalakeId = datalakeId;
+    const { currentVersion } = await this.meta();
+    if (currentVersion === 0) throw new Error("datalake gateway not configured (no snapshot)");
+    if (n < 0 || n >= MAX_REPLICAS) throw new Error(`replica index ${n} out of range (0..${MAX_REPLICAS - 1})`);
+    const reps = await this.replicas();
+    if (!(n in reps)) {
+      reps[n] = { appliedVersion: 0, lastActiveAt: 0 };
+      await this.ctx.storage.put("replicas", reps);
+    }
+    await this.armReplica(n, /*force*/ true);
+    const after = await this.replicas();
+    return { replicaKey: replicaDoId(this.datalakeId, n), appliedVersion: after[n]?.appliedVersion ?? 0 };
+  }
+
+  /** Force a replica's container to stop (free its slot) while KEEPING the replica
+   *  slot. The container is ephemeral, so "sleep" = destroy() it; the next pick/wake
+   *  cold-boots a fresh one and re-applies the snapshot (appliedVersion reset to 0 so
+   *  doArm knows to re-arm). Lighter than destroy: the slot + its index survive. */
+  async sleepReplica(datalakeId: string, n: number): Promise<{ ok: boolean }> {
+    this.datalakeId = datalakeId;
+    const reps = await this.replicas();
+    if (!(n in reps)) return { ok: false };
+    try {
+      const gw = getSandbox(this.env.GATEWAY, replicaDoId(this.datalakeId, n), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as { destroy(): Promise<void> };
+      await gw.destroy();
+    } catch { /* already gone / hibernated */ }
+    // Reset to stale so the next access re-arms (cold-boot re-applies the snapshot —
+    // the fail-safe). Keep the slot so the index is stable for ops.
+    reps[n] = { appliedVersion: 0, lastActiveAt: 0 };
+    await this.ctx.storage.put("replicas", reps);
+    this.inFlight.delete(n);
+    return { ok: true };
+  }
+
+  /** Destroy a replica's container AND remove its slot from the pool (scale down by
+   *  one). Harder than sleep: the index is gone, so the next pick may re-spawn a
+   *  different index. Use when a replica is wedged and sleep didn't recover it. */
+  async destroyReplica(datalakeId: string, n: number): Promise<{ ok: boolean }> {
+    this.datalakeId = datalakeId;
+    const reps = await this.replicas();
+    if (!(n in reps)) return { ok: false };
+    try {
+      const gw = getSandbox(this.env.GATEWAY, replicaDoId(this.datalakeId, n)) as unknown as { destroy(): Promise<void> };
+      await gw.destroy();
+    } catch { /* already gone */ }
+    delete reps[n];
+    await this.ctx.storage.put("replicas", reps);
+    this.inFlight.delete(n);
+    this.booting.delete(n);
+    return { ok: true };
+  }
+
+  /** Force re-apply the director's CACHED snapshot to replica n (whether warm or
+   *  cold). This is the director-level "re-arm": it does NOT re-fetch from the
+   *  control plane, it re-pushes what the director already holds. Recovers a replica
+   *  whose in-memory birdshot policy got corrupted but whose container is still hot,
+   *  or forces a cold replica to re-arm without a pick. For a control-plane-sourced
+   *  fresh policy, use /gw/snapshot (which updates the cache) instead. */
+  async rearmReplica(datalakeId: string, n: number): Promise<{ ok: boolean; appliedVersion: number }> {
+    this.datalakeId = datalakeId;
+    const { currentVersion } = await this.meta();
+    if (currentVersion === 0) throw new Error("datalake gateway not configured (no snapshot)");
+    const reps = await this.replicas();
+    if (!(n in reps)) throw new Error(`replica ${n} does not exist — wake it first`);
+    await this.armReplica(n, /*force*/ true);
+    const after = await this.replicas();
+    return { ok: true, appliedVersion: after[n]?.appliedVersion ?? 0 };
+  }
+
+  /** Per-replica detail for the dashboard (Step 8): index, appliedVersion (vs the
+   *  current), lastActiveAt, in-flight load, and a warm flag. Does NOT wake any
+   *  container — derived from director state like status(). */
+  async replicaStatus(): Promise<{
+    version: number;
+    replicas: Array<{ index: number; appliedVersion: number; current: boolean; lastActiveAt: number; inFlight: number; warm: boolean }>;
+  }> {
+    const { currentVersion } = await this.meta();
+    const reps = await this.replicas();
+    const now = Date.now();
+    const out = Object.keys(reps).map(Number).sort((a, b) => a - b).map((n) => ({
+      index: n,
+      appliedVersion: reps[n].appliedVersion,
+      current: reps[n].appliedVersion >= currentVersion,
+      lastActiveAt: reps[n].lastActiveAt,
+      inFlight: this.inFlight.get(n) ?? 0,
+      warm: now - reps[n].lastActiveAt < POOL_WARM_WINDOW_MS,
+    }));
+    return { version: currentVersion, replicas: out };
+  }
 }
 
 // ── presigned R2 (Model B; aws4fetch — from ws-probe) ──────────────────────────
@@ -758,6 +903,10 @@ interface ConfigureArgs {
   workspaceKey: string;   // 32-byte hex, control-plane-vended (NEVER persisted in the DO)
   lakeToken: string;      // session JWT, presented as the quack TOKEN
   disableSsl?: boolean;
+  /** Lock the DuckDB configuration after /init (default true). Set false by the
+   *  reconfigure lifecycle route so a workspace whose container survived can be
+   *  re-ATTACHed without the "lock_configuration has been locked" 500. */
+  lockConfiguration?: boolean;
 }
 
 /** Boot the workspace sidecar, wire per-endpoint egress, restore-from-R2 + ATTACH the
@@ -804,7 +953,7 @@ async function configureWorkspace(env: Env, args: ConfigureArgs): Promise<{ lake
     lakeProxy: `${gwHost}:443`,
     lakeToken: args.lakeToken,
     disableSsl: args.disableSsl ?? false,  // false → quack speaks HTTPS:443 (intercepted)
-    lockConfiguration: true,
+    lockConfiguration: args.lockConfiguration ?? true,
   });
   if (init.status !== 200) throw new Error(`sidecar /init ${init.status}: ${JSON.stringify(init.json)}`);
   return { lakeAttached: init.json?.lakeAttached === true, initStatus: init.status };
@@ -874,6 +1023,74 @@ async function route(request: Request, env: Env): Promise<Response> {
     return Response.json({ ok: true, legacyDestroyed: legacy, ...r }, { status: 200 });
   }
 
+  // ── per-replica gateway lifecycle (Step 3) ─────────────────────────────────────
+  // Service-binding-only (the DATAPLANE binding is the trust boundary, same as the
+  // other /gw/* routes — no bearer token; control-api is the sole caller). These are
+  // explicit admin ops on a single replica index; they bypass the load-based
+  // autoscaler. Path: /gw/replica/:n/{wake,sleep,destroy,rearm,reapply}. Body: { endpointId }.
+  // reapply is gateway-side: it asks the replica's CONTAINER to re-run its cached
+  // snapshot (no director/control-plane round trip), so it is forwarded straight to
+  // the container's /ctrl/reapply rather than going through a director RPC.
+  const replicaOp = /^\/gw\/replica\/(\d+)\/(wake|sleep|destroy|rearm|reapply)$/.exec(path);
+  if (replicaOp && request.method === "POST") {
+    const n = Number(replicaOp[1]);
+    const op = replicaOp[2];
+    const { endpointId } = body;
+    if (!endpointId) return Response.json({ error: "missing endpointId" }, { status: 400 });
+    if (!Number.isInteger(n) || n < 0) return Response.json({ error: "bad replica index" }, { status: 400 });
+    // reapply: forward to the container's /ctrl/reapply (its own cached snapshot).
+    if (op === "reapply") {
+      try {
+        const gw = getSandbox(env.GATEWAY, replicaDoId(endpointId, n), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
+        // Ensure the container is up (a cold container lost its cached snapshot → 409 below).
+        await ensureGateway(gw, undefined);
+        const force = body.force !== false;
+        const r = await gwFwd(gw, "/ctrl/reapply", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ force }),
+        });
+        return Response.json(r.json, { status: r.status });
+      } catch (e) {
+        return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 502 });
+      }
+    }
+    const pool = getPool(env, endpointId);
+    try {
+      let r: unknown;
+      if (op === "wake") r = await pool.wakeReplica(endpointId, n);
+      else if (op === "sleep") r = await pool.sleepReplica(endpointId, n);
+      else if (op === "destroy") r = await pool.destroyReplica(endpointId, n);
+      else r = await pool.rearmReplica(endpointId, n);
+      return Response.json(r, { status: 200 });
+    } catch (e) {
+      return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 502 });
+    }
+  }
+  // Per-replica detail for the dashboard (no container wake — derived from director state).
+  if (path === "/gw/replicas" && request.method === "GET") {
+    const endpointId = url.searchParams.get("endpointId");
+    if (!endpointId) return Response.json({ error: "missing endpointId" }, { status: 400 });
+    const r = await getPool(env, endpointId).replicaStatus();
+    return Response.json(r, { status: 200 });
+  }
+
+  // ── pool-director reset (Step 4) ───────────────────────────────────────────────
+  // resetPool: drop the cached snapshot + zero currentVersion (fail-closed until the
+  //   next /gw/snapshot). clearSnapshot: keep the cache, mark every replica stale so
+  //   the next pick re-applies the same snapshot. Both service-binding-only.
+  if (path === "/gw/pool/reset" && request.method === "POST") {
+    const { endpointId } = body;
+    if (!endpointId) return Response.json({ error: "missing endpointId" }, { status: 400 });
+    const r = await getPool(env, endpointId).resetPool(endpointId);
+    return Response.json(r, { status: 200 });
+  }
+  if (path === "/gw/pool/clear-snapshot" && request.method === "POST") {
+    const { endpointId } = body;
+    if (!endpointId) return Response.json({ error: "missing endpointId" }, { status: 400 });
+    const r = await getPool(env, endpointId).clearSnapshot(endpointId);
+    return Response.json(r, { status: 200 });
+  }
+
   // ── governed ETL: authorize-then-execute a lake WRITE on the trusted gateway ────
   // A lake write (CTAS / read_source ingest) can't go through the workspace (sealed,
   // no egress) or the gated quack serving path (serves the memory catalog only — a
@@ -906,12 +1123,12 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (path === "/configure" && request.method === "POST") {
     // control-api migrated endpointId → datalakeId (the gateway DO is keyed gw:<datalakeId>,
     // and gw-<id>.internal uses the same value); accept either name for the routing id.
-    const { workspaceId, agentId, workspaceKey, lakeToken, disableSsl } = body;
+    const { workspaceId, agentId, workspaceKey, lakeToken, disableSsl, lockConfiguration } = body;
     const endpointId = body.endpointId ?? body.datalakeId;
     if (!workspaceId || !agentId || !endpointId || !workspaceKey || !lakeToken) {
       return Response.json({ error: "missing workspaceId/agentId/datalakeId/workspaceKey/lakeToken" }, { status: 400 });
     }
-    const out = await configureWorkspace(env, { workspaceId, agentId, endpointId, workspaceKey, lakeToken, disableSsl });
+    const out = await configureWorkspace(env, { workspaceId, agentId, endpointId, workspaceKey, lakeToken, disableSsl, lockConfiguration });
     return Response.json({ ok: true, ...out });
   }
   if ((path === "/query" || path === "/run") && request.method === "POST") {

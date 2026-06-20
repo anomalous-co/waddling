@@ -30,6 +30,8 @@ import {
   EmptyDescription,
 } from '@/components/ui/empty';
 import { StatusBadge } from '@/components/dashboard/status';
+import { GatewayPanel } from '@/components/dashboard/gateway-panel';
+import { WorkspacesPanel } from '@/components/dashboard/workspaces-panel';
 import { fetchCp, cpPost } from '@/components/dashboard/fetch';
 import type {
   DatalakeRuntime,
@@ -467,6 +469,10 @@ export default function DatalakeDetailPage() {
       <AttachCard addr={gatewayAddrFor(dl.slug)} datalakeId={dl.id} />
 
       <SchemasCard schemas={dl.schemas} />
+
+      {/* Gateway lifecycle + workspace recovery (Steps 1–5, 7) */}
+      <GatewayPanel datalakeId={dl.id} />
+      <WorkspacesPanel datalakeId={dl.id} />
     </div>
   );
 }

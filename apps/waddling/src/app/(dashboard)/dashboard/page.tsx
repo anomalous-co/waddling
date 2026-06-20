@@ -35,6 +35,7 @@ import {
   EmptyDescription,
 } from '@/components/ui/empty';
 import { StatusBadge } from '@/components/dashboard/status';
+import { WorkspacesPanel } from '@/components/dashboard/workspaces-panel';
 import { fetchCp } from '@/components/dashboard/fetch';
 import type {
   DatalakeSummary,
@@ -405,6 +406,8 @@ export default function OverviewPage() {
           )}
         </CardContent>
       </Card>
+
+      <WorkspacesPanel />
     </div>
   );
 }

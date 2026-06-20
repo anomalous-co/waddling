@@ -58,6 +58,7 @@ import {
 } from '../lib/gateway-client';
 import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
+import { loadSigningKey, mintLakeToken, SESSION_TTL_SECONDS as SESSION_TTL_SECONDS_IMPORT } from '../lib/session-jwt';
 import type { ConnectResult, QueryResult } from '../lib/types';
 import {
   resolveCaller,
@@ -69,7 +70,7 @@ import {
   AuthError,
 } from '../lib/cp-shared';
 
-const SESSION_TTL_SECONDS = 15 * 60; // 15m (spec default; max 1h)
+const SESSION_TTL_SECONDS = SESSION_TTL_SECONDS_IMPORT; // from lib/session-jwt (kept as the connect-path local name)
 
 /**
  * POST a JSON body to a data-plane lifecycle route over the DATAPLANE service binding
@@ -185,38 +186,6 @@ interface EndpointRow {
   org_id: string;
   status: string;
   server_token: string;
-}
-
-interface JwksRow {
-  id: string;
-  publicKey: string;
-  privateKey: string;
-}
-
-/** Newest non-expired jwks row → { kid, publicJwk, privateJwk }. */
-async function loadSigningKey(): Promise<{
-  kid: string;
-  publicJwk: { n: string; e: string; kty: string };
-  privateJwk: JWK;
-}> {
-  // Better Auth's jwks schema has no expiresAt column (keys are rotated, not
-  // TTL'd), so just take the newest key by createdAt.
-  const row = await queryOne<JwksRow>(
-    `SELECT id, "publicKey", "privateKey" FROM "jwks"
-      ORDER BY "createdAt" DESC LIMIT 1`,
-  );
-  if (!row) {
-    throw new AuthError(
-      'no_signing_key',
-      500,
-      'No JWKS key found — Better Auth jwt plugin must mint one first',
-    );
-  }
-  return {
-    kid: row.id,
-    publicJwk: JSON.parse(row.publicKey),
-    privateJwk: JSON.parse(row.privateKey),
-  };
 }
 
 interface SessionListRow {
@@ -955,25 +924,6 @@ sessions.post('/:id/query', (c) =>
   }),
 );
 
-/** Mint a fresh RS256 session JWT (same agent principal) to use as the gateway lakeToken.
- *  Mirrors the connect mint: `id`/`sub` = agent:<id> is birdshot's principal; the gateway
- *  verifies it against the JWKS pushed at connect. Used by the ETL path, which does not
- *  retain the connect JWT (it is never stored in plaintext). */
-async function mintLakeToken(env: Env, agentId: string, datalakeId: string, mode: string): Promise<string> {
-  const { kid, privateJwk } = await loadSigningKey();
-  const key = (await importJWK(privateJwk, 'RS256')) as CryptoKey;
-  const principal = `agent:${agentId}`;
-  return new SignJWT({ id: principal, mode, cap: CAPABILITY.connect })
-    .setProtectedHeader({ alg: 'RS256', kid })
-    .setSubject(principal)
-    .setIssuer(env.JWT_ISSUER)
-    .setAudience(`gw:${datalakeId}`)
-    .setIssuedAt()
-    .setJti(crypto.randomUUID())
-    .setExpirationTime(`${SESSION_TTL_SECONDS}s`)
-    .sign(key);
-}
-
 const EtlSchema = z.object({ sql: z.string().min(1) });
 
 /** POST /:id/etl → a GOVERNED lake WRITE (CTAS / read_source ingest). Unlike /query — which
@@ -1007,6 +957,7 @@ sessions.post('/:id/etl', (c) =>
     }
 
     const identity = await resolveAgentIdentity(sess.agent_id);
+    if (!identity) return err(c, 'agent_not_found', 404);
     const lakeToken = await mintLakeToken(c.env, sess.agent_id, sess.datalake_id, identity.mode);
     const r = await dpFetch(c.env, '/gw/load', {
       datalakeId: sess.datalake_id,

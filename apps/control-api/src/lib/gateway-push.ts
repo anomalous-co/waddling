@@ -39,20 +39,46 @@ async function loadJwk(): Promise<BirdshotJwk | null> {
 
 /**
  * Recompile the endpoint's FULL policy (every agent) via compileEndpointPolicy
- * and push it to the gateway. Best-effort: a gateway failure leaves the rule
- * persisted for the next connect/recompile to re-push.
+ * and push it to the gateway. Best-effort by default: a gateway failure leaves the
+ * rule persisted for the next connect/recompile to re-push, and the failure is
+ * reported via the returned `pushError` field (NOT thrown).
+ *
+ * Pass `{ surfacePushError: true }` (the admin refresh-policy path) to instead
+ * RE-THROW the gateway error so the caller can surface a 502 to the admin rather
+ * than silently reporting best-effort success.
  *
  * When datalakeId is NULL (e.g. a global-scope delegation) we cannot push to a
  * specific gateway — skip the push, return a trivial empty compile result. The
  * next per-endpoint connect/recompile picks it up (consistent with best-effort
  * posture).
+ *
+ * Returns the CompileResult augmented with push telemetry: `pushed` is true only
+ * when a snapshot was actually delivered to a running gateway; `pushError` carries
+ * the reason on a best-effort failure; `pushSkipped` is true when no push was
+ * attempted (null datalake, or a non-running endpoint).
  */
+export interface RecompileResult extends CompileResult {
+  /** true only when a snapshot was delivered to a running gateway. */
+  pushed?: boolean;
+  /** best-effort failure reason (only when surfacePushError is false). */
+  pushError?: string;
+  /** true when no push was attempted (null datalake / non-running endpoint). */
+  pushSkipped?: boolean;
+}
+
+export interface RecompileOptions {
+  /** Re-throw gateway push errors instead of swallowing + reporting via pushError.
+   *  Used by the admin refresh-policy endpoint so a failed push surfaces as 502. */
+  surfacePushError?: boolean;
+}
+
 export async function recompileAndPush(
   c: { env: Env },
   datalakeId: string | null,
-): Promise<CompileResult> {
+  opts: RecompileOptions = {},
+): Promise<RecompileResult> {
   if (!datalakeId) {
-    return { snapshot: { roleGrants: [], userRoles: [], roleConstraints: [] }, constraints: [], activeAgentIds: [] };
+    return { snapshot: { roleGrants: [], userRoles: [], roleConstraints: [] }, constraints: [], activeAgentIds: [], pushSkipped: true };
   }
 
   const endpoint = await queryOne<EndpointRow>(
@@ -81,10 +107,16 @@ export async function recompileAndPush(
         gatewayBoot: boot.gatewayBoot,
       };
       await gw.pushSnapshot(snapshotReq);
-    } catch {
-      // gateway down / catalog provisioning — persisted rule re-pushes on next connect/recompile
+      return { ...compiled, pushed: true };
+    } catch (e) {
+      // gateway down / catalog provisioning — persisted rule re-pushes on next connect/recompile.
+      // The admin refresh path opts out of swallowing so a failed push is visible.
+      if (opts.surfacePushError) throw e;
+      return { ...compiled, pushed: false, pushError: e instanceof Error ? e.message : String(e) };
     }
   }
 
-  return compiled;
+  // endpoint missing or not running — no push attempted; the rule re-pushes on the
+  // next connect/recompile once the gateway is running.
+  return { ...compiled, pushed: false, pushSkipped: true };
 }

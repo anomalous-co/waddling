@@ -469,6 +469,199 @@ server.registerTool(
   },
 );
 
+// ── Gateway lifecycle + workspace recovery tools (Steps 1–5 of the lifecycle plan) ──
+// These map 1:1 to the control-api recovery endpoints. They are the ops levers for a
+// gateway whose cached birdshot snapshot went stale (direct DB edits, missed pushes) or
+// whose workspace DuckDB got locked (lock_configuration) — the two cases a normal
+// reconnect can't fix. All are org-scoped by the control plane (resolveCaller) and
+// audited there; this server holds no policy logic.
+
+// ── Tool: waddling_admin_refresh_policy (Step 1) ───────────────────────────────
+
+server.registerTool(
+  'waddling_admin_refresh_policy',
+  {
+    description:
+      'On-demand recovery: recompile the FULL endpoint policy from waddling.acl_rule and push it to the gateway. The lever for a gateway whose cached birdshot snapshot went stale — e.g. after a DIRECT database edit to acl_rule bypassed the recompile+push, or a missed push. Surfaces push failures (502) instead of swallowing them. Returns the pushed snapshot (grants, userRoles, constraints, activeAgents).',
+    inputSchema: {
+      endpoint_id: z.string().describe('Datalake/endpoint ID to refresh the policy for'),
+    },
+  },
+  async (args) => {
+    const result = await cpFetch<unknown>(
+      'POST',
+      `/api/cp/datalakes/${encodeURIComponent(args.endpoint_id)}/refresh-policy`,
+      {},
+    );
+    return toToolResult(result);
+  },
+);
+
+// ── Tool: waddling_admin_list_workspaces ──────────────────────────────────────
+
+server.registerTool(
+  'waddling_admin_list_workspaces',
+  {
+    description:
+      'List the org\'s workspaces (per-(workspace, agent) durable DuckDB files) with live-session counts and the datalake each belongs to. Use before destroy/reconfigure to find the (workspaceId, agentId) pair to recover.',
+    inputSchema: {},
+  },
+  async () => {
+    const result = await cpFetch<unknown>('GET', '/api/cp/workspaces');
+    return toToolResult(result);
+  },
+);
+
+// ── Tool: waddling_admin_destroy_workspace (Step 2) ───────────────────────────
+
+server.registerTool(
+  'waddling_admin_destroy_workspace',
+  {
+    description:
+      'Tear down a workspace container + its session. With purge=true (recommended for recovery), also deletes the R2 workspace object so the next connect bootstraps a FRESH DuckDB — the recovery lever for the "lock_configuration has been locked" deadlock that blocks reconnect. Also kills any active agent_session rows on the pair. Lighter alternative: waddling_admin_reconfigure_workspace (keeps the file).',
+    inputSchema: {
+      workspace_id: z.string().describe('Workspace ID (from waddling_admin_list_workspaces)'),
+      agent_id: z.string().describe('Agent ID that owns this workspace slot'),
+      purge: z
+        .boolean()
+        .optional()
+        .describe(
+          'Also delete the R2 workspace object so the next connect starts fresh (default false). Set true to recover from a locked/corrupt DuckDB file.',
+        ),
+      reason: z.string().optional().describe('Reason recorded in the audit log'),
+    },
+  },
+  async (args) => {
+    const result = await cpFetch<unknown>(
+      'POST',
+      `/api/cp/workspaces/${encodeURIComponent(args.workspace_id)}/agents/${encodeURIComponent(args.agent_id)}/destroy`,
+      { purge: args.purge ?? false, reason: args.reason },
+    );
+    return toToolResult(result);
+  },
+);
+
+// ── Tool: waddling_admin_reconfigure_workspace (Step 2 + 7) ───────────────────
+
+server.registerTool(
+  'waddling_admin_reconfigure_workspace',
+  {
+    description:
+      'Re-ATTACH the lake into a SURVIVING workspace container WITHOUT destroying it. Re-pushes the birdshot snapshot (so the gateway is armed) + re-inits the workspace sidecar with lockConfiguration:false, bypassing the "Cannot change configuration option lock_configuration" error a plain reconnect hits. Use this when you want to keep the workspace file/state; use destroy+purge when the DuckDB file itself is corrupt.',
+    inputSchema: {
+      workspace_id: z.string().describe('Workspace ID (from waddling_admin_list_workspaces)'),
+      agent_id: z.string().describe('Agent ID that owns this workspace slot'),
+    },
+  },
+  async (args) => {
+    const result = await cpFetch<unknown>(
+      'POST',
+      `/api/cp/workspaces/${encodeURIComponent(args.workspace_id)}/agents/${encodeURIComponent(args.agent_id)}/reconfigure`,
+      {},
+    );
+    return toToolResult(result);
+  },
+);
+
+// ── Tool: waddling_admin_list_replicas ────────────────────────────────────────
+
+server.registerTool(
+  'waddling_admin_list_replicas',
+  {
+    description:
+      'Per-replica pool status for a datalake gateway: each replica\'s index, appliedVersion vs the current snapshot version, lastActiveAt, in-flight query count, and warm flag. Does NOT wake any container. Use before/after gateway_replica or reset_pool ops to see what state the pool is in.',
+    inputSchema: {
+      endpoint_id: z.string().describe('Datalake/endpoint ID'),
+    },
+  },
+  async (args) => {
+    const result = await cpFetch<unknown>(
+      'GET',
+      `/api/cp/datalakes/${encodeURIComponent(args.endpoint_id)}/replicas`,
+    );
+    return toToolResult(result);
+  },
+);
+
+// ── Tool: waddling_admin_gateway_replica (Step 3) ─────────────────────────────
+
+server.registerTool(
+  'waddling_admin_gateway_replica',
+  {
+    description:
+      'Per-replica gateway lifecycle op. wake = force-boot + arm replica n with the current snapshot (creates the slot if missing). sleep = stop the container but keep the slot (next access cold-boots + re-arms). destroy = destroy the container AND remove the slot (scale down; use to force a replica onto a new image — the re-spawn boots fresh). rearm = force re-apply the DIRECTOR\'s cached snapshot to replica n (does NOT re-fetch from the control plane). These bypass the load-based autoscaler — explicit admin actions.',
+    inputSchema: {
+      endpoint_id: z.string().describe('Datalake/endpoint ID'),
+      replica: z.number().int().min(0).describe('Replica index (0-based, from waddling_admin_list_replicas)'),
+      op: z
+        .enum(['wake', 'sleep', 'destroy', 'rearm'])
+        .describe('Lifecycle operation to perform on this replica'),
+    },
+  },
+  async (args) => {
+    const result = await cpFetch<unknown>(
+      'POST',
+      `/api/cp/datalakes/${encodeURIComponent(args.endpoint_id)}/replicas/${args.replica}/${args.op}`,
+      {},
+    );
+    return toToolResult(result);
+  },
+);
+
+// ── Tool: waddling_admin_reset_pool (Step 4) ──────────────────────────────────
+
+server.registerTool(
+  'waddling_admin_reset_pool',
+  {
+    description:
+      'Pool-director reset. reset = drop the cached snapshot + zero the version → the gateway FAIL-CLOSES (refuses queries) until the next push; use when the cached snapshot itself is suspect (a bad compile got pushed) to force a clean re-push from the control plane. clear = keep the cached snapshot but mark every replica stale → the next pick re-applies the SAME snapshot; lighter, use when the policy is fine but you distrust that replicas have it loaded. Both leave warm containers running (no compute teardown — use gateway_replica destroy for that).',
+    inputSchema: {
+      endpoint_id: z.string().describe('Datalake/endpoint ID'),
+      op: z
+        .enum(['reset', 'clear'])
+        .describe('reset = fail-closed until next push; clear = re-apply same snapshot on next pick'),
+    },
+  },
+  async (args) => {
+    const path = args.op === 'reset' ? 'reset-pool' : 'clear-snapshot';
+    const result = await cpFetch<unknown>(
+      'POST',
+      `/api/cp/datalakes/${encodeURIComponent(args.endpoint_id)}/${path}`,
+      {},
+    );
+    return toToolResult(result);
+  },
+);
+
+// ── Tool: waddling_admin_reapply_snapshot (Step 5) ────────────────────────────
+
+server.registerTool(
+  'waddling_admin_reapply_snapshot',
+  {
+    description:
+      'Birdshot-only reset+recommit: ask replica n\'s CONTAINER to re-run its own last-cached birdshot snapshot (reset → set → commit) with NO control-plane round trip. Recovers a hot replica whose in-memory birdshot policy got corrupted while the container stayed up. Distinct from gateway_replica rearm (re-pushes the DIRECTOR\'s snapshot) and refresh_policy (recompiles from acl_rule). Use this when you trust the last push was correct and only the in-memory state is suspect. Returns 409 (no_cached_snapshot) if the container has never received a snapshot — push one first. force=false skips the re-apply when birdshot already reports a loaded policy.',
+    inputSchema: {
+      endpoint_id: z.string().describe('Datalake/endpoint ID'),
+      replica: z.number().int().min(0).describe('Replica index (0-based)'),
+      force: z
+        .boolean()
+        .optional()
+        .describe(
+          'Re-apply even if birdshot_status reports a loaded policy (default true). Set false to skip when already loaded.',
+        ),
+    },
+  },
+  async (args) => {
+    const forceParam = args.force === false ? '?force=false' : '';
+    const result = await cpFetch<unknown>(
+      'POST',
+      `/api/cp/datalakes/${encodeURIComponent(args.endpoint_id)}/replicas/${args.replica}/reapply${forceParam}`,
+      {},
+    );
+    return toToolResult(result);
+  },
+);
+
 // ── Transport selection and startup ──────────────────────────────────────────
 
 async function main(): Promise<void> {

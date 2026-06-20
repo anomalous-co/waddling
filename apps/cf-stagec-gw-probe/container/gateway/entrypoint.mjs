@@ -211,6 +211,14 @@ async function main() {
   }
 
   // ── Forwarder + control channel on :8080 ─────────────────────────────────────
+  // Cache of the last successfully-applied snapshot (+ auth + lakeCatalog), so
+  // /ctrl/reapply can re-run applySnapshot WITHOUT a control-plane round trip.
+  // Lives in this container process's memory: lost on cold boot (correct — a cold
+  // container has no in-memory birdshot policy to reapply, so reapply 409s there and
+  // the director re-arms via /ctrl/snapshot). Used to recover a hot replica whose
+  // in-memory birdshot policy got corrupted.
+  let lastSnapshot = null;
+
   const server = createServer((req, res) => {
     void handle(req, res).catch((err) => {
       const reason = err instanceof Error ? err.message : String(err);
@@ -254,8 +262,45 @@ async function main() {
       } finally {
         rt.config.lakeAlias = prevAlias;
       }
+      // Cache for /ctrl/reapply (restore the alias override the re-apply needs).
+      lastSnapshot = { snapshot: body.snapshot, auth: body.auth, lakeCatalog: body.lakeCatalog };
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, grants: body.snapshot.roleGrants.length }));
+      return;
+    }
+
+    // Re-apply the last successfully-applied snapshot verbatim (no control-plane
+    // round trip). Recovers a hot replica whose in-memory birdshot policy got
+    // corrupted (applySnapshot is a full reset→set→commit, so this is idempotent).
+    // 409 when the container has never received a snapshot (cold boot) — push one
+    // via /ctrl/snapshot first. `force` (default true) re-applies even if
+    // birdshot_status reports a loaded policy; set false to skip when loaded.
+    if (path === "/ctrl/reapply" && method === "POST") {
+      if (!lastSnapshot) {
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "no_cached_snapshot", reason: "this container has never received a snapshot — push one via /ctrl/snapshot first" }));
+        return;
+      }
+      const body = await readJson(req).catch(() => ({}));
+      const force = body.force !== false;
+      if (!force) {
+        const st = await birdshotStatus(rt);
+        const policySize = Number(st?.policySize ?? 0);
+        if (policySize > 0) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, reapplied: false, reason: "policy already loaded (force=false)" }));
+          return;
+        }
+      }
+      const prevAlias = rt.config.lakeAlias;
+      if (lastSnapshot.lakeCatalog) rt.config.lakeAlias = lastSnapshot.lakeCatalog;
+      try {
+        await applySnapshot(rt, lastSnapshot.snapshot, lastSnapshot.auth);
+      } finally {
+        rt.config.lakeAlias = prevAlias;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, reapplied: true, grants: lastSnapshot.snapshot.roleGrants.length }));
       return;
     }
 

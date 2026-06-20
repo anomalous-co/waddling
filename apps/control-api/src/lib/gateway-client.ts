@@ -231,6 +231,51 @@ export class GatewayClient {
       { endpointId: datalakeId }, // WIRE CONTRACT: dataplane reads `endpointId` (= datalake id)
     );
   }
+
+  // ── per-replica lifecycle (Step 3) ──────────────────────────────────────────────
+  // The client half of the /gw/replica/:n/{op} + /gw/replicas contract. Used by the
+  // Internal MCP admin tools (Step 6) and the dashboard (Step 8). Each takes the
+  // datalake id (remapped to `endpointId` on the wire, matching the other /gw routes).
+
+  /** Force-boot + arm replica n with the current snapshot (creates the slot if missing). */
+  wakeReplica(datalakeId: string, n: number): Promise<{ replicaKey: string; appliedVersion: number }> {
+    return this.send('POST', `/gw/replica/${n}/wake`, { endpointId: datalakeId });
+  }
+  /** Stop replica n's container but keep its slot (next access cold-boots + re-arms). */
+  sleepReplica(datalakeId: string, n: number): Promise<{ ok: boolean }> {
+    return this.send('POST', `/gw/replica/${n}/sleep`, { endpointId: datalakeId });
+  }
+  /** Destroy replica n's container AND remove its slot from the pool (scale down). */
+  destroyReplica(datalakeId: string, n: number): Promise<{ ok: boolean }> {
+    return this.send('POST', `/gw/replica/${n}/destroy`, { endpointId: datalakeId });
+  }
+  /** Force re-apply the director's CACHED snapshot to replica n (warm or cold). */
+  rearmReplica(datalakeId: string, n: number): Promise<{ ok: boolean; appliedVersion: number }> {
+    return this.send('POST', `/gw/replica/${n}/rearm`, { endpointId: datalakeId });
+  }
+  /** Re-apply the replica CONTAINER's own last-cached snapshot (no control-plane round
+   *  trip). Recovers a hot replica with a corrupted in-memory birdshot policy. 409 if
+   *  the container has never received a snapshot (cold boot). `force` defaults true. */
+  reapplyReplica(datalakeId: string, n: number, force = true): Promise<{ ok: boolean; reapplied: boolean; grants?: number; reason?: string }> {
+    return this.send('POST', `/gw/replica/${n}/reapply`, { endpointId: datalakeId, force });
+  }
+  /** Per-replica detail (index, appliedVersion, current, lastActiveAt, inFlight, warm). */
+  replicaStatus(datalakeId: string): Promise<{
+    version: number;
+    replicas: Array<{ index: number; appliedVersion: number; current: boolean; lastActiveAt: number; inFlight: number; warm: boolean }>;
+  }> {
+    return this.send('GET', `/gw/replicas?endpointId=${encodeURIComponent(datalakeId)}`);
+  }
+
+  // ── pool-director reset (Step 4) ───────────────────────────────────────────────
+  /** Drop the cached snapshot + zero currentVersion (fail-closed until the next push). */
+  resetPool(datalakeId: string): Promise<{ ok: boolean; clearedReplicas: number }> {
+    return this.send('POST', '/gw/pool/reset', { endpointId: datalakeId });
+  }
+  /** Keep the cache but mark every replica stale so the next pick re-applies it. */
+  clearSnapshot(datalakeId: string): Promise<{ ok: boolean; markedStale: number; version: number }> {
+    return this.send('POST', '/gw/pool/clear-snapshot', { endpointId: datalakeId });
+  }
 }
 
 /** One drained birdshot audit record (free-text fields already b64-decoded by the gateway). */

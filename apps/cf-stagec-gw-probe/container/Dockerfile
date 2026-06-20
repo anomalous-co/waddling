@@ -1,4 +1,5 @@
 # Stage D gateway probe — the waddling gateway as a CF Container image.
+# (build-bust: step5 reapply route)
 #
 # Base = docker.io/cloudflare/sandbox:<pin> (REQUIRED, not cosmetic): the Sandbox
 # SDK ships an in-container process-server that the GatewayDO's startProcess() /

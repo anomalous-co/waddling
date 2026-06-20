@@ -24,6 +24,7 @@ import { resolveCaller, AuthError } from "./lib/cp-shared";
 import { handleMcp } from "./mcp/server";
 import type { LoopbackResult } from "./mcp/tools";
 import { datalakes } from "./routes/datalakes";
+import { workspaces } from "./routes/workspaces";
 import { whoami } from "./routes/whoami";
 import { agents } from "./routes/agents";
 import { notebooks } from "./routes/notebooks";
@@ -510,6 +511,7 @@ app.route("/api/cp/datalakes", datalakes);
 // Deprecated alias: the old path keeps resolving to the same handler during the
 // endpoint→datalake cutover (external callers + any not-yet-updated UI link).
 app.route("/api/cp/endpoints", datalakes);
+app.route("/api/cp/workspaces", workspaces);
 app.route("/api/cp/agents", agents);
 app.route("/api/cp/notebooks", notebooks);
 app.route("/api/cp/views", views);

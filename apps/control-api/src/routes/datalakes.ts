@@ -18,6 +18,7 @@ import { getDatalakeGatewayConfig } from '../lib/datalake-secrets';
 import type { StorageCreds, CatalogCreds } from '../lib/datalake-secrets';
 import { getCrypto } from '../lib/secret-crypto';
 import { gatewayClientFor, GatewayError } from '../lib/gateway-client';
+import { recompileAndPush } from '../lib/gateway-push';
 import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
 import { provisionOrgCatalog } from '../lib/catalog-provision';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
@@ -361,6 +362,212 @@ datalakes.post('/:id/teardown-gateways', (c) =>
     return ok(c, result);
   }),
 );
+
+// ── POST /:id/refresh-policy — on-demand recompile + push (admin recovery lever) ──
+//
+// Recompiles the FULL endpoint policy (every agent) from waddling.acl_rule and
+// pushes it to the gateway control channel. This is the recovery lever for the two
+// cases where a gateway's cached snapshot goes stale and a normal reconnect can't
+// fix it (Step 1 of the gateway-lifecycle plan):
+//   1. Direct DB edits to waddling.acl_rule bypass recompileAndPush (e.g. a manual
+//      SQL fix), so the gateway's cached snapshot diverges from the rules table.
+//   2. Reconnecting a LOCKED workspace fails (lock_configuration is immutable
+//      post-init), so there is no way to force a fresh push through connect.
+//
+// Org-scoped (any caller that owns the datalake — agent API key OR dashboard user),
+// matching teardown-gateways. This is NOT an escalation: the pushed snapshot is
+// compiled from acl_rule rows the caller cannot write, so an agent re-pushing the
+// truth gains nothing it did not already have. Making it agent-key-callable is what
+// unblocks the CLI recovery path (no browser session available).
+//
+// Unlike the push on ACL CRUD (best-effort, swallows gateway errors), this route
+// surfaces push failures as 502 so the caller knows whether the snapshot landed.
+datalakes.post('/:id/refresh-policy', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const id = c.req.param('id');
+    const ep = await loadOwned(id, caller.orgId);
+    if (!ep) return err(c, 'datalake_not_found', 404);
+
+    // surfacePushError so a failed gateway push surfaces as 502 instead of being
+    // swallowed (best-effort is correct for the CRUD path, wrong for an explicit
+    // recovery action).
+    let compiled;
+    try {
+      compiled = await recompileAndPush(c, id, { surfacePushError: true });
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      await query(
+        `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, reason, actor)
+         VALUES ($1,'control-plane','refresh_policy',$2,'deny',$3,$4)`,
+        [caller.orgId, id, `push failed: ${detail}`, caller.callerId],
+      );
+      return err(c, 'policy_push_failed', 502, detail);
+    }
+
+    await query(
+      `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, reason, actor)
+       VALUES ($1,'control-plane','refresh_policy',$2,'allow',$3,$4)`,
+      [
+        caller.orgId,
+        id,
+        `pushed=${compiled.pushed ?? false} grants=${compiled.snapshot.roleGrants.length} agents=${compiled.activeAgentIds.length}`,
+        caller.callerId,
+      ],
+    );
+
+    return ok(c, {
+      datalakeId: id,
+      pushed: compiled.pushed ?? false,
+      pushSkipped: compiled.pushSkipped ?? false,
+      pushError: compiled.pushError,
+      grants: compiled.snapshot.roleGrants.length,
+      userRoles: compiled.snapshot.userRoles.length,
+      constraints: (compiled.snapshot.roleConstraints ?? []).length,
+      activeAgents: compiled.activeAgentIds.length,
+      snapshot: compiled.snapshot,
+    });
+  }),
+);
+
+// ── GET /:id/replicas — per-replica pool status (Step 8 dashboard + Step 4 read path) ──
+// Returns the director's view of every replica (index, appliedVersion vs current,
+// lastActiveAt, inFlight, warm). Does NOT wake any container. Org-scoped (agent key
+// OR dashboard user), like teardown-gateways — read-only, no escalation.
+datalakes.get('/:id/replicas', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const id = c.req.param('id');
+    const ep = await loadOwned(id, caller.orgId);
+    if (!ep) return err(c, 'datalake_not_found', 404);
+    const result = await gatewayClientFor(ep).replicaStatus(id);
+    return ok(c, result);
+  }),
+);
+
+// ── POST /:id/reset-pool + /:id/clear-snapshot — pool-director reset (Step 4) ──────
+// resetPool: drop the cached snapshot + zero currentVersion → fail-closed (pickReplica
+//   refuses) until the next /gw/snapshot. Recovers a corrupt pushed snapshot by forcing
+//   a clean re-push from the control plane.
+// clearSnapshot: keep the cache but mark every replica stale → the next pick re-applies
+//   the SAME cached snapshot. Lighter: the policy is fine, we just distrust that the
+//   replicas have it loaded.
+// Both org-scoped like teardown-gateways. They mutate the live gateway director, so an
+// audit_event is written. (Admin-only gating is intentionally NOT added — mirrors
+// teardown-gateways, which is strictly more destructive, and the pushed/resent policy
+// is compiled from acl_rule rows the caller cannot write.)
+async function poolReset(c: Parameters<typeof handle>[0], id: string, op: 'reset' | 'clear') {
+  const caller = await resolveCaller(c);
+  const ep = await loadOwned(id, caller.orgId);
+  if (!ep) return err(c, 'datalake_not_found', 404);
+  const gw = gatewayClientFor(ep);
+  let result;
+  try {
+    result = op === 'reset' ? await gw.resetPool(id) : await gw.clearSnapshot(id);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    await query(
+      `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, reason, actor)
+       VALUES ($1,'control-plane','pool_reset',$2,'deny',$3,$4)`,
+      [caller.orgId, id, `${op} failed: ${detail}`, caller.callerId],
+    );
+    return err(c, 'pool_reset_failed', 502, detail);
+  }
+  await query(
+    `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, reason, actor)
+     VALUES ($1,'control-plane','pool_reset',$2,'allow',$3,$4)`,
+    [caller.orgId, id, `op=${op} ${JSON.stringify(result)}`, caller.callerId],
+  );
+  return ok(c, { datalakeId: id, op, ...result });
+}
+
+datalakes.post('/:id/reset-pool', (c) => handle(c, () => poolReset(c, c.req.param('id'), 'reset')));
+datalakes.post('/:id/clear-snapshot', (c) => handle(c, () => poolReset(c, c.req.param('id'), 'clear')));
+
+// ── POST /:id/replicas/:n/reapply — birdshot-only reset+recommit (Step 5) ──────────
+// Asks replica n's CONTAINER to re-run its own last-cached birdshot snapshot (reset →
+// set → commit), with NO control-plane round trip. Recovers a hot replica whose
+// in-memory birdshot policy got corrupted while the container stayed up. Returns 409
+// if the container has never received a snapshot (cold boot) — push one first.
+// Distinct from rearm (Step 3): rearm re-pushes the DIRECTOR's cached snapshot;
+// reapply re-runs the CONTAINER's. Use reapply when you trust the last push was
+// correct and only the in-memory state is suspect; use rearm/reset-pool otherwise.
+// Query param ?force=false skips the re-apply when birdshot_status already reports a
+// loaded policy (lighter check). Org-scoped + audited.
+datalakes.post('/:id/replicas/:n/reapply', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const id = c.req.param('id');
+    const n = Number(c.req.param('n'));
+    if (!Number.isInteger(n) || n < 0) return err(c, 'bad_replica_index', 400);
+    const u = new URL(c.req.url);
+    const force = u.searchParams.get('force') !== 'false';
+    const ep = await loadOwned(id, caller.orgId);
+    if (!ep) return err(c, 'datalake_not_found', 404);
+    let result;
+    try {
+      result = await gatewayClientFor(ep).reapplyReplica(id, n, force);
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      await query(
+        `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, reason, actor)
+         VALUES ($1,'control-plane','reapply_snapshot',$2,'deny',$3,$4)`,
+        [caller.orgId, id, `replica ${n} failed: ${detail}`, caller.callerId],
+      );
+      return err(c, 'reapply_failed', 502, detail);
+    }
+    await query(
+      `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, reason, actor)
+       VALUES ($1,'control-plane','reapply_snapshot',$2,'allow',$3,$4)`,
+      [caller.orgId, id, `replica ${n} force=${force} ${JSON.stringify(result)}`, caller.callerId],
+    );
+    return ok(c, { datalakeId: id, replica: n, force, ...result });
+  }),
+);
+
+// ── POST /:id/replicas/:n/{wake,sleep,destroy,rearm} — per-replica lifecycle (Step 3 ext surface) ─
+// External surface for the Step 3 director RPCs, needed by the Step 6 MCP tools + the
+// Step 8 dashboard. Each is org-scoped + audited. `destroy` forces a container cold-boot
+// on the next pick (the new container boots from the latest pushed image — the lever for
+// picking up gateway-image code changes like the /gw/reapply route itself).
+async function replicaOp(
+  c: Parameters<typeof handle>[0],
+  id: string,
+  n: number,
+  op: 'wake' | 'sleep' | 'destroy' | 'rearm',
+) {
+  const caller = await resolveCaller(c);
+  if (!Number.isInteger(n) || n < 0) return err(c, 'bad_replica_index', 400);
+  const ep = await loadOwned(id, caller.orgId);
+  if (!ep) return err(c, 'datalake_not_found', 404);
+  const gw = gatewayClientFor(ep);
+  let result;
+  try {
+    if (op === 'wake') result = await gw.wakeReplica(id, n);
+    else if (op === 'sleep') result = await gw.sleepReplica(id, n);
+    else if (op === 'destroy') result = await gw.destroyReplica(id, n);
+    else result = await gw.rearmReplica(id, n);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    await query(
+      `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, reason, actor)
+       VALUES ($1,'control-plane','replica_op',$2,'deny',$3,$4)`,
+      [caller.orgId, id, `${op} replica ${n} failed: ${detail}`, caller.callerId],
+    );
+    return err(c, 'replica_op_failed', 502, detail);
+  }
+  await query(
+    `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, reason, actor)
+     VALUES ($1,'control-plane','replica_op',$2,'allow',$3,$4)`,
+    [caller.orgId, id, `${op} replica ${n} ${JSON.stringify(result)}`, caller.callerId],
+  );
+  return ok(c, { datalakeId: id, replica: n, op, ...result });
+}
+
+datalakes.post('/:id/replicas/:n/wake', (c) => handle(c, () => replicaOp(c, c.req.param('id')!, Number(c.req.param('n')), 'wake')));
+datalakes.post('/:id/replicas/:n/sleep', (c) => handle(c, () => replicaOp(c, c.req.param('id')!, Number(c.req.param('n')), 'sleep')));
+datalakes.post('/:id/replicas/:n/destroy', (c) => handle(c, () => replicaOp(c, c.req.param('id')!, Number(c.req.param('n')), 'destroy')));
+datalakes.post('/:id/replicas/:n/rearm', (c) => handle(c, () => replicaOp(c, c.req.param('id')!, Number(c.req.param('n')), 'rearm')));
 
 // ── /api/cp/endpoints/:id/describe — governed schema introspection ───────────────
 //
