@@ -449,11 +449,19 @@ export async function applySnapshot(
   // quack serves are created at boot (restoreLakeViews in bootDuckRuntime), so a table
   // loaded AFTER this replica booted — e.g. a governed ETL that ran on a PEER replica and
   // persisted to the shared DuckLake — is invisible here until the views are refreshed.
-  // applySnapshot runs on every snapshot re-arm (pickReplica guarantees it before serving),
-  // so refreshing here makes a freshly-loaded table queryable on whichever replica serves
-  // the next read. No-op for a quackboard (it serves its own durable catalog, no lake views).
+  // applySnapshot runs on every snapshot re-arm, so refreshing here makes a freshly-loaded
+  // table queryable on whichever replica serves the next read. No-op for a quackboard.
+  //
+  // CRITICAL: this is BEST-EFFORT and must NEVER block the apply. The birdshot config is
+  // already committed above (the connect-critical part); a view refresh that resolves the
+  // lake schema from the Postgres DuckLake catalog can be slow, and applySnapshot gates
+  // connect (control-api aborts /gw/snapshot if it runs long → every connect times out).
+  // So time-bound it and move on; a missed refresh is recovered on the next boot/re-arm.
   if (!rt.config.quackboard) {
-    await restoreLakeViews(c, rt.config.lakeAlias);
+    await Promise.race([
+      restoreLakeViews(c, rt.config.lakeAlias).catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
   }
 }
 
