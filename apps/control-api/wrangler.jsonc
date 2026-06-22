@@ -24,6 +24,13 @@
     "head_sampling_rate": 1,
     "logs": { "enabled": true, "head_sampling_rate": 1, "persist": true, "invocation_logs": true }
   },
+  // Prepaid-credit duration-debit driver. Every 5 min the scheduled() handler closes
+  // abandoned sessions past TTL and debits each closed-but-unbilled session's wall-clock
+  // (the dominant COGS). Bounds the at-most-one-cron-interval billing lag; the connect/
+  // per-query gates enforce the real-time cutoff off the cached balance.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   // Control-plane database: PlanetScale Postgres reached through Hyperdrive
   // (port 5432, caching disabled). The Worker reads env.HYPERDRIVE.connectionString.
   // Production origin: api.getwaddling.com (custom domain on the getwaddling.com

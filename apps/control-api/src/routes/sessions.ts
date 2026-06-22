@@ -57,8 +57,10 @@ import {
   type BirdshotJwk,
 } from '../lib/gateway-client';
 import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
+import { hasCredit, debitQueryFloor } from '../lib/credits';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import { loadSigningKey, mintLakeToken, SESSION_TTL_SECONDS as SESSION_TTL_SECONDS_IMPORT } from '../lib/session-jwt';
+import { refreshCatalogAndRecompile } from '../lib/gateway-push';
 import type { ConnectResult, QueryResult } from '../lib/types';
 import {
   resolveCaller,
@@ -267,6 +269,19 @@ sessions.post('/', (c) =>
     if (!endpoint) return err(c, 'endpoint_not_found', 404);
     if (endpoint.status !== 'running') {
       return err(c, 'endpoint_not_running', 409, `Endpoint status is ${endpoint.status}`);
+    }
+
+    // Prepaid credit gate at CONNECT. The per-query cutoff alone can't bound the dominant
+    // cost: a session is the unit that accrues wall-clock COGS, so a zero-balance org must
+    // be refused a NEW session here (not just its first query). Fail-open if no balance row
+    // exists yet (legacy/un-granted org) — see lib/credits.hasCredit.
+    if (!(await hasCredit(endpoint.org_id))) {
+      return err(
+        c,
+        'insufficient_credits',
+        402,
+        'Org credit balance is exhausted — top up credits to start a new session.',
+      );
     }
 
     // Resolve the acting agent + session origin per caller type:
@@ -862,6 +877,19 @@ sessions.post('/:id/query', (c) =>
       return err(c, 'session_not_active', 409, `Session status is ${sess.status} — reconnect`);
     }
 
+    // Prepaid credit gate, per-query pre-flight. At zero balance, refuse before the query
+    // reaches the gateway (402). The locked decision accepts a one-query overshoot: a
+    // query already in flight isn't clawed back, and the in-flight session keeps accruing
+    // duration until it closes — the connect-time gate bounds the new-session case.
+    if (!(await hasCredit(sess.org_id))) {
+      return err(
+        c,
+        'insufficient_credits',
+        402,
+        'Org credit balance is exhausted — top up credits to continue querying.',
+      );
+    }
+
     // Re-resolve the workspace deterministically (idempotent upsert) — the data plane
     // is keyed by (workspaceId, agentId), not the sessionId.
     const ws = await resolveWorkspaceForSession(sess.org_id, sess.datalake_id, sess.agent_id);
@@ -894,6 +922,13 @@ sessions.post('/:id/query', (c) =>
       console.log(`[sessions] recordQueryAudit failed: ${e instanceof Error ? e.message : String(e)}`);
     });
     if (exCtx) exCtx.waitUntil(recording);
+
+    // Per-query floor debit — minor + best-effort (the dominant session-duration charge is
+    // billed durably by the sweeper). Unique key per call: this is a top-up, not a dedupe.
+    const flooring = debitQueryFloor(sess.org_id, sess.id, crypto.randomUUID()).catch((e) => {
+      console.log(`[sessions] query floor debit failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+    if (exCtx) exCtx.waitUntil(flooring);
 
     // The sidecar returns HTTP 500 with an error string on a birdshot denial. Map it to
     // the structured authorization_denied shape the agent surface knows (so mcp-external
@@ -956,6 +991,17 @@ sessions.post('/:id/etl', (c) =>
       return err(c, 'session_not_active', 409, `Session status is ${sess.status} — reconnect`);
     }
 
+    // Prepaid credit gate, pre-flight (same contract as /query). ETL also runs egress +
+    // a durable lake write, so refuse at zero before any of that work begins.
+    if (!(await hasCredit(sess.org_id))) {
+      return err(
+        c,
+        'insufficient_credits',
+        402,
+        'Org credit balance is exhausted — top up credits to continue running ETL.',
+      );
+    }
+
     const identity = await resolveAgentIdentity(sess.agent_id);
     if (!identity) return err(c, 'agent_not_found', 404);
     const lakeToken = await mintLakeToken(c.env, sess.agent_id, sess.datalake_id, identity.mode);
@@ -972,6 +1018,12 @@ sessions.post('/:id/etl', (c) =>
       console.log(`[sessions] recordEtlAudit failed: ${e instanceof Error ? e.message : String(e)}`);
     });
     if (exCtx) exCtx.waitUntil(recording);
+
+    // Per-query floor debit for the ETL statement (best-effort; duration billed by sweeper).
+    const flooring = debitQueryFloor(sess.org_id, sess.id, crypto.randomUUID()).catch((e) => {
+      console.log(`[sessions] etl floor debit failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+    if (exCtx) exCtx.waitUntil(flooring);
 
     if (r.status !== 200) {
       return err(c, 'etl_failed', 502, `data plane /gw/load → ${r.status}: ${JSON.stringify(r.json)}`);
@@ -992,6 +1044,20 @@ sessions.post('/:id/etl', (c) =>
         );
       }
       return err(c, 'etl_failed', 500, j.error ?? 'governed load failed');
+    }
+    // Change-tracked catalog refresh: an ETL statement may CREATE/DROP a lake table,
+    // so the gateway is warm right now — re-pull + upsert the cached catalog so the
+    // authoring picker (and any covering wildcard grant) sees the new shape. Post-
+    // response, best-effort; never adds latency or fails the call.
+    if (exCtx) {
+      exCtx.waitUntil(
+        refreshCatalogAndRecompile(c, sess.datalake_id, {
+          id: sess.datalake_id,
+          org_id: sess.org_id,
+          status: 'running',
+          server_token: '',
+        }),
+      );
     }
     return ok(c, { ok: true, phase: j.phase ?? 'done', authorizeDecision: j.authorizeDecision ?? 'allow' });
   }),

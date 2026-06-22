@@ -16,6 +16,7 @@ import { AwsClient } from "aws4fetch";
 import { Pool } from "pg";
 import type { Env } from "./lib/env";
 import { runInDbScope, query } from "./lib/db";
+import { sweepExpiredSessions } from "./lib/credits";
 import { buildAuth, runMigrations, runInAuthScope } from "./lib/auth";
 import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
@@ -620,4 +621,23 @@ app.get("/probe", async (c) => {
   });
 });
 
-export default { fetch: app.fetch };
+// Scheduled (cron) handler — the prepaid-credit duration-debit driver. Each tick closes
+// abandoned-but-active sessions past TTL and debits every closed-but-unbilled session's
+// wall-clock (the dominant COGS). Runs in its own per-invocation DB scope (no ambient
+// pool on workerd). Cadence is set by the cron trigger in wrangler.jsonc.
+async function scheduled(
+  _event: ScheduledController,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<void> {
+  await runInDbScope(ctx, env.HYPERDRIVE.connectionString, async () => {
+    try {
+      const n = await sweepExpiredSessions();
+      if (n > 0) console.log(`[cron] swept + debited ${n} session(s)`);
+    } catch (e) {
+      console.log(`[cron] sweepExpiredSessions failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
+}
+
+export default { fetch: app.fetch, scheduled };

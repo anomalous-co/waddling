@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import { getActivePlanName } from '../lib/entitlements';
+import { getBalanceMicro, MICRO_PER_USD } from '../lib/credits';
 import type { Env } from '../lib/env';
 import { resolveCaller, parseBody, handle, ok } from '../lib/cp-shared';
 import type { UsageRollup } from '../lib/types';
@@ -148,6 +149,9 @@ usage.get('/', (c) =>
     };
     const planName = await getActivePlanName(caller.orgId);
     const totalSessions = series.reduce((acc, p) => acc + p.sessions, 0);
+    // Prepaid credit balance (µUSD ledger → USD for display). Drives the dashboard's
+    // remaining-credits widget + low-balance UX; the actual cutoff is enforced server-side.
+    const balanceMicro = await getBalanceMicro(caller.orgId);
     return ok(c, {
       rollup,
       series,
@@ -155,6 +159,10 @@ usage.get('/', (c) =>
       totalSessions,
       plan: planName,
       planName,
+      credit: {
+        balanceMicro,
+        balanceUsd: balanceMicro / MICRO_PER_USD,
+      },
     });
   }),
 );
