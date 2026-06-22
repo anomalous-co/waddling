@@ -103,6 +103,26 @@ export interface GatewayTableInfo {
   columns: { name: string; type: string; nullable?: boolean }[];
 }
 
+// Full, UNFILTERED lake catalog (admin authoring picker). Names + types only — no
+// row data. Grouped schema → table → column. Scoped to the lake ATTACH catalog by
+// the gateway, so demo/system schemas never appear.
+export interface GatewayCatalogColumn {
+  name: string;
+  type: string;
+  nullable: boolean;
+}
+export interface GatewayCatalogTable {
+  name: string;
+  columns: GatewayCatalogColumn[];
+}
+export interface GatewayCatalogSchema {
+  name: string;
+  tables: GatewayCatalogTable[];
+}
+export interface GatewayCatalog {
+  schemas: GatewayCatalogSchema[];
+}
+
 // Pool runtime status from the dataplane GatewayPoolDO (derived without waking a sleeping
 // pool). Replaces the old per-gateway birdshot counts.
 export interface GatewayStatus {
@@ -202,6 +222,18 @@ export class GatewayClient {
     return Promise.reject(
       new GatewayError('describe not available on the data-plane gateway (Stage D)', 501),
     );
+  }
+
+  /**
+   * Fetch the FULL lake catalog (every schema/table/column the owner may grant),
+   * UNFILTERED by grants — for the admin ACL authoring picker. Distinct from the
+   * agent-facing grant-scoped `describe`. May trigger a cold gateway boot
+   * (boot-on-demand when no cached snapshot), so it carries the longer timeout.
+   * Names + types only; never row data.
+   */
+  catalog(datalakeId: string): Promise<GatewayCatalog> {
+    // WIRE CONTRACT: dataplane reads `endpointId` (= datalake id).
+    return this.send<GatewayCatalog>('POST', '/gw/catalog', { endpointId: datalakeId }, 45_000);
   }
 
   revoke(req: RevokeRequest): Promise<GatewayAck> {

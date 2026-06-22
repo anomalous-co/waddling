@@ -417,6 +417,55 @@ async function main() {
       return;
     }
 
+    // ── Full lake catalog (trusted connection, UNFILTERED by grants) ───────────
+    // Admin-facing: powers the control-plane ACL authoring picker (real schemas/
+    // tables/columns the owner may grant). Distinct from the agent-facing
+    // grant-scoped `describe`. Scoped to the lake catalog (database_name = the
+    // ATTACH alias) so the demo `memory.main` tables and system schemas never leak
+    // in as if they were the datalake's catalog. Names + types ONLY — never rows.
+    if (path === "/ctrl/catalog" && method === "GET") {
+      // Return the lake's real DATA tables only. Three exclusions:
+      //  - demo/system catalogs (memory/system/temp) — keeps the demo `memory.main`
+      //    orders/secrets + read-through views out of the admin picker. We exclude by
+      //    catalog name rather than filter to `= lakeAlias` because a DuckLake ATTACH
+      //    may report its catalog under its own name, not the alias (describeTables in
+      //    duck.ts carries the same warning) — so `= alias` could drop the real lake.
+      //  - information_schema/pg_catalog — engine internals.
+      //  - `ducklake_*` tables — DuckLake's own catalog bookkeeping (column/snapshot/
+      //    data_file/…), which live in the metadata schema (`dl_<slug>`) and are NOT
+      //    user data. DuckLake reserves the `ducklake_` prefix, so this is safe; the
+      //    metadata schema then has zero rows and never appears in the picker.
+      const reader = await rt.connection.runAndReadAll(
+        `SELECT schema_name, table_name, column_name, data_type, is_nullable
+           FROM duckdb_columns()
+          WHERE database_name NOT IN ('memory', 'system', 'temp')
+            AND schema_name NOT IN ('information_schema', 'pg_catalog')
+            AND table_name NOT LIKE 'ducklake_%'
+          ORDER BY schema_name, table_name, column_index`,
+      );
+      const rows = normalize(reader.getRowObjects());
+      // group rows → { schemas: [{ name, tables: [{ name, columns: [{name,type,nullable}] }] }] }
+      const schemaMap = new Map();
+      for (const r of rows) {
+        const sName = String(r.schema_name);
+        const tName = String(r.table_name);
+        let sch = schemaMap.get(sName);
+        if (!sch) { sch = { name: sName, tables: new Map() }; schemaMap.set(sName, sch); }
+        let tbl = sch.tables.get(tName);
+        if (!tbl) { tbl = { name: tName, columns: [] }; sch.tables.set(tName, tbl); }
+        const nul = r.is_nullable;
+        tbl.columns.push({
+          name: String(r.column_name),
+          type: String(r.data_type),
+          nullable: nul === true || String(nul).toLowerCase() === "true" || String(nul).toUpperCase() === "YES",
+        });
+      }
+      const schemas = [...schemaMap.values()].map((s) => ({ name: s.name, tables: [...s.tables.values()] }));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ schemas }));
+      return;
+    }
+
     // ── Audit drain (trusted connection) ───────────────────────────────────────
     // birdshot's audit log is process-GLOBAL (State::Get() is a singleton; the
     // Authorize hook on the quack serving connection appends to the same deque this

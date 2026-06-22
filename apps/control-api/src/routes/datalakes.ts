@@ -13,11 +13,13 @@ import { Hono } from 'hono';
 import { query, queryOne, withTransaction } from '../lib/db';
 import type { Env } from '../lib/env';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err } from '../lib/cp-shared';
+import { makePostHog } from '../lib/posthog';
 import { getEntitlements } from '../lib/entitlements';
 import { getDatalakeGatewayConfig } from '../lib/datalake-secrets';
 import type { StorageCreds, CatalogCreds } from '../lib/datalake-secrets';
 import { getCrypto } from '../lib/secret-crypto';
 import { gatewayClientFor, GatewayError } from '../lib/gateway-client';
+import { getCachedCatalog, refreshCatalog } from '../lib/catalog-cache';
 import { recompileAndPush } from '../lib/gateway-push';
 import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
 import { compileEndpointPolicy } from '../lib/effective-policy';
@@ -237,6 +239,15 @@ datalakes.post('/', (c) =>
         }
 
         return row.rows[0]!;
+      });
+
+      // Provisioning funnel: a new endpoint/datalake was created. Server-side,
+      // fire-and-forget via waitUntil; no-op when POSTHOG_KEY is unset.
+      makePostHog(c.env, c.executionCtx).capture({
+        distinctId: caller.callerId,
+        event: 'endpoint_created',
+        properties: { region: input.region, encrypted: input.encrypted, kind: input.kind },
+        groups: { organization: caller.orgId },
       });
 
       return ok(c, { datalakeId: created.id, status: created.status }, 201);
@@ -730,6 +741,69 @@ datalakes.get('/:id/describe', (c) =>
     }
 
     return ok<DescribeResult>(c, { datalakeId, tables });
+  }),
+);
+
+// ── /api/cp/datalakes/:id/catalog — FULL catalog for the ACL authoring picker ────
+//
+// UNFILTERED by grants (unlike /describe, which is the agent-facing grant-scoped
+// view) → owner/admin only. Serves the cached snapshot instantly; if nothing is
+// cached yet, boots the gateway once on demand to populate it. The real freshness
+// driver is the change-tracked refresh after catalog-mutating statements, not this
+// read path.
+async function requireOrgAdmin(caller: { callerId: string; orgId: string }): Promise<boolean> {
+  const member = await queryOne<{ role: string }>(
+    `SELECT role FROM "member" WHERE "userId" = $1 AND "organizationId" = $2`,
+    [caller.callerId, caller.orgId],
+  );
+  return !!member && ['owner', 'admin'].includes(member.role);
+}
+
+datalakes.get('/:id/catalog', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const datalakeId = c.req.param('id');
+    const endpoint = await queryOne<DescribeEndpointRow>(
+      `SELECT id, org_id, status, server_token FROM waddling.datalake WHERE id = $1`,
+      [datalakeId],
+    );
+    if (!endpoint) return err(c, 'datalake_not_found', 404);
+    assertOrg(caller, endpoint.org_id);
+    if (!(await requireOrgAdmin(caller))) {
+      return err(c, 'forbidden', 403, 'Only org owners and admins may browse the catalog');
+    }
+
+    let cached = await getCachedCatalog(datalakeId);
+    if (!cached) {
+      // Boot-on-demand: nothing cached yet — try to populate once (may cold-boot).
+      const snap = await refreshCatalog(endpoint);
+      if (snap) cached = await getCachedCatalog(datalakeId);
+    }
+    if (!cached) {
+      return ok(c, { datalakeId, schemas: [], fetchedAt: null, stale: true });
+    }
+    return ok(c, { datalakeId, schemas: cached.snapshot.schemas, fetchedAt: cached.fetchedAt, stale: false });
+  }),
+);
+
+datalakes.post('/:id/catalog/refresh', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const datalakeId = c.req.param('id');
+    const endpoint = await queryOne<DescribeEndpointRow>(
+      `SELECT id, org_id, status, server_token FROM waddling.datalake WHERE id = $1`,
+      [datalakeId],
+    );
+    if (!endpoint) return err(c, 'datalake_not_found', 404);
+    assertOrg(caller, endpoint.org_id);
+    if (!(await requireOrgAdmin(caller))) {
+      return err(c, 'forbidden', 403, 'Only org owners and admins may refresh the catalog');
+    }
+    const snap = await refreshCatalog(endpoint);
+    if (!snap) {
+      return err(c, 'gateway_unreachable', 503, 'could not fetch catalog (gateway cold or stopped)');
+    }
+    return ok(c, { datalakeId, schemas: snap.snapshot.schemas });
   }),
 );
 

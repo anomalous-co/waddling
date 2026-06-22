@@ -17,6 +17,7 @@ import { bumpPolicyVersion } from './policy-version';
 import type { CompileResult } from './policy-compiler';
 import { gatewayClientFor, type SnapshotRequest, type BirdshotJwk } from './gateway-client';
 import { resolveGatewayBoot } from './gateway-boot';
+import { refreshCatalog, type CatalogEndpoint } from './catalog-cache';
 import type { Env } from './env';
 
 interface EndpointRow {
@@ -126,4 +127,24 @@ export async function recompileAndPush(
   // endpoint missing or not running — no push attempted; the rule re-pushes on the
   // next connect/recompile once the gateway is running.
   return { ...compiled, pushed: false, pushSkipped: true };
+}
+
+/**
+ * Change-tracked catalog refresh + conditional recompile. Called after a governed
+ * catalog-mutating statement (CTAS/ETL/DROP/...), when the gateway is already warm:
+ * pull the fresh catalog, and IF it changed, recompile + push so any covering
+ * read/write WILDCARD grant folds in the new/removed table (the "future tables are
+ * auto-covered" path). Best-effort — never throws into the caller (run in waitUntil).
+ */
+export async function refreshCatalogAndRecompile(
+  c: { env: Env },
+  datalakeId: string,
+  endpoint: CatalogEndpoint,
+): Promise<void> {
+  try {
+    const r = await refreshCatalog(endpoint);
+    if (r?.changed) await recompileAndPush(c, datalakeId);
+  } catch {
+    /* best-effort: the next connect/recompile picks up the fresh catalog anyway */
+  }
 }

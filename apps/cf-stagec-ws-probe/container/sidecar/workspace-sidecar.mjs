@@ -52,13 +52,39 @@ if (!PORT || !DB_FILE) {
 const q = (s) => "'" + String(s).replace(/'/g, "''") + "'";
 
 // Inlined from packages/gateway/src/duck.ts (the cross-monorepo import is not in the
-// container build context). Coerce DuckDB row values to JSON-safe primitives:
-// BigInt → number (or string when it would lose precision), everything else as-is.
+// container build context). Coerce a DuckDB row TREE to JSON-safe values so the
+// JSON.stringify in sendJson() never throws "Do not know how to serialize a BigInt".
+//
+// This MUST recurse: a top-level BIGINT/HUGEINT (id, count(*)) arrives as a bare
+// `bigint`, but a TIMESTAMPTZ / DECIMAL / nested LIST/STRUCT/MAP from getRowObjects()
+// arrives as a value-wrapper OBJECT (or array) that carries a `bigint` INSIDE it.
+// A shallow check sees the wrapper is an object (not a bigint), returns it untouched,
+// and then JSON.stringify recurses into the internal bigint and dies. So we walk the
+// whole tree here:
+//   • bigint   → Number when within Number.MAX_SAFE_INTEGER (precision-safe), else its
+//                lossless string form (the gateway uses a bare Number(); we keep the
+//                range guard so large HUGEINT/BIGINT values don't silently round),
+//   • array    → map(normalize) elementwise,
+//   • foreign-prototype object (a DuckDB value wrapper: timestamp, decimal, …) → its
+//                readable String() form (these stringify cleanly and carry hidden bigints),
+//   • plain object (STRUCT / row map) → recurse over its entries,
+//   • everything else → as-is.
 function normalize(v) {
   if (typeof v === "bigint") {
     return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER)
       ? Number(v)
       : v.toString();
+  }
+  if (Array.isArray(v)) return v.map(normalize);
+  if (v && typeof v === "object") {
+    const proto = Object.getPrototypeOf(v);
+    // A non-plain prototype = a DuckDB value wrapper (DuckDBTimestampValue, etc.). These
+    // hold an internal bigint that JSON.stringify would choke on; their toString() is the
+    // readable value, so stringify them here.
+    if (proto && proto !== Object.prototype) return String(v);
+    return Object.fromEntries(
+      Object.entries(v).map(([k, val]) => [k, normalize(val)]),
+    );
   }
   return v;
 }
@@ -98,10 +124,23 @@ async function readJson(req) {
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
 }
 
+// Backstop replacer: row VALUES are already normalized at /query, but this guards every
+// other response site (and any nested bigint a future handler forgets to normalize) so a
+// stray bigint can never crash JSON.stringify with "Do not know how to serialize a BigInt".
+// Same precision-safe strategy as normalize(): in-range → Number, else lossless string.
+function bigintSafe(_k, v) {
+  if (typeof v === "bigint") {
+    return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(v)
+      : v.toString();
+  }
+  return v;
+}
+
 function sendJson(res, status, body) {
   res.statusCode = status;
   res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify(body));
+  res.end(JSON.stringify(body, bigintSafe));
 }
 
 /**

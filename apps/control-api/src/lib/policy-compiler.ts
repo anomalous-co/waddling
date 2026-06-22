@@ -207,6 +207,68 @@ const tableRef = (r: AclRuleRow): string => `${r.schema_name}.${r.table_name}`;
 /** A grant's capability — explicit `capability` if present, else the legacy `verb`. */
 const capOf = (r: AclRuleRow): Capability => (r.capability ?? r.verb) as Capability;
 
+// Catalog shape for wildcard expansion (names only; GatewayCatalog is a structural
+// supertype, so a cached snapshot is assignable here directly).
+export interface CompileCatalog {
+  schemas: { name: string; tables: { name: string }[] }[];
+}
+
+// Capabilities enforced via birdshot's BIND-walk against the lake-CATALOG-qualified
+// bound ref (`lake.<schema>.<table>`). A schema/table WILDCARD grant (`main.*`) does
+// NOT match a lake-qualified bound ref (only the `.*` prefix branch fires, and it is
+// catalog-sensitive), so for these caps we EXPAND the wildcard into concrete
+// `schema.table` refs from the real catalog — which DO match via the exact/suffix
+// branch. The parse-authorized caps (create/drop/alter/detach) are matched on the
+// PARSE-walk against bare refs and target new/named objects, so they keep their
+// wildcard and are deliberately NOT expanded (expanding `create` would forbid
+// creating any NOT-yet-existing table). birdshot itself is never loosened.
+//
+// KNOWN ASYMMETRY (intentional, not a bug to fix here): `drop`/`alter` are
+// parse-authorized, so a broad `drop main.*` grant stays literal and matches only
+// BARE refs on the parse-walk — a `DROP TABLE lake.main.foo` (the catalog-qualified
+// form the MCP tells agents to use) under `drop main.*` would be denied. `read` is
+// the proven need this phase; drop/alter target existing objects too and could join
+// this set later, but are out of scope now. Documented so the denial isn't mysterious.
+const BIND_WALK_CAPABILITIES = new Set<Capability>(['read', 'write']);
+
+/**
+ * Expand `read`/`write` wildcard rules (`schema='*'` and/or `table='*'`) into one
+ * concrete rule per matching real table, preserving every field (capability/effect/
+ * columns/limits/window/priority/agent) so precedence + deny carve-outs still work.
+ * A wildcard that matches zero real tables emits nothing (covers nothing — honest;
+ * the authoring UI blocks zero-match grants). Only applied when a catalog is known;
+ * with no catalog the caller keeps today's literal-wildcard behavior.
+ */
+export function expandBindWalkWildcards(rules: AclRuleRow[], catalog: CompileCatalog): AclRuleRow[] {
+  const bySchema = new Map<string, { real: string; tables: string[] }>();
+  for (const s of catalog.schemas) {
+    bySchema.set(s.name.toLowerCase(), { real: s.name, tables: s.tables.map((t) => t.name) });
+  }
+  const out: AclRuleRow[] = [];
+  for (const r of rules) {
+    const cap = capOf(r);
+    const schemaWild = r.schema_name === '*';
+    const tableWild = r.table_name === '*';
+    if (!BIND_WALK_CAPABILITIES.has(cap) || (!schemaWild && !tableWild)) {
+      out.push(r); // concrete, or a non-bind-walk capability → unchanged
+      continue;
+    }
+    const schemas = schemaWild
+      ? [...bySchema.values()]
+      : bySchema.has(r.schema_name.toLowerCase())
+        ? [bySchema.get(r.schema_name.toLowerCase())!]
+        : [];
+    for (const s of schemas) {
+      const tables = tableWild ? s.tables : [r.table_name];
+      for (const t of tables) {
+        out.push({ ...r, schema_name: s.real, table_name: t });
+      }
+    }
+    // zero matches ⇒ no grant emitted (covers nothing)
+  }
+  return out;
+}
+
 /**
  * Compile active rules → birdshot snapshot + gateway constraints.
  *
@@ -225,8 +287,14 @@ export function compilePolicy(
   rules: AclRuleRow[],
   now: Date,
   policyRows: AclPolicyRow[] = [],
+  catalog?: CompileCatalog,
 ): CompileResult {
-  const active = rules.filter((r) => isRuleActive(r, now));
+  // Expand read/write wildcards into concrete refs against the real catalog (so a
+  // broad "entire schema/lake" grant authorizes lake-qualified reads WITHOUT
+  // loosening birdshot). With no catalog, keep the literal-wildcard behavior.
+  const active = (catalog ? expandBindWalkWildcards(rules, catalog) : rules).filter((r) =>
+    isRuleActive(r, now),
+  );
 
   // Key = agentId|tableRef|capability. Keep the strongest rule (lower priority
   // wins; deny beats allow on tie).

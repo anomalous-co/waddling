@@ -1123,6 +1123,24 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  // ── full lake catalog (admin authoring picker; control-api gates owner/admin) ──
+  // Forwards to the gateway's /ctrl/catalog (trusted connection, unfiltered by
+  // grants, scoped to the lake catalog). Names + types only — no row data.
+  if (path === "/gw/catalog" && request.method === "POST") {
+    const endpointId = body.endpointId ?? body.datalakeId;
+    if (!endpointId) return Response.json({ error: "missing datalakeId" }, { status: 400 });
+    const pool = getPool(env, endpointId);
+    const picked = await pool.pickReplica(endpointId);
+    if (!picked.replicaKey) return Response.json({ error: picked.error ?? "no gateway replica" }, { status: 503 });
+    const gw = getSandbox(env.GATEWAY, picked.replicaKey, { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
+    try {
+      const r = await gwFwd(gw, "/ctrl/catalog", { method: "GET" });
+      return Response.json(r.json, { status: r.status });
+    } finally {
+      try { await pool.release(picked.replicaKey); } catch { /* best-effort load bookkeeping */ }
+    }
+  }
+
   // ── workspace lifecycle (control-api configure; mcp-external query/run) ─────────
   if (path === "/configure" && request.method === "POST") {
     // control-api migrated endpointId → datalakeId (the gateway DO is keyed gw:<datalakeId>,

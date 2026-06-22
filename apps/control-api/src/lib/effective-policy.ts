@@ -18,6 +18,7 @@
  * emitted as birdshot verb rows; birdshot cannot enforce them yet (Phase 2).
  */
 import { query } from './db';
+import { getCachedCatalog } from './catalog-cache';
 import {
   compilePolicy,
   type AclRuleRow,
@@ -576,5 +577,10 @@ export async function compileEndpointPolicy(
   const allRules: AclRuleRow[] = [...directRows, ...derivedRows];
   const allPolicies: AclPolicyRow[] = [...directPolicies, ...derivedPolicies];
 
-  return compilePolicy(allRules, now, allPolicies);
+  // Load the cached lake catalog so the compiler can expand read/write wildcards
+  // into concrete refs (broad "entire schema/lake" grants → matching lake-qualified
+  // grants). If no snapshot is cached yet, the compiler keeps the literal-wildcard
+  // behavior (no regression) until the catalog populates.
+  const cached = await getCachedCatalog(datalakeId);
+  return compilePolicy(allRules, now, allPolicies, cached?.snapshot);
 }

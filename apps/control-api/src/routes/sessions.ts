@@ -1049,16 +1049,17 @@ sessions.post('/:id/etl', (c) =>
     // so the gateway is warm right now — re-pull + upsert the cached catalog so the
     // authoring picker (and any covering wildcard grant) sees the new shape. Post-
     // response, best-effort; never adds latency or fails the call.
-    if (exCtx) {
-      exCtx.waitUntil(
-        refreshCatalogAndRecompile(c, sess.datalake_id, {
-          id: sess.datalake_id,
-          org_id: sess.org_id,
-          status: 'running',
-          server_token: '',
-        }),
-      );
-    }
+    // Change-tracked catalog refresh: an ETL may CREATE/DROP a lake table. Awaited
+    // (not waitUntil) because c.executionCtx is absent on the MCP-loopback path, so
+    // waitUntil silently no-ops; ETL is not latency-critical and the gateway is warm
+    // now. refreshCatalogAndRecompile is internally best-effort (never throws), so it
+    // can't fail the ETL response.
+    await refreshCatalogAndRecompile(c, sess.datalake_id, {
+      id: sess.datalake_id,
+      org_id: sess.org_id,
+      status: 'running',
+      server_token: '',
+    });
     return ok(c, { ok: true, phase: j.phase ?? 'done', authorizeDecision: j.authorizeDecision ?? 'allow' });
   }),
 );
