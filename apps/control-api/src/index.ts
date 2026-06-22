@@ -42,6 +42,7 @@ import { deviceLink } from "./routes/device-link";
 import { catalog } from "./routes/catalog";
 import { quackboard } from "./routes/quackboard";
 import { account } from "./routes/account";
+import { onboarding } from "./routes/onboarding";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -529,6 +530,7 @@ app.route("/api/cp/device-link", deviceLink);
 app.route("/api/cp/catalog", catalog);
 app.route("/api/cp/quackboard", quackboard);
 app.route("/api/cp/account", account);
+app.route("/api/cp/onboarding", onboarding);
 
 app.get("/", (c) =>
   c.text(
