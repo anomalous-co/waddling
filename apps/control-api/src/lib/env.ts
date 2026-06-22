@@ -45,6 +45,16 @@ export interface Env {
   // own base URL in this deployment.
   APP_URL?: string;
 
+  // ── PostHog (server-side funnel capture via HTTP, workerd-safe) ──────────
+  // The PostHog project token — the SAME value the render plane ships as
+  // NEXT_PUBLIC_POSTHOG_KEY (project tokens are public/write-only). Unset ⇒ the
+  // server-side PostHog client (lib/posthog.ts) degrades to a no-op.
+  POSTHOG_KEY?: string;
+  // Ingestion host. Unset ⇒ https://us.i.posthog.com. Set to the EU host
+  // (https://eu.i.posthog.com) or a self-hosted instance as needed. The render
+  // plane proxies through /ingest; the Worker calls this host directly.
+  POSTHOG_HOST?: string;
+
   // The render-plane (UI) Worker's browser origin, e.g. https://app.getwaddling.com.
   // The dashboard now runs on its own origin and calls /api/cp/* + /api/auth/* here
   // cross-origin, so this origin must be echoed in CORS Access-Control-Allow-Origin
@@ -76,6 +86,10 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_PRICE_PRO: string;
   STRIPE_PRICE_ENTERPRISE: string;
+  // One-time credit-pack Prices (ANO-64 fills these). Unset/placeholder ⇒ pack hidden.
+  STRIPE_PRICE_CREDIT_10: string;
+  STRIPE_PRICE_CREDIT_25: string;
+  STRIPE_PRICE_CREDIT_100: string;
 
   // ── Neon (per-org managed Postgres catalog) — non-secret vars ────────────
   // The cloud region id (e.g. 'aws-us-east-1') new org catalog projects are created in, and

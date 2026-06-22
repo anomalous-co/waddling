@@ -110,6 +110,9 @@
     "STRIPE_WEBHOOK_SECRET": "whsec_placeholder_b1",
     "STRIPE_PRICE_PRO": "price_placeholder_pro",
     "STRIPE_PRICE_ENTERPRISE": "price_placeholder_ent",
+    "STRIPE_PRICE_CREDIT_10": "price_placeholder_credit_10",
+    "STRIPE_PRICE_CREDIT_25": "price_placeholder_credit_25",
+    "STRIPE_PRICE_CREDIT_100": "price_placeholder_credit_100",
     // Neon per-org managed Postgres catalog. The API key is a Worker secret:
     // `wrangler secret put NEON_API_KEY`. Until it is set, getNeonClient() returns null and
     // /api/cp/catalog 503s (managed-postgres catalog disabled) — safe to deploy unconfigured.

@@ -18,11 +18,15 @@
  * to function against live Stripe; the placeholder key in env is enough to read this
  * summary (it touches no Stripe API).
  */
+import { z } from 'zod';
+import Stripe from 'stripe';
 import { Hono } from 'hono';
 import { queryOne } from '../lib/db';
 import { getActivePlan } from '../lib/entitlements';
+import { getBalanceMicro, MICRO_PER_USD } from '../lib/credits';
+import { getPack, packPriceId, availablePacks } from '../lib/credit-packs';
 import type { Env } from '../lib/env';
-import { resolveCaller, handle, ok } from '../lib/cp-shared';
+import { resolveCaller, parseBody, handle, ok, err } from '../lib/cp-shared';
 
 interface SubRow {
   plan: string | null;
@@ -84,10 +88,14 @@ billing.get('/', (c) =>
       cancelAtPeriodEnd: sub?.cancelAtPeriodEnd ?? false,
     };
 
+    // Prepaid credit balance + the purchasable packs, for the top-up surface.
+    const balanceMicro = await getBalanceMicro(caller.orgId);
     return ok(c, {
       plan: planInfo,
       entitlements: plan.entitlements,
       invoices: [] as Invoice[],
+      credit: { balanceMicro, balanceUsd: balanceMicro / MICRO_PER_USD },
+      creditPacks: availablePacks(c.env),
       subscription: sub
         ? {
             plan: sub.plan,
@@ -106,6 +114,47 @@ billing.get('/', (c) =>
         list: '/api/auth/subscription/list',
       },
     });
+  }),
+);
+
+const CreditPackSchema = z.object({ packId: z.string().min(1) });
+
+/**
+ * POST /credit-pack — start a one-time Stripe Checkout to buy a prepaid credit pack.
+ *
+ * Returns a Checkout URL; the dashboard redirects to it. Credits are NOT granted here —
+ * fulfillment is on the webhook (`fulfillCreditPackEvent` via the stripe plugin's onEvent),
+ * keyed on the session id so a closed tab / redelivery still grants exactly once.
+ *
+ * TODO(ANO-80): gate to admin+ once resolveCaller exposes org role (billing-manage = admin+).
+ */
+billing.post('/credit-pack', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const { packId } = await parseBody(c, CreditPackSchema);
+    const pack = getPack(packId);
+    if (!pack) return err(c, 'unknown_pack', 400, `No such credit pack: ${packId}`);
+    const priceId = packPriceId(c.env, pack);
+    if (!priceId) {
+      return err(c, 'billing_not_configured', 409, 'Credit packs are not configured for this deployment yet.');
+    }
+
+    const web = (c.env.WEB_ORIGIN ?? '').split(',')[0]?.trim() || c.env.BETTER_AUTH_URL;
+    // Per-request Stripe client (workerd: fetch HTTP client; never module-cache it).
+    const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { httpClient: Stripe.createFetchHttpClient() });
+    const session = await stripe.checkout.sessions.create(
+      {
+        mode: 'payment',
+        line_items: [{ price: priceId, quantity: 1 }],
+        success_url: `${web}/dashboard/billing?topup=success`,
+        cancel_url: `${web}/dashboard/billing?topup=cancel`,
+        // Belt-and-suspenders org binding for fulfillment (metadata + client_reference_id).
+        client_reference_id: caller.orgId,
+        metadata: { orgId: caller.orgId, packId: pack.id, kind: 'credit_pack' },
+      },
+      { idempotencyKey: crypto.randomUUID() },
+    );
+    return ok(c, { url: session.url });
   }),
 );
 
