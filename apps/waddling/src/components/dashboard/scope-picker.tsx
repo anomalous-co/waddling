@@ -62,7 +62,9 @@ interface ScopePickerProps {
 
 export function ScopePicker({ datalakes, grants, onChange, fixedDatalakeId }: ScopePickerProps) {
   const [datalakeId, setDatalakeId] = useState<string>(fixedDatalakeId ?? datalakes[0]?.id ?? '');
-  const [capability, setCapability] = useState<Capability>('read');
+  // Multi-select capabilities: tick read+write (or all six via "Full access") and stage
+  // them in ONE "Add to scope" instead of re-picking + re-saving per capability.
+  const [caps, setCaps] = useState<Set<Capability>>(new Set<Capability>(['read']));
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null);
   const [loadingCatalog, setLoadingCatalog] = useState(false);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -103,18 +105,35 @@ export function ScopePicker({ datalakes, grants, onChange, fixedDatalakeId }: Sc
       return next;
     });
 
+  const toggleCap = (cap: Capability) =>
+    setCaps((prev) => {
+      const next = new Set(prev);
+      next.has(cap) ? next.delete(cap) : next.add(cap);
+      return next;
+    });
+  const allCaps = caps.size === SCOPE_CAPABILITIES.length;
+  const toggleAllCaps = () =>
+    setCaps(allCaps ? new Set<Capability>() : new Set<Capability>(SCOPE_CAPABILITIES));
+
   const addGrants = () => {
-    const rows: GrantRow[] = [];
+    // Targets (schema/table) chosen in the current mode, crossed with every ticked
+    // capability — one GrantRow per (capability × target).
+    const targets: { schema: string; table: string }[] = [];
     if (mode === 'lake') {
-      rows.push({ datalakeId, capability, schema: '*', table: '*' });
+      targets.push({ schema: '*', table: '*' });
     } else if (mode === 'schema') {
       if (!wholeSchema) return;
-      rows.push({ datalakeId, capability, schema: wholeSchema, table: '*' });
+      targets.push({ schema: wholeSchema, table: '*' });
     } else {
       for (const key of checked) {
         const [schema, ...rest] = key.split('.');
-        rows.push({ datalakeId, capability, schema, table: rest.join('.') });
+        targets.push({ schema, table: rest.join('.') });
       }
+    }
+    const rows: GrantRow[] = [];
+    for (const cap of SCOPE_CAPABILITIES) {
+      if (!caps.has(cap)) continue;
+      for (const t of targets) rows.push({ datalakeId, capability: cap, schema: t.schema, table: t.table });
     }
     if (rows.length === 0) return;
     // Dedupe against existing staged grants (same datalake/capability/schema/table).
@@ -125,35 +144,69 @@ export function ScopePicker({ datalakes, grants, onChange, fixedDatalakeId }: Sc
     setWholeSchema('');
   };
 
-  const removeGrant = (i: number) => onChange(grants.filter((_, idx) => idx !== i));
+  const removeTarget = (g: { datalakeId: string; schema: string; table: string }) =>
+    onChange(
+      grants.filter(
+        (r) => !(r.datalakeId === g.datalakeId && r.schema === g.schema && r.table === g.table),
+      ),
+    );
+
+  // Collapse staged grants to one chip per (datalake, schema, table), listing the
+  // capabilities together — so full access on a table is one chip, not six.
+  const groups: { datalakeId: string; schema: string; table: string; caps: Capability[] }[] = [];
+  const groupIndex = new Map<string, number>();
+  for (const g of grants) {
+    const key = `${g.datalakeId}|${g.schema}|${g.table}`;
+    let gi = groupIndex.get(key);
+    if (gi === undefined) {
+      gi = groups.length;
+      groupIndex.set(key, gi);
+      groups.push({ datalakeId: g.datalakeId, schema: g.schema, table: g.table, caps: [] });
+    }
+    groups[gi].caps.push(g.capability);
+  }
+  const targetText = (g: { schema: string; table: string }) =>
+    g.schema === '*' ? 'entire lake' : g.table === '*' ? `${g.schema}.* (whole schema)` : `${g.schema}.${g.table}`;
 
   const dlName = (id: string) => datalakes.find((d) => d.id === id)?.name ?? id;
-  const canAdd =
+  const hasTarget =
     mode === 'lake' || (mode === 'schema' && !!wholeSchema) || (mode === 'tables' && checked.size > 0);
+  const canAdd = caps.size > 0 && hasTarget;
 
   return (
     <div className="flex flex-col gap-3">
-      {/* datalake + capability */}
-      <div className="grid grid-cols-2 gap-2">
-        {!fixedDatalakeId && (
-          <div className="flex flex-col gap-1">
-            <Label className="text-xs text-muted-foreground">Data lake</Label>
-            <Select value={datalakeId} onValueChange={setDatalakeId}>
-              <SelectTrigger className="w-full"><SelectValue placeholder="Select a lake" /></SelectTrigger>
-              <SelectContent>
-                {datalakes.map((d) => <SelectItem key={d.id} value={d.id}>{d.name}</SelectItem>)}
-              </SelectContent>
-            </Select>
-          </div>
-        )}
-        <div className={`flex flex-col gap-1 ${fixedDatalakeId ? 'col-span-2' : ''}`}>
-          <Label className="text-xs text-muted-foreground">Capability</Label>
-          <Select value={capability} onValueChange={(v) => setCapability(v as Capability)}>
-            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+      {/* datalake */}
+      {!fixedDatalakeId && (
+        <div className="flex flex-col gap-1">
+          <Label className="text-xs text-muted-foreground">Data lake</Label>
+          <Select value={datalakeId} onValueChange={setDatalakeId}>
+            <SelectTrigger className="w-full"><SelectValue placeholder="Select a lake" /></SelectTrigger>
             <SelectContent>
-              {SCOPE_CAPABILITIES.map((cap) => <SelectItem key={cap} value={cap}>{cap}</SelectItem>)}
+              {datalakes.map((d) => <SelectItem key={d.id} value={d.id}>{d.name}</SelectItem>)}
             </SelectContent>
           </Select>
+        </div>
+      )}
+
+      {/* capabilities — multi-select; one grant per ticked capability */}
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-center justify-between">
+          <Label className="text-xs text-muted-foreground">Capabilities</Label>
+          <button
+            type="button"
+            onClick={toggleAllCaps}
+            className="text-xs text-muted-foreground hover:text-foreground"
+          >
+            {allCaps ? 'Clear all' : 'Full access'}
+          </button>
+        </div>
+        <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+          {SCOPE_CAPABILITIES.map((cap) => (
+            <label key={cap} className="flex items-center gap-1.5 cursor-pointer text-sm">
+              <Checkbox checked={caps.has(cap)} onCheckedChange={() => toggleCap(cap)} />
+              <span className="font-mono">{cap}</span>
+            </label>
+          ))}
         </div>
       </div>
 
@@ -216,7 +269,7 @@ export function ScopePicker({ datalakes, grants, onChange, fixedDatalakeId }: Sc
         </TabsContent>
 
         <TabsContent value="lake" className="mt-2">
-          <p className="text-sm">Grant <span className="font-medium">{capability}</span> on the <span className="font-medium">entire lake</span> — every schema and table, including future ones.</p>
+          <p className="text-sm">Grant the <span className="font-medium">selected capabilities</span> on the <span className="font-medium">entire lake</span> — every schema and table, including future ones.</p>
         </TabsContent>
       </Tabs>
 
@@ -224,22 +277,39 @@ export function ScopePicker({ datalakes, grants, onChange, fixedDatalakeId }: Sc
         <Plus className="size-3.5" /> Add to scope
       </Button>
 
-      {/* staged grants */}
-      {grants.length > 0 && (
+      {/* staged grants — one chip per target, capabilities listed together */}
+      {groups.length > 0 && (
         <div className="flex flex-col gap-1.5 rounded-md border p-2">
-          <span className="text-xs text-muted-foreground">Scope ({grants.length})</span>
+          <span className="text-xs text-muted-foreground">
+            Scope ({groups.length} target{groups.length > 1 ? 's' : ''}, {grants.length} grant{grants.length > 1 ? 's' : ''})
+          </span>
           <div className="flex flex-wrap gap-1.5">
-            {grants.map((g, i) => (
-              <Badge key={i} variant="secondary" className="gap-1 font-mono text-xs">
-                {!fixedDatalakeId && datalakes.length > 1 && (
-                  <span className="text-muted-foreground">{dlName(g.datalakeId)}:</span>
-                )}
-                {grantLabel(g)}
-                <button type="button" onClick={() => removeGrant(i)} className="ml-0.5 hover:text-destructive">
-                  <X className="size-3" />
-                </button>
-              </Badge>
-            ))}
+            {groups.map((g) => {
+              const ordered = SCOPE_CAPABILITIES.filter((c) => g.caps.includes(c));
+              const capText = ordered.length === SCOPE_CAPABILITIES.length ? 'full access' : ordered.join(' ');
+              return (
+                <Badge
+                  key={`${g.datalakeId}|${g.schema}|${g.table}`}
+                  variant="secondary"
+                  className="flex-col items-start gap-0.5 font-mono text-xs max-w-[220px] whitespace-normal h-auto"
+                >
+                  <span className="flex items-center gap-1 w-full min-w-0">
+                    {!fixedDatalakeId && datalakes.length > 1 && (
+                      <span className="text-muted-foreground shrink-0">{dlName(g.datalakeId)}:</span>
+                    )}
+                    <span className="truncate">{targetText(g)}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeTarget(g)}
+                      className="ml-auto shrink-0 hover:text-destructive"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                  <span className="text-muted-foreground text-[10px] leading-tight">{capText}</span>
+                </Badge>
+              );
+            })}
           </div>
         </div>
       )}
