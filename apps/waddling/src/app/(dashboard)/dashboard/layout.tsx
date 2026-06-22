@@ -1,5 +1,5 @@
 import { redirect } from 'next/navigation';
-import { getServerSession } from '@/lib/control-api-server';
+import { getServerSession, getPaidStatus } from '@/lib/control-api-server';
 import { DashboardShell } from '@/components/dashboard/shell';
 import type { ReactNode } from 'react';
 
@@ -16,6 +16,15 @@ export default async function DashboardLayout({
     const url = '/sign-in?next=/dashboard';
     redirect(url);
   }
+
+  // Payment-onboarding gate ("must pay to enter"): an org may not reach the dashboard
+  // until it has an active subscription OR has purchased credits. Derived server-side by
+  // control-api (no new flag). Route the no-org case to org-creation first, the unpaid
+  // case to the billing step. /onboarding lives OUTSIDE this route group, so it is not
+  // gated by this layout (no redirect loop).
+  const paidStatus = await getPaidStatus();
+  if (!paidStatus.hasOrg) redirect('/onboarding?step=org');
+  if (!paidStatus.paid) redirect('/onboarding?step=billing');
 
   // Better Auth organization plugin stores the active org id on the session.
   // The field is `session.session.activeOrganizationId` (plugin-injected).

@@ -263,6 +263,94 @@ acl.get('/:id', (c) =>
   }),
 );
 
+// PATCH /:id — edit an existing rule IN PLACE (no delete+recreate). Mutable: the
+// non-targeting dimensions — capability, columns, row limit, effect, time window, and
+// expiry (the "continuation" lever: extend/shorten/clear a grant's lifetime). The
+// TARGET (datalake/schema/table/subject) is immutable; retargeting = a new rule.
+// `undefined` = leave unchanged; an explicit `null` clears (columns/rowLimit/window/
+// expiry). Recompiles + pushes like POST/DELETE.
+const PatchAclSchema = z.object({
+  capability: z.enum(CAPABILITY_VALUES).optional(),
+  columns: z.array(z.string()).nullable().optional(),
+  rowLimit: z.number().int().positive().nullable().optional(),
+  effect: z.enum(['allow', 'deny']).optional(),
+  window: z.object({ start: z.string(), end: z.string() }).nullable().optional(),
+  expiresAt: z.string().nullable().optional(),
+  ttlSeconds: z.number().int().positive().nullable().optional(),
+});
+
+acl.patch('/:id', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const id = c.req.param('id');
+    const input = await parseBody(c, PatchAclSchema);
+
+    const rule = await queryOne<RuleRow>(
+      `SELECT id, org_id, datalake_id, agent_id FROM waddling.acl_rule WHERE id = $1`,
+      [id],
+    );
+    if (!rule) return err(c, 'rule_not_found', 404);
+    assertOrg(caller, rule.org_id);
+
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    let n = 1;
+    if (input.capability !== undefined) {
+      sets.push(`capability = $${n++}`);
+      params.push(input.capability);
+      // Keep the legacy verb consistent with the new capability (NOT NULL column).
+      sets.push(`verb = $${n++}`);
+      params.push(input.capability === 'write' ? 'write' : 'read');
+    }
+    if (input.columns !== undefined) {
+      sets.push(`columns = $${n++}`);
+      params.push(input.columns); // null clears the allow-list (= all columns)
+    }
+    if (input.rowLimit !== undefined) {
+      sets.push(`row_limit = $${n++}`);
+      params.push(input.rowLimit);
+    }
+    if (input.effect !== undefined) {
+      sets.push(`effect = $${n++}`);
+      params.push(input.effect);
+    }
+    if (input.window !== undefined) {
+      sets.push(`window_start = $${n++}`, `window_end = $${n++}`);
+      params.push(input.window?.start ?? null, input.window?.end ?? null);
+    }
+    // Expiry (continuation): explicit expiresAt wins; else ttlSeconds → now+ttl; null clears.
+    if (input.expiresAt !== undefined) {
+      sets.push(`expires_at = $${n++}`);
+      params.push(input.expiresAt);
+    } else if (input.ttlSeconds !== undefined) {
+      sets.push(`expires_at = $${n++}`);
+      params.push(input.ttlSeconds === null ? null : new Date(Date.now() + input.ttlSeconds * 1000).toISOString());
+    }
+
+    if (sets.length === 0) return err(c, 'no_changes', 400, 'No mutable fields provided');
+
+    params.push(id);
+    const updated = await queryOne<AclRuleDbRow>(
+      `UPDATE waddling.acl_rule SET ${sets.join(', ')} WHERE id = $${n} RETURNING *`,
+      params,
+    );
+
+    const compiled = await recompileAndPush(c, rule.datalake_id);
+
+    await query(
+      `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, datalake_id, decision, actor)
+       VALUES ($1,'control-plane','grant_update',$2,$3,'allow',$4)`,
+      [rule.org_id, rule.agent_id, rule.datalake_id, caller.callerId],
+    );
+
+    return ok(c, {
+      rule: updated ? mapRule(updated) : null,
+      ruleId: id,
+      compiledGrants: compiled.snapshot,
+    });
+  }),
+);
+
 acl.delete('/:id', (c) =>
   handle(c, async () => {
     const caller = await resolveCaller(c);

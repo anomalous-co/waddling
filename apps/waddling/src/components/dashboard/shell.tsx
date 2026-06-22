@@ -139,7 +139,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   notebooks: 'Notebooks',
   views: 'Views',
   billing: 'Billing',
-  settings: 'Organization',
+  settings: 'Settings',
   account: 'Account',
   onboarding: 'Connect',
   new: 'New',
@@ -222,7 +222,7 @@ function UserMenu({
             <DropdownMenuSeparator />
             <DropdownMenuGroup>
               <DropdownMenuItem asChild>
-                <Link href="/dashboard/account">
+                <Link href="/dashboard/settings?tab=account">
                   <User data-icon="inline-start" />
                   Account
                 </Link>
@@ -247,13 +247,13 @@ function UserMenu({
                   ))}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem asChild>
-                    <Link href="/dashboard/settings">
+                    <Link href="/dashboard/settings?tab=organization">
                       <Settings data-icon="inline-start" />
                       Organization settings
                     </Link>
                   </DropdownMenuItem>
                   <DropdownMenuItem asChild>
-                    <Link href="/dashboard/settings?create=org">
+                    <Link href="/dashboard/settings?tab=organization&create=org">
                       <Plus data-icon="inline-start" />
                       Create organization
                     </Link>
@@ -261,7 +261,7 @@ function UserMenu({
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
               <DropdownMenuItem asChild>
-                <Link href="/dashboard/billing">
+                <Link href="/dashboard/settings?tab=billing">
                   <CreditCard data-icon="inline-start" />
                   Billing
                 </Link>

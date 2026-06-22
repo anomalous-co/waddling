@@ -1,0 +1,18 @@
+{
+  "name": "@waddling/pipelines",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workflows ETL fleet: pulls events from sources (PostHog) into Pipelines streams, then loads a governed star schema into a DuckLake lake through Waddling's gateway.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4",
+    "typescript": "^5",
+    "wrangler": "^4.101.0"
+  }
+}

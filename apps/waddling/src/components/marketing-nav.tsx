@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { ThemeToggle } from '@/components/theme-toggle';
 import { BrandMark } from '@/components/brand-mark';
 import { appUrl } from '@/lib/site';
+import { useFunnel } from '@/lib/funnel';
 
 const LINKS = [
   { href: '/docs', label: 'docs' },
@@ -16,6 +17,7 @@ const LINKS = [
 
 export function MarketingNav() {
   const [open, setOpen] = useState(false);
+  const { signupCtaClicked } = useFunnel();
 
   return (
     <nav className="border-b border-zinc-800 bg-zinc-950/80 backdrop-blur-sm">
@@ -39,6 +41,7 @@ export function MarketingNav() {
           <ThemeToggle className="text-zinc-400 hover:text-zinc-50 hover:bg-zinc-800" />
           <Link
             href={appUrl('/dashboard')}
+            onClick={() => signupCtaClicked({ cta_location: 'nav', cta_text: 'sign in' })}
             className="bg-zinc-100 text-zinc-900 px-3 py-1.5 rounded font-mono text-sm hover:bg-zinc-50 transition-colors"
           >
             sign in
@@ -75,7 +78,10 @@ export function MarketingNav() {
           ))}
           <Link
             href={appUrl('/dashboard')}
-            onClick={() => setOpen(false)}
+            onClick={() => {
+              signupCtaClicked({ cta_location: 'nav_mobile', cta_text: 'sign in' });
+              setOpen(false);
+            }}
             className="bg-zinc-100 text-zinc-900 px-3 py-1.5 rounded font-mono text-sm hover:bg-zinc-50 transition-colors text-center"
           >
             sign in

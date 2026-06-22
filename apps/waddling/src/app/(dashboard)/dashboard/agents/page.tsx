@@ -23,6 +23,7 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
 import {
@@ -51,6 +52,7 @@ import {
 } from '@/components/ui/field';
 import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp, cpPost } from '@/components/dashboard/fetch';
+import { ScopePicker, type GrantRow } from '@/components/dashboard/scope-picker';
 import { toast } from 'sonner';
 import type { AgentSummary } from '@/lib/types';
 
@@ -104,14 +106,16 @@ interface CreateAgentDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (agent: AgentSummary, key: string) => void;
+  datalakes: { id: string; name: string }[];
 }
 
-function CreateAgentDialog({ open, onOpenChange, onCreated }: CreateAgentDialogProps) {
+function CreateAgentDialog({ open, onOpenChange, onCreated, datalakes }: CreateAgentDialogProps) {
   const [form, setForm] = useState<CreateAgentForm>({
     name: '',
     description: '',
     defaultRole: 'reader',
   });
+  const [grants, setGrants] = useState<GrantRow[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [fieldError, setFieldError] = useState<string | null>(null);
 
@@ -119,6 +123,7 @@ function CreateAgentDialog({ open, onOpenChange, onCreated }: CreateAgentDialogP
   useEffect(() => {
     if (open) {
       setForm({ name: '', description: '', defaultRole: 'reader' });
+      setGrants([]);
       setFieldError(null);
     }
   }, [open]);
@@ -130,9 +135,10 @@ function CreateAgentDialog({ open, onOpenChange, onCreated }: CreateAgentDialogP
     }
     setSubmitting(true);
     setFieldError(null);
+    // Create the agent AND its initial scope in one action (composite POST).
     const res = await cpPost<{ agent: AgentSummary; key?: string; agentId?: string; apiKey?: string }>(
       '/api/cp/agents',
-      form,
+      { ...form, grants },
     );
     setSubmitting(false);
     if (!res.ok) {
@@ -143,14 +149,16 @@ function CreateAgentDialog({ open, onOpenChange, onCreated }: CreateAgentDialogP
     onCreated(res.data.agent, key);
     // Keep dialog open only if we have a key to reveal (parent handles transition).
     onOpenChange(false);
-    toast.success(`Agent "${res.data.agent.name}" created`);
+    const scopeMsg = grants.length ? ` with ${grants.length} grant${grants.length > 1 ? 's' : ''}` : '';
+    toast.success(`Agent "${res.data.agent.name}" created${scopeMsg}`);
   };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>New agent</DialogTitle>
+          <DialogDescription>Create the agent and grant its initial access in one step.</DialogDescription>
         </DialogHeader>
 
         <FieldGroup className="py-1">
@@ -191,6 +199,17 @@ function CreateAgentDialog({ open, onOpenChange, onCreated }: CreateAgentDialogP
                 <SelectItem value="admin">admin</SelectItem>
               </SelectContent>
             </Select>
+          </Field>
+
+          <Field>
+            <FieldLabel>Initial access (optional)</FieldLabel>
+            {datalakes.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No data lakes yet — create one first, then you can scope this agent.
+              </p>
+            ) : (
+              <ScopePicker datalakes={datalakes} grants={grants} onChange={setGrants} />
+            )}
           </Field>
 
           {fieldError ? (
@@ -282,19 +301,24 @@ function RevealKeyDialog({ open, onOpenChange, agentName, apiKey }: RevealKeyDia
 
 export default function AgentsPage() {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [datalakes, setDatalakes] = useState<{ id: string; name: string }[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [revealKey, setRevealKey] = useState<{ name: string; key: string } | null>(null);
 
   const load = useCallback(async () => {
-    const res = await fetchCp<{ agents: AgentSummary[] }>('/api/cp/agents');
-    if (!res.ok) {
-      setError(res.error);
+    const [agentsRes, lakesRes] = await Promise.all([
+      fetchCp<{ agents: AgentSummary[] }>('/api/cp/agents'),
+      fetchCp<{ datalakes: { id: string; name: string }[] }>('/api/cp/datalakes'),
+    ]);
+    if (!agentsRes.ok) {
+      setError(agentsRes.error);
     } else {
-      setAgents(res.data.agents);
+      setAgents(agentsRes.data.agents);
       setError(null);
     }
+    if (lakesRes.ok) setDatalakes(lakesRes.data.datalakes.map((d) => ({ id: d.id, name: d.name })));
     setLoading(false);
   }, []);
 
@@ -413,6 +437,7 @@ export default function AgentsPage() {
       </div>
 
       <CreateAgentDialog
+        datalakes={datalakes}
         open={createOpen}
         onOpenChange={setCreateOpen}
         onCreated={handleCreated}

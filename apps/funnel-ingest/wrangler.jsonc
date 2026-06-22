@@ -1,0 +1,52 @@
+{
+  // Funnel ingestion Worker: PostHog (HogQL query API) → Pipelines Stream → SQL
+  // pipeline → R2 Data Catalog (Iceberg) → waddling lake reads it natively.
+  //
+  // Provisioning is NOT all expressible in wrangler config — the Stream/Sink/Pipeline
+  // are created with `wrangler pipelines …` (see README.md) and produce the STREAM_ID
+  // referenced below. Fill the placeholders, run the README runbook, then deploy.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "waddling-funnel-ingest",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "head_sampling_rate": 1, "persist": true, "invocation_logs": true }
+  },
+
+  // Keep it private — no public *.workers.dev. The only invokers are the cron and
+  // (optionally) an internal/Access-gated GET /run.
+  "workers_dev": false,
+
+  // Hourly pull. Tighten to "*/15 * * * *" for fresher data, or loosen for cost.
+  "triggers": { "crons": ["0 * * * *"] },
+
+  // Pipelines Stream binding. Replace <STREAM_ID> with the id from
+  // `wrangler pipelines streams list` after creating the stream (README step 1).
+  // NB: the field is `stream` (the older `pipeline` key is deprecated).
+  "pipelines": [{ "binding": "FUNNEL_STREAM", "stream": "<STREAM_ID>" }],
+
+  // Watermark store (single key). Replace <KV_ID> with the id from
+  // `wrangler kv namespace create funnel-ingest-watermark`.
+  "kv_namespaces": [{ "binding": "WATERMARK", "id": "<KV_ID>" }],
+
+  // Non-secret config. SECRETS (set via `wrangler secret put …`, NOT here):
+  //   POSTHOG_PERSONAL_API_KEY — PostHog query:read key (the pull step)
+  //   WADDLING_AGENT_KEY       — sk_agent_… for the analytics agent (the lake load step)
+  "vars": {
+    "POSTHOG_APP_HOST": "https://us.posthog.com",
+    "POSTHOG_PROJECT_ID": "<PROJECT_ID>",
+    "FUNNEL_EVENTS": "$pageview,signup_cta_clicked,signup_started,signup_completed,org_created",
+
+    // DuckLake load (dogfood) — the funnel lands in an EXISTING org's lake via the
+    // governed waddling_etl path. Unset any of these ⇒ the load step is skipped.
+    "CONTROL_API_BASE": "https://api.getwaddling.com",
+    "DATALAKE_ID": "<ORG_ENDPOINT_DATALAKE_ID>",
+    // s3:// glob the gateway reads — point the Pipeline's Parquet sink at a prefix
+    // INSIDE this endpoint's lake bucket so the gateway's lake S3 secret covers it.
+    "LAKE_FUNNEL_GLOB": "s3://waddling-lake/org-<ID>/_ingest/funnel/**/*.parquet",
+    "LAKE_FUNNEL_TABLE": "funnel_events"
+  }
+}

@@ -42,6 +42,18 @@ export function PostHogSetup({ children }: PostHogSetupProps) {
         api_host: '/ingest',
         capture_pageview: 'history_change',
         persistence: 'localStorage+cookie',
+        // The render plane serves marketing (getwaddling.com) and the product
+        // (app.getwaddling.com) as ONE app on TWO subdomains. The funnel only
+        // connects if the anonymous distinct_id survives the getwaddling.com →
+        // app.getwaddling.com hop: localStorage does NOT cross subdomains, so the
+        // identity rides the cookie, which must be scoped to the registrable parent
+        // (.getwaddling.com), not host-only. Explicit so the bridge can't silently
+        // break (which would sever every landing → signup funnel into two persons).
+        cross_subdomain_cookie: true,
+        // Only create Person profiles once a user is identified (post sign-up).
+        // Anonymous landing/blog events are still captured and get linked to the
+        // person on identify() — the funnel works, without billing anonymous browsers.
+        person_profiles: 'identified_only',
       }}
     >
       <PostHogPageView />

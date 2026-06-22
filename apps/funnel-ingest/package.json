@@ -1,0 +1,18 @@
+{
+  "name": "@waddling/funnel-ingest",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Cron Worker that pulls funnel events from PostHog into a Cloudflare Pipelines stream → R2 Data Catalog (Iceberg) → waddling lake.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4",
+    "typescript": "^5",
+    "wrangler": "^4.101.0"
+  }
+}

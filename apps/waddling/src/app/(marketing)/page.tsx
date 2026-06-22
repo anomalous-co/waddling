@@ -3,6 +3,7 @@ import type { Metadata } from 'next';
 import { appUrl } from '@/lib/site';
 import { LakeScene } from '@/components/lake-scene';
 import { SkyScene } from '@/components/sky-scene';
+import { TrackedLink } from '@/components/tracked-link';
 import { Offerings } from './offerings';
 import { PersonaRows } from './customers/customers-content';
 import { Button } from '@/components/ui/button';
@@ -239,10 +240,14 @@ LIMIT 500;
           </p>
           <div className="flex flex-wrap justify-center gap-4">
             <Button asChild size="lg" className={BRAND_BTN}>
-              <Link href={appUrl('/dashboard')}>start free</Link>
+              <TrackedLink href={appUrl('/dashboard')} location="landing_footer" text="start free">
+                start free
+              </TrackedLink>
             </Button>
             <Button asChild size="lg" variant="outline" className="font-mono">
-              <Link href="/pricing">see pricing</Link>
+              <TrackedLink href="/pricing" location="landing_footer" text="see pricing">
+                see pricing
+              </TrackedLink>
             </Button>
           </div>
         </div>

@@ -1,0 +1,58 @@
+{
+  // ETL fleet: Cloudflare Workflows orchestrate per-source pulls (PostHog HogQL)
+  // → Pipelines Stream → R2 sink (Parquet) → governed DuckLake star-schema load.
+  //
+  // Provisioning is NOT all expressible here — the Stream/Sink/Pipeline are created
+  // with `wrangler pipelines …` and the D1 db with `wrangler d1 create` (see
+  // README.md), producing the STREAM_ID + D1_ID referenced below. Fill the
+  // placeholders, run the README runbook, then deploy.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "waddling-pipelines",
+  "main": "src/dispatcher.ts",
+  "compatibility_date": "2026-06-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "head_sampling_rate": 1, "persist": true, "invocation_logs": true }
+  },
+
+  // Private — no public *.workers.dev. The only invokers are the cron and the
+  // Access-gated (or RUN_TOKEN-gated) GET /run.
+  "workers_dev": false,
+
+  // Hourly dispatch tick. The dispatcher decides which pipelines are due.
+  "triggers": { "crons": ["0 * * * *"] },
+
+  // Workflow that runs one pipeline end-to-end (extract → buffer → settle →
+  // governed-load → advance-cursor).
+  "workflows": [
+    { "binding": "WF", "name": "etl-workflow", "class_name": "EtlWorkflow" }
+  ],
+
+  // Pipelines Stream binding (funnel pipeline). Replace <STREAM_ID> with the id
+  // from `wrangler pipelines streams list` after creating the stream (README).
+  // NB: the field is `stream` (the older `pipeline` key is deprecated).
+  "pipelines": [
+    { "binding": "FUNNEL_STREAM", "stream": "<STREAM_ID>" }
+  ],
+
+  // D1 cursor store. Replace <D1_ID> with the id from `wrangler d1 create
+  // pipelines-cursors`, then apply migrations/0001_cursors.sql (README).
+  "d1_databases": [
+    { "binding": "DB", "database_name": "pipelines-cursors", "database_id": "<D1_ID>" }
+  ],
+
+  // Non-secret config. SECRETS (set via `wrangler secret put …`, NOT here):
+  //   POSTHOG_PERSONAL_API_KEY — PostHog query:read key (the pull step)
+  //   FUNNEL_AGENT_KEY         — sk_agent_… for the funnel analytics agent (the load step)
+  //   RUN_TOKEN (optional)     — bearer gate for GET /run when not behind Access
+  "vars": {
+    "POSTHOG_APP_HOST": "https://us.posthog.com",
+    "POSTHOG_PROJECT_ID": "<PROJECT_ID>",
+    "CONTROL_API_BASE": "https://api.getwaddling.com",
+    // The dogfood org's lake the star schema is loaded into. Keep in sync with
+    // the registry spec's datalakeId placeholder.
+    "DATALAKE_ID": "<DATALAKE_ID>"
+  }
+}

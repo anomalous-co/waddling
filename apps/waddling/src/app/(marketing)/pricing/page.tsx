@@ -2,6 +2,7 @@ import Link from 'next/link';
 import type { Metadata } from 'next';
 import { PLANS } from '@/lib/plans';
 import { appUrl } from '@/lib/site';
+import { TrackedLink } from '@/components/tracked-link';
 
 // PLANS shape (from @waddling/control-schema via @/lib/types):
 // Plan = { name:'free'|'pro'|'enterprise'; priceId:string; entitlements:{endpoints:number;agents:number;dynamicAcl:boolean;adminMcp:boolean;auditRetentionDays:number} }
@@ -145,8 +146,11 @@ export default function PricingPage() {
               ))}
             </ul>
 
-            <Link
+            <TrackedLink
               href={plan.ctaHref}
+              location="pricing"
+              text={plan.cta}
+              plan={plan.key}
               className={`block text-center font-mono font-semibold text-sm py-2.5 px-4 rounded transition-colors ${
                 plan.highlight
                   ? 'bg-emerald-500 hover:bg-emerald-400 text-[#0c0a09]'
@@ -154,7 +158,7 @@ export default function PricingPage() {
               }`}
             >
               {plan.cta}
-            </Link>
+            </TrackedLink>
           </div>
         ))}
       </div>

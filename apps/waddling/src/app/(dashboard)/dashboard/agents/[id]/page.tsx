@@ -39,6 +39,7 @@ import {
 } from '@/components/ui/empty';
 import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp, cpPost, cpDelete } from '@/components/dashboard/fetch';
+import { AgentAccess } from '@/components/dashboard/agent-access';
 import type { AgentSummary, SessionSummary } from '@/lib/types';
 
 interface ApiKeyRow {
@@ -219,6 +220,9 @@ export default function AgentDetailPage() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Access (in-place scope editor) */}
+        <AgentAccess agentId={agent.id} />
 
         {/* API keys card */}
         <Card>

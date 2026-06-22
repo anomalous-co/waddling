@@ -79,6 +79,13 @@ export function cpPost<T>(path: string, body: unknown): Promise<CpResult<T>> {
   });
 }
 
+export function cpPatch<T>(path: string, body: unknown): Promise<CpResult<T>> {
+  return fetchCp<T>(path, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  });
+}
+
 export function cpDelete<T>(path: string): Promise<CpResult<T>> {
   return fetchCp<T>(path, { method: 'DELETE' });
 }

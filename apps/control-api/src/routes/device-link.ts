@@ -25,6 +25,7 @@ import type { Env } from '../lib/env';
 import { buildAuth } from '../lib/auth';
 import { getEntitlements } from '../lib/entitlements';
 import { resolveCaller, parseBody, handle, ok, err, AuthError } from '../lib/cp-shared';
+import { makePostHog } from '../lib/posthog';
 import type { DeviceLinkInit, DeviceLinkClaimResult, DeviceLinkPoll } from '../lib/types';
 
 // ── Code / token generation (ported from device-link/_shared.ts) ─────────────────
@@ -83,25 +84,12 @@ function clientIp(c: { req: { header(name: string): string | undefined } }): str
   return c.req.header('x-real-ip') ?? 'unknown';
 }
 
-// ── PostHog (neutered) ────────────────────────────────────────────────────────────
-// posthog-node is Node-only and does not bundle/run on workerd. The funnel events
-// (device_link_created/claimed, alias/identify, agent_created) are deferred to a
-// later analytics stage; this no-op preserves the call sites so the routes port
-// verbatim and telemetry never breaks a request (mirrors lib/agent-identity).
-interface PhLike {
-  capture(args: {
-    distinctId: string;
-    event: string;
-    properties?: Record<string, unknown>;
-    groups?: Record<string, string>;
-  }): void;
-  alias(args: { distinctId: string; alias: string }): void;
-  identify(args: { distinctId: string; properties?: Record<string, unknown> }): void;
-}
-const NOOP_PH: PhLike = { capture() {}, alias() {}, identify() {} };
-function posthog(): PhLike {
-  return NOOP_PH;
-}
+// ── PostHog ─────────────────────────────────────────────────────────────────────
+// Real server-side funnel events over PostHog's HTTP ingestion (makePostHog) — the
+// device-code onboarding funnel: device_link_created/claimed, the device→user alias +
+// identify, and agent_created. Fire-and-forget via the request executionCtx; a no-op
+// when POSTHOG_KEY is unset. Email is a person property on identify only — never an
+// event property.
 
 /** device:<uuid> distinct id used pre-auth so we can alias to the user on claim. */
 function deviceDistinctId(deviceId: string): string {
@@ -160,7 +148,7 @@ deviceLink.post('/', (c) =>
     const appUrl = (c.env.APP_URL ?? c.env.BETTER_AUTH_URL).replace(/\/+$/, '');
     const verifyUrl = `${appUrl}/link?code=${encodeURIComponent(code)}`;
 
-    posthog().capture({
+    makePostHog(c.env, c.executionCtx).capture({
       distinctId: deviceDistinctId(deviceId),
       event: 'device_link_created',
       properties: { source: 'mcp-external' },
@@ -262,7 +250,7 @@ deviceLink.post('/claim', (c) =>
       [caller.callerId],
     ).catch(() => null);
 
-    const ph = posthog();
+    const ph = makePostHog(c.env, c.executionCtx);
     ph.alias({ distinctId: deviceDistinctId(link.device_id), alias: caller.callerId });
     ph.identify({
       distinctId: caller.callerId,
@@ -280,7 +268,7 @@ deviceLink.post('/claim', (c) =>
     ph.capture({
       distinctId: caller.callerId,
       event: 'agent_created',
-      properties: { via: 'device-link' },
+      properties: { default_role: 'reader', via: 'device-link' },
       groups: { organization: orgId },
     });
 

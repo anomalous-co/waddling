@@ -23,6 +23,11 @@ import { Pool } from 'pg';
 import Stripe from 'stripe';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Env } from './env';
+import { makePostHog } from './posthog';
+import { grantCredits, STARTER_GRANT_MICRO } from './credits';
+import { queryOne } from './db';
+import { fulfillCreditPackEvent } from './credit-packs';
+import { captureCheckoutCompletedEvent } from './funnel-stripe';
 
 /**
  * Shape the @better-auth/stripe plugin wants: `{ name, priceId }`. The free plan
@@ -91,17 +96,21 @@ function construct(env: Env, pool: Pool) {
     database: pool,
     emailAndPassword: { enabled: true },
 
-    // PostHog funnel hooks. The original called posthog-node (`getPostHogServer()`),
-    // which is a Node-only library that does not bundle/run on workerd. Real
-    // analytics is a later stage; here the hooks are guarded no-ops so signup/
-    // org-create still succeed and the constructed shape matches prod. A thrown
-    // hook would fail the operation, hence the try/catch around the (empty) body.
+    // PostHog funnel hooks. posthog-node is Node-only and does not bundle/run on
+    // workerd, so capture goes over PostHog's HTTP ingestion endpoint instead (see
+    // lib/posthog.ts). This is the AUTHORITATIVE, non-spoofable `signup_completed`;
+    // the browser SDK only calls identify() to stitch the anonymous → identified
+    // person. A thrown hook would fail the operation, hence the try/catch.
     databaseHooks: {
       user: {
         create: {
-          after: async (_user: { id: string; email?: string }) => {
+          after: async (user: { id: string; email?: string; name?: string }) => {
             try {
-              // no-op: analytics deferred; never import posthog-node on workerd.
+              makePostHog(env, authExecutionCtx()).capture({
+                distinctId: user.id,
+                event: 'signup_completed',
+                properties: { $set: { email: user.email, name: user.name } },
+              });
             } catch {
               // swallow — telemetry must never break sign-up.
             }
@@ -127,14 +136,41 @@ function construct(env: Env, pool: Pool) {
         allowUserToCreateOrganization: true,
         creatorRole: 'owner',
         organizationHooks: {
-          afterCreateOrganization: async (_args: {
+          afterCreateOrganization: async (args: {
             organization: { id: string; name?: string };
             user: { id: string };
           }) => {
             try {
-              // no-op: analytics deferred (see user.create hook above).
+              makePostHog(env, authExecutionCtx()).capture({
+                distinctId: args.user.id,
+                event: 'org_created',
+                properties: { org_id: args.organization.id, org_name: args.organization.name },
+                groups: { organization: args.organization.id },
+              });
             } catch {
               // swallow — telemetry must never break org creation.
+            }
+            // Free-tier starter credit grant — the single onboarding path for the prepaid
+            // ledger (NEW orgs; existing orgs are backfilled by a one-off script). Idempotent
+            // on `starter:<orgId>` so a retried create can't double-grant. Runs in this auth
+            // request's DB scope. Swallow errors: a grant failure must not fail sign-up —
+            // it can be reconciled by re-running the (idempotent) grant.
+            try {
+              await grantCredits(
+                args.organization.id,
+                STARTER_GRANT_MICRO,
+                'starter_grant',
+                `starter:${args.organization.id}`,
+                { createdBy: args.user.id },
+              );
+            } catch (e) {
+              // Swallow so a grant failure never fails sign-up — but LOG loudly: a missing
+              // grant means no balance row, and hasCredit() fails open, so the org would get
+              // unlimited free service invisibly. This makes that leak observable + reconcilable
+              // (re-run the idempotent backfill script).
+              console.log(
+                `[credits] STARTER GRANT FAILED for org ${args.organization.id} — reconcile via backfill: ${e instanceof Error ? e.message : String(e)}`,
+              );
             }
           },
         },
@@ -177,6 +213,16 @@ function construct(env: Env, pool: Pool) {
       stripe({
         stripeClient: stripeClientInstance,
         stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET,
+        // Credit-pack fulfillment: onEvent fires AFTER signature verification + the
+        // plugin's own handling, is awaited, and a throw returns non-2xx → Stripe retries
+        // (so the ledger's idempotency is a live safety net). Runs in the request's DB
+        // scope, so grantCredits works. See lib/credit-packs.fulfillCreditPackEvent.
+        onEvent: async (event) => {
+          await fulfillCreditPackEvent(event);
+          // Conversion funnel: emit checkout_completed for a settled subscription
+          // Checkout (no-op for credit-pack/payment events). Best-effort, never throws.
+          await captureCheckoutCompletedEvent(env, event, authExecutionCtx());
+        },
         // Stripe's customer/subscription side-effects make external Stripe API calls
         // during auth + org-create flows. With PLACEHOLDER keys those calls don't
         // return cleanly and hang the request (the org-create timeout we hit). Better
@@ -190,7 +236,22 @@ function construct(env: Env, pool: Pool) {
         createCustomerOnSignUp: stripeConfigured,
         subscription: {
           enabled: stripeConfigured,
-          // Subscriptions bound to organization — referenceId = org id.
+          // Subscriptions bound to organization — referenceId = org id. The plugin only
+          // honors a non-self referenceId when this authorizes it: the acting user must be
+          // an owner/admin of that org. Reads the member row in the request's DB scope
+          // (same path the org-create / credit hooks use). Without this, an org-scoped
+          // upgrade is rejected and billing can't bind to the org.
+          authorizeReference: async ({ user, referenceId }: { user: { id: string }; referenceId: string }) => {
+            try {
+              const row = await queryOne<{ role: string }>(
+                `SELECT role FROM "member" WHERE "userId" = $1 AND "organizationId" = $2`,
+                [user.id, referenceId],
+              );
+              return !!row && (row.role === 'owner' || row.role === 'admin');
+            } catch {
+              return false;
+            }
+          },
           plans: stripeConfigured ? stripePlans(env) : [],
         },
       }),
@@ -214,8 +275,17 @@ export type Auth = ReturnType<typeof construct>;
 interface AuthSlot {
   auth?: Auth;
   pool?: Pool;
+  // Request executionCtx, stashed so database/organization hooks can fire
+  // fire-and-forget PostHog captures via waitUntil (the hooks only close over
+  // `env`, not the Hono context).
+  exCtx?: { waitUntil(p: Promise<unknown>): void };
 }
 const authScope = new AsyncLocalStorage<AuthSlot>();
+
+/** The current request's executionCtx, for telemetry waitUntil inside auth hooks. */
+function authExecutionCtx(): { waitUntil(p: Promise<unknown>): void } | undefined {
+  return authScope.getStore()?.exCtx;
+}
 
 export function buildAuth(env: Env): Auth {
   const slot = authScope.getStore();
@@ -242,7 +312,7 @@ export async function runInAuthScope(
   executionCtx: { waitUntil(p: Promise<unknown>): void } | undefined,
   next: () => Promise<void>,
 ): Promise<void> {
-  const slot: AuthSlot = {};
+  const slot: AuthSlot = { exCtx: executionCtx };
   await authScope.run(slot, next);
   if (slot.pool) {
     const pool = slot.pool;

@@ -1,0 +1,26 @@
+{
+  "fields": [
+    { "name": "uuid", "type": "string", "required": true },
+    { "name": "event", "type": "string", "required": true },
+    { "name": "distinct_id", "type": "string", "required": false },
+    { "name": "person_id", "type": "string", "required": false },
+    { "name": "timestamp", "type": "timestamp", "required": true },
+    { "name": "current_url", "type": "string", "required": false },
+    { "name": "pathname", "type": "string", "required": false },
+    { "name": "utm_source", "type": "string", "required": false },
+    { "name": "utm_medium", "type": "string", "required": false },
+    { "name": "utm_campaign", "type": "string", "required": false },
+    { "name": "referrer", "type": "string", "required": false },
+    { "name": "cta_location", "type": "string", "required": false },
+    { "name": "cta_text", "type": "string", "required": false },
+    { "name": "plan", "type": "string", "required": false },
+    { "name": "decision", "type": "string", "required": false },
+    { "name": "duration_ms", "type": "int64", "required": false },
+    { "name": "reason", "type": "string", "required": false },
+    { "name": "from_plan", "type": "string", "required": false },
+    { "name": "to_plan", "type": "string", "required": false },
+    { "name": "mrr_cents", "type": "int64", "required": false },
+    { "name": "email", "type": "string", "required": false },
+    { "name": "name", "type": "string", "required": false }
+  ]
+}

@@ -18,13 +18,40 @@ import { getEntitlements } from '../lib/entitlements';
 import { gatewayClientFor } from '../lib/gateway-client';
 import type { Env } from '../lib/env';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err, AuthError } from '../lib/cp-shared';
+import { makePostHog } from '../lib/posthog';
 import { buildAuth } from '../lib/auth';
+import { recompileAndPush } from '../lib/gateway-push';
 import type { AgentSummary } from '../lib/types';
+
+const CAPABILITY_VALUES = [
+  'read', 'write', 'create', 'drop', 'alter',
+  'read_source', 'copy_to', 'copy_from',
+  'attach', 'detach', 'install', 'load', 'etl',
+] as const;
+
+// One initial grant authored in the create-and-scope wizard. Each maps 1:1 to an
+// agent-subject acl_rule on a datalake. A concrete table → {schema,table}; an "entire
+// schema" → {schema, table:'*'}; "entire lake" → {schema:'*', table:'*'} (the compiler
+// expands read/write wildcards against the cached catalog).
+const GrantInputSchema = z.object({
+  datalakeId: z.string().min(1),
+  capability: z.enum(CAPABILITY_VALUES).default('read'),
+  schema: z.string().default('*'),
+  table: z.string().default('*'),
+  columns: z.array(z.string()).optional(),
+  rowLimit: z.number().int().positive().optional(),
+  ttlSeconds: z.number().int().positive().optional(),
+  effect: z.enum(['allow', 'deny']).default('allow'),
+});
 
 const CreateSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
   defaultRole: z.string().default('reader'),
+  // Optional: create the agent AND its initial scope in one action. Omitted ⇒
+  // today's behavior (agent with no grants). Inserted as agent-subject acl_rule rows,
+  // then a single recompile+push per datalake.
+  grants: z.array(GrantInputSchema).optional(),
 });
 
 const PatchSchema = z.object({
@@ -114,6 +141,21 @@ agents.post('/', (c) =>
     }
     const input = await parseBody(c, CreateSchema);
 
+    // Validate any initial grants' target datalakes UP-FRONT (before minting a key), so a
+    // bad grant can't orphan an agent+key. All must belong to the caller's org.
+    if (input.grants?.length) {
+      const ids = [...new Set(input.grants.map((g) => g.datalakeId))];
+      const rows = await query<{ id: string }>(
+        `SELECT id FROM waddling.datalake WHERE id = ANY($1) AND org_id = $2`,
+        [ids, caller.orgId],
+      );
+      const valid = new Set(rows.rows.map((r) => r.id));
+      const missing = ids.filter((id) => !valid.has(id));
+      if (missing.length) {
+        return err(c, 'datalake_not_found', 404, `datalake(s) not in this org: ${missing.join(', ')}`);
+      }
+    }
+
     // Plan quotas only apply when billing is configured (can't enforce a paid limit with
     // no way to pay — mirrors the ACL plan gate + auth.ts stripeConfigured check).
     const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
@@ -148,12 +190,38 @@ agents.post('/', (c) =>
         [caller.orgId, input.name, input.description ?? null, created.id, input.defaultRole],
       );
       if (agentRow?.id) {
-        // deferred (Stage C/D): server-side analytics for 'agent_created'
-        // (via:dashboard). The original called getPostHogServer().capture, a Node-only
-        // posthog-node path that does not bundle/run on workerd (see auth.ts /
-        // agent-identity.ts neutered hooks). captureAgentEvent is agent-principal-only
-        // and does not fit this user-funnel event.
+        // Provisioning funnel: a new agent was created from the dashboard. Server-side,
+        // fire-and-forget via waitUntil; no-op when POSTHOG_KEY is unset.
+        makePostHog(c.env, c.executionCtx).capture({
+          distinctId: caller.callerId,
+          event: 'agent_created',
+          properties: { default_role: agentRow.default_role, via: 'dashboard' },
+          groups: { organization: caller.orgId },
+        });
       }
+      // Create-and-scope: insert the agent's initial grants (agent-subject acl_rule
+      // rows) + a single recompile/push per datalake. Datalakes were validated up-front,
+      // so this can't orphan; it runs after the agent row exists so agent_id is set.
+      const grantedScope: { datalakeId: string; capability: string; schema: string; table: string }[] = [];
+      if (agentRow?.id && input.grants?.length) {
+        const datalakeIds = new Set<string>();
+        for (const g of input.grants) {
+          const verb = g.capability === 'write' ? 'write' : 'read';
+          const expiresAt = g.ttlSeconds ? new Date(Date.now() + g.ttlSeconds * 1000).toISOString() : null;
+          await query(
+            `INSERT INTO waddling.acl_rule
+               (org_id, datalake_id, agent_id, subject_kind, capability,
+                schema_name, table_name, columns, verb, effect, row_limit, ttl_seconds, expires_at, created_by)
+             VALUES ($1,$2,$3,'agent',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+            [caller.orgId, g.datalakeId, agentRow.id, g.capability, g.schema, g.table,
+             g.columns ?? null, verb, g.effect, g.rowLimit ?? null, g.ttlSeconds ?? null, expiresAt, caller.callerId],
+          );
+          datalakeIds.add(g.datalakeId);
+          grantedScope.push({ datalakeId: g.datalakeId, capability: g.capability, schema: g.schema, table: g.table });
+        }
+        for (const dlId of datalakeIds) await recompileAndPush(c, dlId);
+      }
+
       // agent + key: additive fields for the dashboard (backward-compatible with
       // existing consumers that read agentId/apiKey/apiKeyId).
       const agent: AgentSummary | undefined = agentRow
@@ -178,6 +246,7 @@ agents.post('/', (c) =>
           // additive fields (dashboard + future consumers):
           agent,
           key: created.key, // alias for apiKey — shown once
+          grants: grantedScope, // initial scope created in the same action (may be empty)
         },
         201,
       );

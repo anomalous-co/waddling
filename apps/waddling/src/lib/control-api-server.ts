@@ -86,6 +86,35 @@ export async function getServerSession(): Promise<ServerSession | null> {
   }
 }
 
+/** Payment-onboarding gate status (see control-api GET /api/cp/billing/status). */
+export interface PaidStatus {
+  hasOrg: boolean;
+  paid: boolean;
+}
+
+/**
+ * Resolve whether the caller's active org has PAID (active subscription OR a purchased
+ * credit pack) — the "must pay to enter" dashboard gate. Forwards the inbound cookie via
+ * the same service-binding-first transport as getServerSession.
+ *
+ * FAIL-CLOSED: any error (no cookie, control-api blip, non-2xx) returns
+ * `{hasOrg:false, paid:false}`, which bounces the user to /onboarding. The onboarding
+ * page re-checks and sends a genuinely-paid user back to /dashboard once control-api is
+ * healthy, so a transient failure is self-correcting rather than a lockout.
+ */
+export async function getPaidStatus(): Promise<PaidStatus> {
+  const cookie = await inboundCookie();
+  if (!cookie) return { hasOrg: false, paid: false };
+  try {
+    const res = await cpFetch('/api/cp/billing/status', cookie);
+    if (!res.ok) return { hasOrg: false, paid: false };
+    const body = (await res.json()) as Partial<PaidStatus> | null;
+    return { hasOrg: !!body?.hasOrg, paid: !!body?.paid };
+  } catch {
+    return { hasOrg: false, paid: false };
+  }
+}
+
 /**
  * List the signed-in user's organizations via the Better Auth organization
  * plugin endpoint (forwarding the inbound cookie). Empty array on any failure —

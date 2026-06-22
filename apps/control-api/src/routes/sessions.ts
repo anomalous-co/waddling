@@ -58,6 +58,7 @@ import {
 } from '../lib/gateway-client';
 import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
 import { hasCredit, debitQueryFloor } from '../lib/credits';
+import { makePostHog } from '../lib/posthog';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import { loadSigningKey, mintLakeToken, SESSION_TTL_SECONDS as SESSION_TTL_SECONDS_IMPORT } from '../lib/session-jwt';
 import { refreshCatalogAndRecompile } from '../lib/gateway-push';
@@ -156,6 +157,16 @@ async function recordQueryAudit(
      VALUES ${tuples.join(', ')}`,
     params,
   );
+}
+
+/** Bucket a birdshot denial message into a metadata-only reason class for telemetry —
+ *  never the raw message, so no table/column names leave the control plane in events. */
+function classifyDenial(msg: string): 'column' | 'table' | 'revoked' | 'expired' {
+  const m = msg.toLowerCase();
+  if (m.includes('column')) return 'column';
+  if (m.includes('revok')) return 'revoked';
+  if (m.includes('expir')) return 'expired';
+  return 'table';
 }
 
 // One-key-per-agent runtime policy (agent-auth.md §cardinality). Claude gives the
@@ -639,6 +650,21 @@ sessions.post('/', (c) =>
       extra: { granted_tables: granted.tables.length, origin },
     });
 
+    // Activation funnel: the human reached "agent connected to a governed lake". Gated on
+    // a human (onBehalfOf): delegated/run-as resolve a user id; autonomous service agents
+    // with no owner (e.g. the analytics ETL fleet) have none and are skipped — so the
+    // pipeline never counts itself. Metadata-only props (no SQL/rows). Fire-and-forget.
+    if (onBehalfOf) {
+      let phCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
+      try { phCtx = c.executionCtx; } catch { phCtx = undefined; }
+      makePostHog(c.env, phCtx).capture({
+        distinctId: onBehalfOf,
+        event: 'mcp_connect',
+        properties: { endpoint_id: datalakeId, ttl_seconds: SESSION_TTL_SECONDS },
+        groups: { organization: endpoint.org_id },
+      });
+    }
+
     // Return a workspace HANDLE — no attachSql/JWT/key. The agent does not ATTACH the
     // lake itself; its workspace DO does, and the agent queries via
     // POST /api/cp/sessions/:id/query (→ data plane /query).
@@ -893,11 +919,13 @@ sessions.post('/:id/query', (c) =>
     // Re-resolve the workspace deterministically (idempotent upsert) — the data plane
     // is keyed by (workspaceId, agentId), not the sessionId.
     const ws = await resolveWorkspaceForSession(sess.org_id, sess.datalake_id, sess.agent_id);
+    const queryStartedAt = Date.now();
     const r = await dpFetch(c.env, '/query', {
       workspaceId: ws.workspaceId,
       agentId: sess.agent_id,
       sql,
     });
+    const queryDurationMs = Date.now() - queryStartedAt;
 
     // Cold/hibernated workspace → caller must reconnect (re-push snapshot + reconfigure).
     // The query never reached the gateway, so there is nothing to record.
@@ -923,6 +951,54 @@ sessions.post('/:id/query', (c) =>
     });
     if (exCtx) exCtx.waitUntil(recording);
 
+    // Activation funnel (data plane). Gated on a human behind the session: the delegated
+    // caller is the user; otherwise the agent's owner. Owner-less service agents (e.g. the
+    // analytics ETL fleet) resolve to null and are skipped — so the pipeline never counts
+    // itself. Props are metadata-only (decision / duration_ms / bucketed reason) — never
+    // SQL text or rows. Always runs in waitUntil; never affects the query path.
+    const fireActivation = async (decision: 'allow' | 'deny', denyReason?: string): Promise<void> => {
+      try {
+        const human = caller.delegated
+          ? caller.callerId
+          : (await resolveAgentIdentity(sess.agent_id))?.onBehalfOf ?? null;
+        if (!human) return;
+        const ph = makePostHog(c.env, exCtx);
+        ph.capture({
+          distinctId: human,
+          event: 'query_executed',
+          properties: { decision, duration_ms: queryDurationMs },
+          groups: { organization: sess.org_id },
+        });
+        if (decision === 'deny') {
+          ph.capture({
+            distinctId: human,
+            event: 'denial_hit',
+            properties: { reason: denyReason ?? 'table' },
+            groups: { organization: sess.org_id },
+          });
+        }
+        // first_query — once per person. Await the audit insert above so THIS query's
+        // usage_event row is counted, making "exactly 1" a deterministic first-query test
+        // (no race with the concurrent insert). $set_once also keeps the person property
+        // idempotent as a backstop.
+        await recording.catch(() => {});
+        const cnt = await queryOne<{ n: string }>(
+          `SELECT count(*)::text AS n FROM waddling.usage_event WHERE agent_id = $1 AND kind = 'query'`,
+          [sess.agent_id],
+        ).catch(() => null);
+        if (cnt && Number(cnt.n) === 1) {
+          ph.capture({
+            distinctId: human,
+            event: 'first_query',
+            properties: { $set_once: { first_query_at: new Date().toISOString() } },
+            groups: { organization: sess.org_id },
+          });
+        }
+      } catch {
+        // activation telemetry must never affect the query path.
+      }
+    };
+
     // Per-query floor debit — minor + best-effort (the dominant session-duration charge is
     // billed durably by the sweeper). Unique key per call: this is a top-up, not a dedupe.
     const flooring = debitQueryFloor(sess.org_id, sess.id, crypto.randomUUID()).catch((e) => {
@@ -936,6 +1012,7 @@ sessions.post('/:id/query', (c) =>
     if (r.status === 500) {
       const msg = String(r.json?.error ?? '');
       if (/authoriz|permission|denied|not allowed/i.test(msg)) {
+        if (exCtx) exCtx.waitUntil(fireActivation('deny', classifyDenial(msg)));
         return c.json({ error: 'authorization_denied', reason: msg }, 403);
       }
       return err(c, 'query_failed', 500, msg || 'workspace query failed');
@@ -955,6 +1032,7 @@ sessions.post('/:id/query', (c) =>
       rowCount: r.json?.rowCount ?? (r.json?.rows?.length ?? 0),
       truncated: false,
     };
+    if (exCtx) exCtx.waitUntil(fireActivation('allow'));
     return ok(c, result);
   }),
 );

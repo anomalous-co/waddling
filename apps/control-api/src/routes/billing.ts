@@ -22,10 +22,12 @@ import { z } from 'zod';
 import Stripe from 'stripe';
 import { Hono } from 'hono';
 import { queryOne } from '../lib/db';
-import { getActivePlan } from '../lib/entitlements';
+import { getActivePlan, getActivePlanName } from '../lib/entitlements';
 import { getBalanceMicro, MICRO_PER_USD } from '../lib/credits';
+import { isOrgComped } from '../lib/comp';
 import { getPack, packPriceId, availablePacks } from '../lib/credit-packs';
 import type { Env } from '../lib/env';
+import { makePostHog } from '../lib/posthog';
 import { resolveCaller, parseBody, handle, ok, err } from '../lib/cp-shared';
 
 interface SubRow {
@@ -61,11 +63,15 @@ billing.get('/', (c) =>
     const plan = await getActivePlan(caller.orgId);
 
     if (plan.name === 'free') {
-      // deferred (Stage C/D): server-side analytics for 'upgrade_viewed'
-      // (current_plan:free, surface:billing_page). The original called
-      // getPostHogServer().capture, a Node-only posthog-node path that does not
-      // bundle/run on workerd (see auth.ts neutered hooks). captureAgentEvent is
-      // agent-principal-only and does not fit this user-funnel event.
+      // Conversion-funnel signal: a free org loaded the billing/upgrade surface.
+      // Authoritative + non-spoofable (server-side), fire-and-forget via waitUntil
+      // so it never blocks the read; no-op when POSTHOG_KEY is unset.
+      makePostHog(c.env, c.executionCtx).capture({
+        distinctId: caller.callerId,
+        event: 'upgrade_viewed',
+        properties: { from_plan: plan.name, surface: 'billing_page' },
+        groups: { organization: caller.orgId },
+      });
     }
 
     const sub = await queryOne<SubRow>(
@@ -90,10 +96,12 @@ billing.get('/', (c) =>
 
     // Prepaid credit balance + the purchasable packs, for the top-up surface.
     const balanceMicro = await getBalanceMicro(caller.orgId);
+    const comped = await isOrgComped(caller.orgId);
     return ok(c, {
       plan: planInfo,
       entitlements: plan.entitlements,
       invoices: [] as Invoice[],
+      comped,
       credit: { balanceMicro, balanceUsd: balanceMicro / MICRO_PER_USD },
       creditPacks: availablePacks(c.env),
       subscription: sub
@@ -117,7 +125,47 @@ billing.get('/', (c) =>
   }),
 );
 
-const CreditPackSchema = z.object({ packId: z.string().min(1) });
+/**
+ * GET /status — the payment-onboarding gate's source of truth.
+ *
+ * "Has paid" (→ may enter the dashboard) = an active/trialing subscription OR at least
+ * one purchased credit pack. It is ledger EXISTENCE (`reason='credit_pack'`), not
+ * balance > 0 — an org that bought a pack and spent it to zero has still paid. The $5
+ * starter grant uses a different reason and is excluded.
+ *
+ * Unlike every other cp route this passes `requireOrg=false`: a freshly-signed-up user
+ * with no org must get `{hasOrg:false}` (so the gate routes them to org-creation) rather
+ * than a 403 it can't interpret. No PostHog side-effect here (cf. GET /), so it is safe
+ * to call from SSR on every dashboard render.
+ */
+billing.get('/status', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c, false);
+    if (!caller.orgId) return ok(c, { hasOrg: false, paid: false, comped: false });
+    // Complimentary orgs (company domains) are free forever — paid regardless of plan.
+    const comped = await isOrgComped(caller.orgId);
+    const planName = await getActivePlanName(caller.orgId);
+    const subscribed = planName === 'pro' || planName === 'enterprise';
+    const boughtPack = await queryOne<{ one: number }>(
+      `SELECT 1 AS one FROM waddling.credit_ledger
+        WHERE org_id = $1 AND reason = 'credit_pack' LIMIT 1`,
+      [caller.orgId],
+    ).catch(() => null);
+    const paid = comped || subscribed || !!boughtPack;
+    return ok(c, { hasOrg: true, paid, comped });
+  }),
+);
+
+const CreditPackSchema = z.object({
+  packId: z.string().min(1),
+  // App-relative return path for the Checkout success/cancel redirect (e.g.
+  // '/onboarding?step=confirming'). Must start with a single '/' (open-redirect guard);
+  // defaults to the billing settings tab.
+  returnPath: z
+    .string()
+    .regex(/^\/(?!\/)/, 'returnPath must be an app-relative path starting with "/"')
+    .optional(),
+});
 
 /**
  * POST /credit-pack — start a one-time Stripe Checkout to buy a prepaid credit pack.
@@ -131,7 +179,7 @@ const CreditPackSchema = z.object({ packId: z.string().min(1) });
 billing.post('/credit-pack', (c) =>
   handle(c, async () => {
     const caller = await resolveCaller(c);
-    const { packId } = await parseBody(c, CreditPackSchema);
+    const { packId, returnPath } = await parseBody(c, CreditPackSchema);
     const pack = getPack(packId);
     if (!pack) return err(c, 'unknown_pack', 400, `No such credit pack: ${packId}`);
     const priceId = packPriceId(c.env, pack);
@@ -140,14 +188,18 @@ billing.post('/credit-pack', (c) =>
     }
 
     const web = (c.env.WEB_ORIGIN ?? '').split(',')[0]?.trim() || c.env.BETTER_AUTH_URL;
+    // App-relative return target (validated to start with a single '/'); the onboarding
+    // gate passes '/onboarding?step=confirming', the settings tab '/dashboard/settings?tab=billing'.
+    const ret = returnPath ?? '/dashboard/billing';
+    const sep = ret.includes('?') ? '&' : '?';
     // Per-request Stripe client (workerd: fetch HTTP client; never module-cache it).
     const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { httpClient: Stripe.createFetchHttpClient() });
     const session = await stripe.checkout.sessions.create(
       {
         mode: 'payment',
         line_items: [{ price: priceId, quantity: 1 }],
-        success_url: `${web}/dashboard/billing?topup=success`,
-        cancel_url: `${web}/dashboard/billing?topup=cancel`,
+        success_url: `${web}${ret}${sep}topup=success`,
+        cancel_url: `${web}${ret}${sep}topup=cancel`,
         // Belt-and-suspenders org binding for fulfillment (metadata + client_reference_id).
         client_reference_id: caller.orgId,
         metadata: { orgId: caller.orgId, packId: pack.id, kind: 'credit_pack' },
@@ -155,6 +207,30 @@ billing.post('/credit-pack', (c) =>
       { idempotencyKey: crypto.randomUUID() },
     );
     return ok(c, { url: session.url });
+  }),
+);
+
+const CheckoutIntentSchema = z.object({ toPlan: z.enum(['pro', 'enterprise']) });
+
+/**
+ * POST /checkout-intent — record that the user is starting a subscription checkout,
+ * just before the dashboard redirects to the Better-Auth/Stripe upgrade flow
+ * (`/api/auth/subscription/upgrade`). Server-side so the conversion event is
+ * non-spoofable; fire-and-forget so it never delays the redirect. No Stripe call
+ * here — this only emits the funnel event; the actual Checkout is the plugin's.
+ */
+billing.post('/checkout-intent', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const { toPlan } = await parseBody(c, CheckoutIntentSchema);
+    const from = await getActivePlan(caller.orgId);
+    makePostHog(c.env, c.executionCtx).capture({
+      distinctId: caller.callerId,
+      event: 'checkout_started',
+      properties: { to_plan: toPlan, from_plan: from.name },
+      groups: { organization: caller.orgId },
+    });
+    return ok(c, { ok: true });
   }),
 );
 

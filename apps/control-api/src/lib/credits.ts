@@ -19,6 +19,7 @@
  * (i.e. billing ≈ at cost) pending a retail multiplier from the pricing team — tune here.
  */
 import { query, withTransaction } from './db';
+import { isOrgComped } from './comp';
 
 /** µUSD per US dollar. Stripe cents → µUSD = cents × 10_000. */
 export const MICRO_PER_USD = 1_000_000;
@@ -153,7 +154,10 @@ export async function hasCredit(orgId: string): Promise<boolean> {
       [orgId],
     );
     if (r.rows.length === 0) return true; // no row → fail-open (see doc above)
-    return Number(r.rows[0]!.balance_micro) > 0;
+    if (Number(r.rows[0]!.balance_micro) > 0) return true;
+    // Balance exhausted — complimentary orgs (company domains) are never cut off.
+    // Checked only here (not on every call) so the hot path stays a single cheap read.
+    return await isOrgComped(orgId);
   } catch (e) {
     console.log(`[credits] hasCredit fail-open (DB error): ${e instanceof Error ? e.message : String(e)}`);
     return true; // never break the data path on a credits read

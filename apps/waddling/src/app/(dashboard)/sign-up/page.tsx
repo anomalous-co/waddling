@@ -1,10 +1,11 @@
 'use client';
 
-import { useState, type FormEvent } from 'react';
+import { useRef, useState, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { Loader2, Check } from 'lucide-react';
 import { authClient } from '@/lib/auth-client';
+import { useFunnel } from '@/lib/funnel';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -47,9 +48,18 @@ function StepDot({
 
 export default function SignUpPage() {
   const router = useRouter();
+  const funnel = useFunnel();
+  const startedRef = useRef(false);
   const [step, setStep] = useState<Step>('account');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Fire `signup_started` once, on the first interaction with the account form.
+  const markStarted = () => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    funnel.signupStarted();
+  };
 
   // Account form
   const [name, setName] = useState('');
@@ -71,6 +81,10 @@ export default function SignUpPage() {
       setError(res.error.message ?? 'Sign-up failed');
       return;
     }
+    // Stitch the anonymous visitor to the new user so the marketing → signup funnel
+    // connects. The authoritative `signup_completed` event fires server-side.
+    const user = res.data?.user;
+    if (user) funnel.identifyUser(user.id, { email: user.email, name: user.name });
     setStep('org');
   };
 
@@ -91,7 +105,8 @@ export default function SignUpPage() {
       setError(res.error.message ?? 'Failed to create organization');
       return;
     }
-    router.push('/dashboard');
+    // Org created → straight to the (unavoidable) billing step, not the dashboard.
+    router.push('/onboarding?step=billing');
   };
 
   return (
@@ -123,7 +138,10 @@ export default function SignUpPage() {
                       <Input
                         id="name"
                         value={name}
-                        onChange={(e) => setName(e.target.value)}
+                        onChange={(e) => {
+                          markStarted();
+                          setName(e.target.value);
+                        }}
                         required
                         autoComplete="name"
                         placeholder="Ada Lovelace"
@@ -136,7 +154,10 @@ export default function SignUpPage() {
                         id="email"
                         type="email"
                         value={email}
-                        onChange={(e) => setEmail(e.target.value)}
+                        onChange={(e) => {
+                          markStarted();
+                          setEmail(e.target.value);
+                        }}
                         required
                         autoComplete="email"
                         placeholder="you@example.com"
@@ -149,7 +170,10 @@ export default function SignUpPage() {
                         id="password"
                         type="password"
                         value={password}
-                        onChange={(e) => setPassword(e.target.value)}
+                        onChange={(e) => {
+                          markStarted();
+                          setPassword(e.target.value);
+                        }}
                         required
                         autoComplete="new-password"
                         placeholder="Min 8 characters"
@@ -215,14 +239,14 @@ export default function SignUpPage() {
                       {loading ? (
                         <Loader2 data-icon="inline-start" className="animate-spin" />
                       ) : null}
-                      Create org and go to dashboard
+                      Create org and continue
                     </Button>
 
                     <Button
                       type="button"
                       variant="ghost"
                       className="w-full text-muted-foreground"
-                      onClick={() => router.push('/dashboard')}
+                      onClick={() => router.push('/onboarding?step=org')}
                     >
                       Skip for now
                     </Button>

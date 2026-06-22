@@ -104,11 +104,12 @@
     // and calls /api/cp/* + /api/auth/* here. WEB_ORIGIN is echoed in credentialed
     // CORS (no `*`) and added to Better Auth trustedOrigins. COOKIE_DOMAIN makes the
     // session cookie first-party across the two subdomains (SameSite=Lax + Secure).
-    "WEB_ORIGIN": "https://app.getwaddling.com",
+    "WEB_ORIGIN": "https://app.getwaddling.com,https://getwaddling.com",
     "COOKIE_DOMAIN": ".getwaddling.com",
-    "STRIPE_SECRET_KEY": "sk_test_placeholder_b1",
-    "STRIPE_WEBHOOK_SECRET": "whsec_placeholder_b1",
-    "STRIPE_PRICE_PRO": "price_placeholder_pro",
+    // STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET are Worker SECRETS (set via
+    // `wrangler secret put …`), not plaintext vars — a name can't be both. A real
+    // (test-mode) STRIPE_SECRET_KEY flips `stripeConfigured` on (auth.ts).
+    "STRIPE_PRICE_PRO": "price_1Tl35LDNZoqvxQqookuG5Q5C",
     "STRIPE_PRICE_ENTERPRISE": "price_placeholder_ent",
     "STRIPE_PRICE_CREDIT_10": "price_placeholder_credit_10",
     "STRIPE_PRICE_CREDIT_25": "price_placeholder_credit_25",

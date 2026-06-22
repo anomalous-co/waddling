@@ -34,6 +34,8 @@ import {
   TabsTrigger,
   TabsContent,
 } from '@/components/ui/tabs';
+import { AccountTab } from '@/components/dashboard/settings/account-tab';
+import { BillingTab } from '@/components/dashboard/settings/billing-tab';
 import {
   Dialog,
   DialogContent,
@@ -724,8 +726,17 @@ function ApiKeysTab({
 
 // ── Root export ────────────────────────────────────────────────────────────────
 
+const SETTINGS_TABS = ['account', 'organization', 'members', 'api-keys', 'billing'] as const;
+type SettingsTab = (typeof SETTINGS_TABS)[number];
+
 export function SettingsContent() {
   const searchParams = useSearchParams();
+  const router = useRouter();
+  // The active tab is driven by ?tab= so it's deep-linkable + shareable.
+  const tabParam = searchParams.get('tab');
+  const activeTab: SettingsTab = (SETTINGS_TABS as readonly string[]).includes(tabParam ?? '')
+    ? (tabParam as SettingsTab)
+    : 'account';
   const [data, setData] = useState<SettingsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -794,16 +805,25 @@ export function SettingsContent() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
           <p className="text-sm text-muted-foreground">
-            Manage your organization, members, and API keys.
+            Manage your account, organization, members, API keys, and billing.
           </p>
         </div>
 
-        <Tabs defaultValue="organization">
+        <Tabs
+          value={activeTab}
+          onValueChange={(v) => router.replace(`/dashboard/settings?tab=${v}`)}
+        >
           <TabsList>
+            <TabsTrigger value="account">Account</TabsTrigger>
             <TabsTrigger value="organization">Organization</TabsTrigger>
             <TabsTrigger value="members">Members</TabsTrigger>
             <TabsTrigger value="api-keys">API keys</TabsTrigger>
+            <TabsTrigger value="billing">Billing</TabsTrigger>
           </TabsList>
+
+          <TabsContent value="account" className="mt-4">
+            <AccountTab />
+          </TabsContent>
 
           <TabsContent value="organization" className="mt-4">
             <OrganizationTab
@@ -825,6 +845,10 @@ export function SettingsContent() {
               onCreateKey={() => setCreateKeyOpen(true)}
               onRevoked={() => void load()}
             />
+          </TabsContent>
+
+          <TabsContent value="billing" className="mt-4">
+            <BillingTab />
           </TabsContent>
         </Tabs>
       </div>
