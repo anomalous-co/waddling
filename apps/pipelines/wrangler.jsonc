@@ -21,8 +21,9 @@
   // Access-gated (or RUN_TOKEN-gated) GET /run.
   "workers_dev": false,
 
-  // Hourly dispatch tick. The dispatcher decides which pipelines are due.
-  "triggers": { "crons": ["0 * * * *"] },
+  // Dispatch tick every 15 minutes. The dispatcher decides which pipelines are
+  // due; the overlap guard skips a pipeline whose prior run is still in flight.
+  "triggers": { "crons": ["*/15 * * * *"] },
 
   // Workflow that runs one pipeline end-to-end (extract → buffer → settle →
   // governed-load → advance-cursor).
@@ -34,13 +35,13 @@
   // from `wrangler pipelines streams list` after creating the stream (README).
   // NB: the field is `stream` (the older `pipeline` key is deprecated).
   "pipelines": [
-    { "binding": "FUNNEL_STREAM", "stream": "<STREAM_ID>" }
+    { "binding": "FUNNEL_STREAM", "stream": "d17b56dd0b914b32a9ec8f4be75c99ce" }
   ],
 
   // D1 cursor store. Replace <D1_ID> with the id from `wrangler d1 create
   // pipelines-cursors`, then apply migrations/0001_cursors.sql (README).
   "d1_databases": [
-    { "binding": "DB", "database_name": "pipelines-cursors", "database_id": "<D1_ID>" }
+    { "binding": "DB", "database_name": "pipelines-cursors", "database_id": "f3592449-0d34-4a0b-bb82-92a9ca16b29f" }
   ],
 
   // Non-secret config. SECRETS (set via `wrangler secret put …`, NOT here):
@@ -51,8 +52,8 @@
     "POSTHOG_APP_HOST": "https://us.posthog.com",
     "POSTHOG_PROJECT_ID": "<PROJECT_ID>",
     "CONTROL_API_BASE": "https://api.getwaddling.com",
-    // The dogfood org's lake the star schema is loaded into. Keep in sync with
-    // the registry spec's datalakeId placeholder.
-    "DATALAKE_ID": "<DATALAKE_ID>"
+    // The dogfood org's lake the star schema is loaded into (Anomalous Context
+    // Lake). Keep in sync with the registry spec's datalakeId.
+    "DATALAKE_ID": "0d4ae298-2039-46a8-9473-c5f41d1620af"
   }
 }

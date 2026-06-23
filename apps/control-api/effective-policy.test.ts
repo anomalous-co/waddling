@@ -584,6 +584,30 @@ describe('compilePolicy — capability grants', () => {
     });
   });
 
+  it('emits bare `*` for a fully-wildcard DDL grant so create authorizes NEW tables', () => {
+    // `*.*` hits birdshot RefMatch's `.*`-prefix branch (use_ref must start with the
+    // literal "*.") and so matches NOTHING — an agent with create:*.* could create no
+    // table. A fully-wildcard DDL grant must emit bare `*` (RefMatch match-everything).
+    const { snapshot } = compilePolicy(
+      [makeRule({ capability: 'create', schema_name: '*', table_name: '*' })],
+      NOW,
+    );
+    const g = snapshot.roleGrants.find((x) => x.action === 'create');
+    expect(g?.tableRef).toBe('*');
+    expect(snapshot.roleGrants.find((x) => x.tableRef === '*.*')).toBeUndefined();
+  });
+
+  it('does NOT broaden read `*.*` to `*` (read stays fail-closed when unexpanded)', () => {
+    // Only parse-authorized DDL caps get the `*` rewrite. read/write are expanded
+    // against the catalog elsewhere; with no catalog they stay literal `*.*` (cover
+    // nothing) rather than being broadened to match-everything (which would leak rows).
+    const { snapshot } = compilePolicy(
+      [makeRule({ capability: 'read', verb: 'read', schema_name: '*', table_name: '*' })],
+      NOW,
+    );
+    expect(snapshot.roleGrants.find((x) => x.action === 'read')?.tableRef).toBe('*.*');
+  });
+
   it('keys deny/allow per capability — a write deny does not suppress a read allow', () => {
     const { snapshot } = compilePolicy(
       [

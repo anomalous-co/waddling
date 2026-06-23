@@ -3,9 +3,8 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "In-container gateway boot + forwarder for the Stage D gateway probe. Imports the REAL packages/gateway boot code (copied into gateway-src/) and runs it via tsx so quack + birdshot load natively.",
+  "description": "In-container gateway boot + forwarder for the Stage D gateway probe. Imports the REAL packages/gateway boot code (copied into gateway-src/), bundled to plain JS at image-build time (esbuild — see ../Dockerfile) and run as `node entrypoint.js` so quack + birdshot load natively with no runtime transpilation.",
   "dependencies": {
-    "@duckdb/node-api": "1.5.3-r.3",
-    "tsx": "^4"
+    "@duckdb/node-api": "1.5.3-r.3"
   }
 }

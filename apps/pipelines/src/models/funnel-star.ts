@@ -75,14 +75,17 @@ export const dimCampaign: StarTable = {
 export const dimPage: StarTable = {
   name: 'dim_page',
   kind: 'dim',
+  // Page-less events (signup_completed, mcp_connect, …) get a deterministic
+  // "(none)" member via the '' sentinel rather than a null key, so EVERY fact row
+  // resolves to a dim_page row (no orphans). The fact computes page_key with the
+  // identical expression. (dim_campaign gets this for free via concat_ws.)
   sql: ({ stagingGlob }) => `
     CREATE OR REPLACE TABLE marketing.dim_page AS
     SELECT DISTINCT
-      md5(coalesce(pathname, current_url)) AS page_key,
+      md5(coalesce(pathname, current_url, '')) AS page_key,
       pathname,
       current_url
     FROM read_parquet('${stagingGlob}', union_by_name => true)
-    WHERE coalesce(pathname, current_url) IS NOT NULL
   `,
 };
 
@@ -104,7 +107,7 @@ export const fctFunnelEvent: StarTable = {
       md5(coalesce(person_id, distinct_id))                      AS person_key,
       md5(event)                                                 AS event_type_key,
       md5(concat_ws('|', utm_source, utm_medium, utm_campaign, referrer)) AS campaign_key,
-      md5(coalesce(pathname, current_url))                       AS page_key,
+      md5(coalesce(pathname, current_url, ''))                   AS page_key,
       CAST(strftime(CAST(timestamp AS DATE), '%Y%m%d') AS INTEGER) AS date_key,
       event IN ('signup_completed','checkout_completed')         AS is_conversion,
       cta_location,

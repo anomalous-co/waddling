@@ -44,18 +44,13 @@ const ISSUER = "https://probe.waddling.test/";
 const ROLE = `agent_${AGENT_ID}`;
 const FWD_PORT = 8080;
 
-// The gateway boot command the DO launches inside the container. tsx is loaded by
-// ABSOLUTE path (not the bare `tsx` specifier) so it resolves regardless of the
-// process-server's cwd; `--import` lets node run the .ts gateway source (the
-// type-only @waddling/control-schema import is erased). cwd is also pinned to
-// /opt/gateway below for good measure. Runs as the long-lived gateway process next
-// to the SDK process-server.
+// The gateway boot command the DO launches inside the container. The image now bundles
+// entrypoint.mjs + the TS gateway-src to plain JS at build time (esbuild — see
+// container/Dockerfile), so boot is `node entrypoint.js` with no tsx runtime transpilation
+// (the cold-start optimization). Runs as the long-lived gateway process next to the SDK
+// process-server.
 const GW_DIR = "/opt/gateway";
-// `--import tsx` MUST be the bare specifier (tsx's package export that registers
-// the loader), NOT a directory path — `node --import <dir>` throws
-// ERR_UNSUPPORTED_DIR_IMPORT. The bare specifier resolves from cwd, which
-// startProcess pins to GW_DIR below, so /opt/gateway/node_modules/tsx is found.
-const BOOT_CMD = `node --import tsx ${GW_DIR}/entrypoint.mjs`;
+const BOOT_CMD = `node ${GW_DIR}/entrypoint.js`;
 
 // GatewayDO is a bare Sandbox subclass — the probe drives it ENTIRELY through the
 // SDK's own methods (startProcess / containerFetch / exec, the same method class the
@@ -68,25 +63,32 @@ export class GatewayDO extends Sandbox<Env> {}
 // until the forwarder's /healthz is reachable via containerFetch — which also
 // confirms quack_serve is up, since the forwarder boots only after bootDuckRuntime
 // returns. Uses ONLY SDK methods on the sandbox handle.
-async function ensureGateway(sandbox: GatewaySandbox): Promise<{ started: boolean; waitedMs: number }> {
-  const marker = await sandbox.exec("test -f /tmp/gw-started && echo yes || echo no");
-  if (marker.stdout.trim() !== "yes") {
-    await sandbox.exec("touch /tmp/gw-started");
-    await sandbox.startProcess(BOOT_CMD, { cwd: GW_DIR });
+async function ensureGateway(sandbox: GatewaySandbox, bootEnv?: Record<string, string>): Promise<{ started: boolean; waitedMs: number; coldBooted: boolean; health: any }> {
+  // Mirrors the production dataplane ensureGateway: collapse marker-check + touch into one exec,
+  // and poll fast early (150ms) then back off (1s), so a ready gateway isn't taxed up to a full
+  // second of poll rounding. `waitedMs` is measured from BEFORE the marker exec, so it is the
+  // true user-perceived boot (container provisioning included), not just the healthz wait.
+  const overallStart = Date.now();
+  const marker = await bootRetry(() => sandbox.exec("if [ -f /tmp/gw-started ]; then echo yes; else touch /tmp/gw-started; echo no; fi"));
+  const coldBooted = marker.stdout.trim() !== "yes";
+  if (coldBooted) {
+    await sandbox.startProcess(BOOT_CMD, { cwd: GW_DIR, env: bootEnv });
   }
-
-  const start = Date.now();
   const deadlineMs = 90_000;
   let lastErr = "";
-  while (Date.now() - start < deadlineMs) {
+  while (Date.now() - overallStart < deadlineMs) {
     try {
       const r = await sandbox.containerFetch("http://gw/healthz", { method: "GET" }, FWD_PORT);
-      if (r.ok) return { started: true, waitedMs: Date.now() - start };
+      if (r.ok) {
+        const health = await r.json().catch(() => ({}));
+        return { started: true, waitedMs: Date.now() - overallStart, coldBooted, health };
+      }
       lastErr = `healthz ${r.status}`;
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e);
     }
-    await new Promise((res) => setTimeout(res, 1000));
+    const elapsed = Date.now() - overallStart;
+    await new Promise((res) => setTimeout(res, elapsed < 3_000 ? 150 : 1_000));
   }
   throw new Error(`gateway did not become healthy in ${deadlineMs}ms: ${lastErr}`);
 }
@@ -105,8 +107,26 @@ async function fwd(sandbox: GatewaySandbox, path: string, init: RequestInit): Pr
 // a sandbox handle, not a GatewayDO instance — we only ever call SDK methods on it.)
 interface GatewaySandbox {
   exec(cmd: string): Promise<{ stdout: string }>;
-  startProcess(cmd: string, opts?: { cwd?: string }): Promise<unknown>;
+  startProcess(cmd: string, opts?: { cwd?: string; env?: Record<string, string> }): Promise<unknown>;
   containerFetch(url: string, init: RequestInit, port?: number): Promise<Response>;
+  destroy(): Promise<void>;
+}
+
+// Retry a container call through the brief teardown/startup race after destroy() (mirrors the
+// dataplane's withBootRetry). Used by the benchmark's cold cycles.
+const BOOT_RACE = /invalidated by a container stop|container (is )?(stop|not running|starting)|no (running )?instance|default session/i;
+async function bootRetry<T>(fn: () => Promise<T>, tries = 20, delayMs = 1000): Promise<T> {
+  let lastErr = "";
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!BOOT_RACE.test(msg)) throw e;
+      lastErr = msg;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw new Error(`still racing container boot after ${tries} tries: ${lastErr}`);
 }
 
 // RS256 keypair for the probe. Generated per /probe run (ephemeral) — the public
@@ -237,6 +257,70 @@ async function runProbe(env: Env): Promise<Response> {
   });
 }
 
+// ── cold vs warm boot benchmark ────────────────────────────────────────────────
+// WARM = the container is already up and the gateway process running; ensureGateway just
+// confirms /healthz (one marker exec + one healthz). COLD = destroy() the container first, so
+// ensureGateway re-provisions it and re-runs the full boot (container + node + bootDuckRuntime
+// → quack_serve → forwarder). `waitedMs` is wall-clock from before the marker exec to healthz
+// (the user-perceived boot); `bootMs` (from healthz) is the in-container boot, so
+// waitedMs − bootMs ≈ container/node provisioning. NOTE: without ?dsn= the boot uses a
+// local-file ducklake catalog (fast attach) — the compute-only floor; a real Postgres catalog
+// adds variable ATTACH-warmth latency on top (visible in the [gateway:boot] attach phase).
+function stats(xs: number[]): { min: number; median: number; max: number; mean: number; n: number } {
+  const s = [...xs].sort((a, b) => a - b);
+  const n = s.length;
+  const median = n % 2 ? s[(n - 1) / 2] : Math.round((s[n / 2 - 1] + s[n / 2]) / 2);
+  const mean = Math.round(s.reduce((a, b) => a + b, 0) / Math.max(n, 1));
+  return { min: s[0] ?? 0, median, max: s[n - 1] ?? 0, mean, n };
+}
+
+async function benchmark(env: Env, opts: { cold: number; warm: number; dsn?: string }): Promise<unknown> {
+  // Real-catalog mode (optional): point the boot at a throwaway Postgres ducklake catalog so the
+  // cold number includes the genuine ATTACH cost. Otherwise the entrypoint's selftest-seed path
+  // boots a local-file catalog.
+  const bootEnv = opts.dsn
+    ? { DUCKLAKE_CATALOG_DSN: opts.dsn, DUCKLAKE_DATA_PATH: "/var/lib/waddling/data/", DUCKLAKE_ALIAS: "lake", DUCKLAKE_METADATA_SCHEMA: "gw_bench" }
+    : undefined;
+  const handle = (id: string) => getSandbox(env.GATEWAY, id) as unknown as GatewaySandbox;
+  const runTag = crypto.randomUUID().slice(0, 8);
+
+  const warm: Array<{ waitedMs: number; bootMs: number; coldBooted: boolean }> = [];
+  const cold: Array<{ waitedMs: number; bootMs: number; coldBooted: boolean }> = [];
+
+  // WARM: one container. The first ensure boots it (cold, discarded); subsequent ensures hit a
+  // hot container — that is the warm path (marker exec + one healthz, no startProcess).
+  const warmGw = handle(`gw-bench-warm-${runTag}`);
+  await ensureGateway(warmGw, bootEnv); // prime (cold; not recorded)
+  for (let i = 0; i < opts.warm; i++) {
+    const r = await ensureGateway(warmGw, bootEnv);
+    warm.push({ waitedMs: r.waitedMs, bootMs: Number(r.health?.bootMs ?? 0), coldBooted: r.coldBooted });
+  }
+
+  // COLD: a FRESH container id per sample so each is a guaranteed cold boot. We do NOT destroy()
+  // a live container to force cold (that call hangs — the documented Sandbox lesson); fresh ids
+  // idle out on their own. Needs max_instances headroom (raised on the probe worker).
+  for (let i = 0; i < opts.cold; i++) {
+    const r = await ensureGateway(handle(`gw-bench-cold-${runTag}-${i}`), bootEnv);
+    cold.push({ waitedMs: r.waitedMs, bootMs: Number(r.health?.bootMs ?? 0), coldBooted: r.coldBooted });
+  }
+
+  return {
+    config: { coldSamples: opts.cold, warmSamples: opts.warm, catalog: opts.dsn ? "postgres(real ATTACH)" : "local-file(compute floor)" },
+    warm,
+    cold,
+    summary: {
+      warmWaitedMs: stats(warm.map((w) => w.waitedMs)),
+      coldWaitedMs: stats(cold.map((c) => c.waitedMs)),
+      coldInContainerBootMs: stats(cold.map((c) => c.bootMs)),
+      // waitedMs − bootMs ≈ container + node provisioning (the part outside DuckDB boot).
+      coldProvisioningMs: stats(cold.map((c) => Math.max(0, c.waitedMs - c.bootMs))),
+    },
+    note: opts.dsn
+      ? "Cold includes a real Postgres ducklake ATTACH."
+      : "Cold uses a local-file catalog (compute floor). Add ?dsn=<throwaway libpq DSN> to include the real Postgres ATTACH cost.",
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -248,7 +332,7 @@ export default {
       try {
         const dbg = getSandbox(env.GATEWAY, "gw-debug-1") as unknown as GatewaySandbox;
         const cmd =
-          "cd /opt/gateway && (timeout 40 node --import tsx /opt/gateway/entrypoint.mjs 2>&1 | head -160); " +
+          "cd /opt/gateway && (timeout 40 node /opt/gateway/entrypoint.js 2>&1 | head -160); " +
           "echo '---BIRDSHOT-FILE---'; file /opt/birdshot/birdshot.duckdb_extension; " +
           "echo '---LDD-MISSING---'; ldd /opt/birdshot/birdshot.duckdb_extension 2>&1 | grep -iE 'not found|error' | head; " +
           "echo '---NODE---'; node -v";
@@ -271,8 +355,21 @@ export default {
         );
       }
     }
+    if (url.pathname === "/benchmark") {
+      try {
+        const cold = Math.min(Math.max(Number(url.searchParams.get("cold") ?? 3), 1), 10);
+        const warm = Math.min(Math.max(Number(url.searchParams.get("warm") ?? 5), 1), 20);
+        // Optional: a throwaway Postgres catalog DSN to measure the REAL ducklake-on-Postgres
+        // ATTACH cost in the cold number. Without it the boot uses a local-file catalog (fast
+        // attach) — i.e. the compute-only cold floor, excluding catalog-warmth latency.
+        const dsn = url.searchParams.get("dsn") ?? undefined;
+        return Response.json(await benchmark(env, { cold, warm, dsn }));
+      } catch (e) {
+        return Response.json({ error: e instanceof Error ? e.message : String(e), stack: e instanceof Error ? e.stack : undefined }, { status: 500 });
+      }
+    }
     return new Response(
-      "Stage D gateway probe (gateway as a private Container DO, serving birdshot-gated quack). GET /probe to run.\n",
+      "Stage D gateway probe (gateway as a private Container DO, serving birdshot-gated quack). GET /probe to run, GET /benchmark?cold=3&warm=5[&dsn=...] to time cold vs warm boots.\n",
       { status: 200 },
     );
   },

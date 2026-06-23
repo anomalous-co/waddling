@@ -80,6 +80,14 @@
     { "tag": "v3", "new_sqlite_classes": ["QuackboardDO"] }
   ],
 
+  // Keep-warm tick: every 3 minutes the scheduled() handler pings gateway replicas for
+  // datalakes with recent real traffic so a hot datalake never cold-boots on the user path.
+  // The interval is well under GatewayDO.sleepAfter (10m) so an active datalake never sleeps
+  // between ticks; idle datalakes self-gate out of warming (see GatewayPoolDO.keepWarm).
+  "triggers": {
+    "crons": ["*/3 * * * *"]
+  },
+
   // REAL R2 S3-API creds (Secrets Store), read by the WorkspaceSandbox DO to MINT
   // short-lived single-object presigned URLs. They NEVER enter the container — the DO
   // signs, the sidecar fetches (Model B). Same store as the ws-probe.

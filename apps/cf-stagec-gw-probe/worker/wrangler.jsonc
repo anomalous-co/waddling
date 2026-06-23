@@ -23,7 +23,9 @@
       "class_name": "GatewayDO",
       "image": "../container/Dockerfile",
       "instance_type": "standard-2",
-      "max_instances": 1
+      // Raised from 1 so the /benchmark cold samples (a fresh container id each, no destroy)
+      // can run concurrently. The probe is a manual test surface; idle containers sleep out.
+      "max_instances": 12
     }
   ],
 

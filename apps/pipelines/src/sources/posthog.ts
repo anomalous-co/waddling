@@ -20,7 +20,9 @@ import { ISO_RE } from '../lib/validate';
 
 // Only pull events at least this old, so PostHog ingestion lag can't make us
 // skip rows whose timestamp is < now but which weren't queryable on the prior run.
-const LAG_SECONDS = 300;
+// 120s for the 15-minute cadence: trades a little ingestion-completeness headroom
+// for fresher data (the watermark re-pulls the same window on the next run anyway).
+const LAG_SECONDS = 120;
 // Per-query page size, and the max pages drained in ONE extract(). The product
 // (PAGE_SIZE * MAX_PAGES) bounds how many records a single workflow run hands
 // across the step boundary — kept modest so the extract→buffer step result stays

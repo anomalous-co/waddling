@@ -56,9 +56,11 @@ const GW_ID = "gw-loop-1";       // stable gateway DO id (booted once, reused)
 const GW_FWD_PORT = 8080;        // gateway forwarder (proxies non-/ctrl → quack:9500)
 const WS_SIDECAR_PORT = 8080;    // workspace sidecar control port (its own container)
 
-// Gateway boot command (same as the proven gw-probe): bare `tsx` specifier, cwd pinned.
+// Gateway boot command (same image as the gw-probe): the image bundles entrypoint to plain
+// JS at build time (esbuild — see container/Dockerfile), so boot is `node entrypoint.js` with
+// no tsx runtime transpilation.
 const GW_DIR = "/opt/gateway";
-const BOOT_CMD = `node --import tsx ${GW_DIR}/entrypoint.mjs`;
+const BOOT_CMD = `node ${GW_DIR}/entrypoint.js`;
 
 // ── DO classes ─────────────────────────────────────────────────────────────────
 // GatewayDO: the TRUSTED gateway. enableInternet=true so all egress ports leave the

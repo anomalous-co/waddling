@@ -85,6 +85,12 @@ const log = (...a) => console.log("[gw-entry]", ...a);
 const qlit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
 
 async function main() {
+  // Wall-clock from process start (this module's first line runs at import; main() is called
+  // immediately after) to the forwarder accepting connections — the in-container boot cost,
+  // surfaced in healthz as `bootMs` so a benchmark can decompose total cold boot into
+  // container/node provisioning (DO-observed waited − bootMs) vs DuckDB boot (bootMs).
+  const bootStartedAt = Date.now();
+  let bootMs = 0; // frozen when the forwarder starts listening (see server.listen below)
   const dataDir = resolve(STATE_DIR, "data");
   mkdirSync(dataDir, { recursive: true });
 
@@ -146,6 +152,36 @@ async function main() {
   const rt = await bootDuckRuntime(config);
   log("gateway booted — quack_serve up, birdshot hooks installed pre-serve");
 
+  // ── Cold-boot snapshot arming (folds the /ctrl/snapshot round-trip into boot) ──────
+  // The director (GatewayPoolDO.doArm) normally pushes the birdshot ACL snapshot over a
+  // SEPARATE /ctrl/snapshot call AFTER healthz goes green — one extra container round-trip
+  // on every cold boot. When it instead hands us the cached snapshot via GW_BOOT_SNAPSHOT
+  // (base64 JSON {snapshot, auth, lakeCatalog}), we apply it HERE, before the forwarder
+  // accepts traffic, so the replica is already armed when healthz first answers. healthz
+  // reports the applied version so the director can skip its redundant push. Fail-safe is
+  // preserved (armed before serving); if this fails we fall back to the director's push.
+  // lastSnapshot is declared here (not in the forwarder block) so /ctrl/reapply can recover
+  // a hot replica from the boot-applied policy too.
+  let lastSnapshot = null;
+  let bootSnapshotVersion = 0;
+  if (process.env.GW_BOOT_SNAPSHOT) {
+    try {
+      const parsed = JSON.parse(Buffer.from(process.env.GW_BOOT_SNAPSHOT, "base64").toString("utf8"));
+      const prevAlias = rt.config.lakeAlias;
+      if (parsed.lakeCatalog) rt.config.lakeAlias = parsed.lakeCatalog;
+      try {
+        await applySnapshot(rt, parsed.snapshot, parsed.auth);
+      } finally {
+        rt.config.lakeAlias = prevAlias;
+      }
+      lastSnapshot = { snapshot: parsed.snapshot, auth: parsed.auth, lakeCatalog: parsed.lakeCatalog };
+      bootSnapshotVersion = Number(process.env.GW_BOOT_SNAPSHOT_VERSION || 0);
+      log(`boot-armed birdshot snapshot v${bootSnapshotVersion} (${parsed.snapshot?.roleGrants?.length ?? 0} grants) — no /ctrl/snapshot round-trip needed`);
+    } catch (e) {
+      log(`boot snapshot apply failed (director will push via /ctrl/snapshot): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   if (seedDemo) {
     // ── Seed the minimal demo lake AFTER boot (trusted control connection) ────────
     // Seed in memory.main — the PROVEN federation placement (birdshot.e2e.ts:147-164
@@ -165,7 +201,7 @@ async function main() {
     log("seeded memory.main.orders (allowed) + memory.main.secrets (forbidden)");
   }
 
-  // ── In-container quack CLIENT ────────────────────────────────────────────────
+  // ── In-container quack CLIENT (lazy — cold-boot optimization) ────────────────
   // workerd has no DuckDB, so the agent's quack client CANNOT live in the Worker.
   // It lives here: a SECOND DuckDBInstance that ATTACHes to the loopback quack
   // listener presenting the session JWT as the TOKEN, exactly as a real agent's
@@ -173,11 +209,20 @@ async function main() {
   // INSIDE the container; the DO drives it over containerFetch → /query (JSON in,
   // JSON rows out). This proves the gateway DO serves GATED quack — it does NOT
   // claim raw quack wire survives the containerFetch hop (out of scope, Stage D+).
-  const clientInst = await DuckDBInstance.create(":memory:");
-  const client = await clientInst.connect();
-  await client.run("INSTALL quack; LOAD quack");
+  //
+  // Created LAZILY on first /query: real agent traffic rides the catch-all quack proxy
+  // below, not /query, so most boots never touch this. Building it eagerly cost every
+  // cold boot a second DuckDBInstance + INSTALL/LOAD quack for nothing.
+  let client = null;
   // One ATTACH per session token; cache so repeated /query calls reuse the session.
   const attachedTokens = new Set();
+  async function ensureClient() {
+    if (client) return client;
+    const clientInst = await DuckDBInstance.create(":memory:");
+    client = await clientInst.connect();
+    await client.run("INSTALL quack; LOAD quack");
+    return client;
+  }
 
   // FTS recall (quackboard): the BM25 index is rebuilt lazily — only when the observations
   // table has grown since the last build — so recall never pays an O(N) rebuild per write
@@ -185,10 +230,11 @@ async function main() {
   // the first recall after a (cold) boot, folding in any observes since bootstrap.
   let lastFtsCount = -1;
   async function attach(token) {
+    const c = await ensureClient();
     if (attachedTokens.has(token)) return;
     // birdshot_authenticate verifies the JWT (RS256) against server_token + JWKS at
     // ATTACH; a bad token throws here. DISABLE_SSL: loopback plaintext quack.
-    await client.run(
+    await c.run(
       `ATTACH 'quack:localhost:${QUACK_PORT}' AS lake (TOKEN '${token.replace(/'/g, "''")}', DISABLE_SSL true)`,
     );
     attachedTokens.add(token);
@@ -211,14 +257,11 @@ async function main() {
   }
 
   // ── Forwarder + control channel on :8080 ─────────────────────────────────────
-  // Cache of the last successfully-applied snapshot (+ auth + lakeCatalog), so
-  // /ctrl/reapply can re-run applySnapshot WITHOUT a control-plane round trip.
-  // Lives in this container process's memory: lost on cold boot (correct — a cold
-  // container has no in-memory birdshot policy to reapply, so reapply 409s there and
-  // the director re-arms via /ctrl/snapshot). Used to recover a hot replica whose
-  // in-memory birdshot policy got corrupted.
-  let lastSnapshot = null;
-
+  // `lastSnapshot` (declared above, before the boot-snapshot arming) caches the last
+  // successfully-applied snapshot (+ auth + lakeCatalog) so /ctrl/reapply can re-run
+  // applySnapshot WITHOUT a control-plane round trip. It is seeded by the boot-snapshot
+  // arming when GW_BOOT_SNAPSHOT is present, and refreshed by every /ctrl/snapshot push.
+  // Used to recover a hot replica whose in-memory birdshot policy got corrupted.
   const server = createServer((req, res) => {
     void handle(req, res).catch((err) => {
       const reason = err instanceof Error ? err.message : String(err);
@@ -233,10 +276,13 @@ async function main() {
     const url = req.url ?? "/";
     const path = url.split("?")[0];
 
-    // Liveness — the DO polls this until quack is reachable.
+    // Liveness — the DO polls this until quack is reachable. `snapshotVersion` reports the
+    // birdshot policy version this replica armed itself with at boot (0 if none): the director
+    // reads it to skip a redundant /ctrl/snapshot push when the boot already applied the
+    // current snapshot (see GatewayPoolDO.doArm).
     if (method === "GET" && path === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, quackPort: QUACK_PORT }));
+      res.end(JSON.stringify({ ok: true, quackPort: QUACK_PORT, snapshotVersion: bootSnapshotVersion, bootMs }));
       return;
     }
 
@@ -698,7 +744,8 @@ async function main() {
   }
 
   server.listen(FWD_PORT, "0.0.0.0", () => {
-    log(`forwarder listening on 0.0.0.0:${FWD_PORT} (→ quack:${QUACK_PORT})`);
+    bootMs = Date.now() - bootStartedAt;
+    log(`forwarder listening on 0.0.0.0:${FWD_PORT} (→ quack:${QUACK_PORT}) — in-container boot ${bootMs}ms`);
   });
 }
 

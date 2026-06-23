@@ -60,7 +60,10 @@ const GW_DIR = "/opt/gateway";
 const quackboardDoId = (orgId: string): string => `qb:${orgId}`.toLowerCase();
 const QB_DB_PATH = "/var/lib/waddling/quackboard.duckdb";
 const QB_LOCAL_QUACK = "quack:localhost:9500"; // the in-container quack server (QUACK_PORT)
-const BOOT_CMD = `node --import tsx ${GW_DIR}/entrypoint.mjs`;
+// Pre-bundled to plain JS at image-build time (esbuild — see the Dockerfile), so boot runs
+// `node entrypoint.js` with NO tsx runtime transpilation on the cold-start path. The image
+// still ships entrypoint.mjs as the source; only the compiled bundle is executed.
+const BOOT_CMD = `node ${GW_DIR}/entrypoint.js`;
 const WS_SIDECAR_CMD = "node --use-system-ca /opt/workspace/workspace-sidecar.mjs";
 const PRESIGN_TTL_SEC = 3600;   // covers a full session (≤1h); R2 max is 7d. Sessions
                                  // longer than this need a periodic re-/init refresh (a
@@ -110,7 +113,10 @@ export class GatewayDO extends Sandbox<Env> {
   // Scale-to-zero: an idle gateway replica container sleeps after this window, freeing its
   // slot. Waking is cold (the /tmp marker + quack_serve process are gone) — ensureGateway
   // re-boots and the director re-applies the birdshot snapshot before the replica serves.
-  sleepAfter = "5m";
+  // Widened from 5m → 10m so the warm window covers more inter-query gaps (fewer cold boots
+  // on the user path); the scheduled keep-warm pings active datalakes well inside this window
+  // so a hot datalake never sleeps. Kept in sync with GATEWAY_SLEEP_AFTER below.
+  sleepAfter = "10m";
 }
 
 export class WorkspaceSandbox extends Sandbox<Env> {
@@ -244,27 +250,38 @@ interface WsHandle {
 }
 
 // ── gateway helpers ────────────────────────────────────────────────────────────
-async function ensureGateway(gw: GatewayHandle, bootEnv?: Record<string, string>): Promise<{ waitedMs: number; coldBooted: boolean }> {
-  const marker = await withBootRetry(() => gw.exec("test -f /tmp/gw-started && echo yes || echo no"), "gw warmup");
-  // A slept/woken container loses its /tmp marker AND its loaded birdshot config (the process
-  // is gone), so an absent marker means COLD: the caller MUST re-apply the snapshot before the
-  // replica serves any agent query (fail-safe — never serve with a stale/empty ACL set).
+async function ensureGateway(gw: GatewayHandle, bootEnv?: Record<string, string>): Promise<{ waitedMs: number; coldBooted: boolean; health: any }> {
+  // Collapse the marker-check + touch into ONE exec round-trip (was two): test the marker and,
+  // when absent, create it atomically, so a cold boot pays one fewer serial container hop before
+  // startProcess. A slept/woken container loses its /tmp marker AND its loaded birdshot config
+  // (the process is gone), so an absent marker means COLD: the caller MUST re-apply the snapshot
+  // before the replica serves any agent query (fail-safe — never serve with a stale/empty ACL set).
+  const marker = await withBootRetry(
+    () => gw.exec("if [ -f /tmp/gw-started ]; then echo yes; else touch /tmp/gw-started; echo no; fi"),
+    "gw warmup",
+  );
   const coldBooted = marker.stdout.trim() !== "yes";
   if (coldBooted) {
-    await gw.exec("touch /tmp/gw-started");
-    // bootEnv carries the per-datalake lake config (catalog DSN, metadata schema, s3 creds).
+    // bootEnv carries the per-datalake lake config (catalog DSN, metadata schema, s3 creds) and
+    // optionally GW_BOOT_SNAPSHOT so the container arms itself during boot (see doArm).
     // A HOT gateway is NOT re-bootstrapped — its config is fixed at first boot.
     await gw.startProcess(BOOT_CMD, { cwd: GW_DIR, env: bootEnv });
   }
   const start = Date.now();
   let lastErr = "";
+  // Poll fast early (a warm/ready gateway answers in well under a second, so a flat 1s interval
+  // wasted up to ~1s of every wake), then back off to 1s so a genuinely cold boot doesn't spin.
   while (Date.now() - start < 90_000) {
     try {
       const r = await gw.containerFetch("http://gw/healthz", { method: "GET" }, GW_FWD_PORT);
-      if (r.ok) return { waitedMs: Date.now() - start, coldBooted };
+      if (r.ok) {
+        const health = await r.json().catch(() => ({}));
+        return { waitedMs: Date.now() - start, coldBooted, health };
+      }
       lastErr = `healthz ${r.status}`;
     } catch (e) { lastErr = e instanceof Error ? e.message : String(e); }
-    await new Promise((res) => setTimeout(res, 1000));
+    const elapsed = Date.now() - start;
+    await new Promise((res) => setTimeout(res, elapsed < 3_000 ? 150 : 1_000));
   }
   throw new Error(`gateway not healthy in 90s: ${lastErr}`);
 }
@@ -349,7 +366,9 @@ async function ensureQuackboard(env: Env, orgId: string, boot: GatewayBoot): Pro
       if (r.ok) return { coldBooted };
       lastErr = `healthz ${r.status}`;
     } catch (e) { lastErr = e instanceof Error ? e.message : String(e); }
-    await new Promise((res) => setTimeout(res, 1000));
+    // Fast early polls then back off (mirrors ensureGateway).
+    const elapsed = Date.now() - start;
+    await new Promise((res) => setTimeout(res, elapsed < 3_000 ? 150 : 1_000));
   }
   throw new Error(`quackboard not healthy in 90s: ${lastErr}`);
 }
@@ -515,9 +534,25 @@ interface PoolCache {
 interface ReplicaRec { appliedVersion: number; lastActiveAt: number; }
 type ReplicaMap = Record<number, ReplicaRec>;
 
-const POOL_WARM_WINDOW_MS = 4 * 60_000;   // < sleepAfter(5m): touched within this ⇒ certainly awake
-const POOL_IDLE_WINDOW_MS = 6 * 60_000;   // > sleepAfter(5m): no activity within this ⇒ asleep
-const GATEWAY_SLEEP_AFTER = "5m";
+const POOL_WARM_WINDOW_MS = 9 * 60_000;   // < sleepAfter(10m): touched within this ⇒ certainly awake
+const POOL_IDLE_WINDOW_MS = 11 * 60_000;  // > sleepAfter(10m): no activity within this ⇒ asleep
+const GATEWAY_SLEEP_AFTER = "10m";        // kept in sync with GatewayDO.sleepAfter
+
+// ── scheduled keep-warm (Track 1) ────────────────────────────────────────────────
+// A datalake that has served a real query within this window is kept hot by the cron tick
+// below (pinging replica 0 resets its sleepAfter timer, so it never cold-boots on the user
+// path). Past the window the datalake is allowed to sleep — we warm the HOT datalakes, not
+// every datalake ever configured. The cron interval (wrangler triggers.crons) must be shorter
+// than sleepAfter so an active datalake never falls through a gap.
+const KEEP_WARM_ACTIVE_WINDOW_MS = 20 * 60_000;
+// Sentinel GATEWAY_POOL instance that holds the registry of configured datalake ids (its only
+// state is the registry; it never runs pool logic). Lets the cron enumerate datalakes to warm.
+const WARM_REGISTRY_ID = "__warm_registry__";
+// Drop datalakes from the registry after a day with no new snapshot push (re-added on the next
+// connect), so the registry doesn't grow without bound across the lifetime of the worker.
+const WARM_REGISTRY_TTL_MS = 24 * 60 * 60_000;
+const getWarmRegistry = (env: Env): DurableObjectStub<GatewayPoolDO> =>
+  env.GATEWAY_POOL.get(env.GATEWAY_POOL.idFromName(WARM_REGISTRY_ID));
 
 function replicaIndexFromKey(replicaKey: string): number {
   const n = Number(replicaKey.slice(replicaKey.lastIndexOf(":") + 1));
@@ -547,6 +582,11 @@ export class GatewayPoolDO extends DurableObject<Env> {
     const version = currentVersion + 1;
     await this.ctx.storage.put("cache", payload);
     await this.ctx.storage.put("meta", { currentVersion: version });
+
+    // Register with the keep-warm registry so the scheduled tick can find this datalake. Cheap
+    // and rare (once per connect-time snapshot push); best-effort so a registry hiccup never
+    // blocks the ACL update.
+    try { await getWarmRegistry(this.env).registerDatalake(datalakeId); } catch { /* keep-warm is best-effort */ }
 
     const reps = await this.replicas();
     if (!(0 in reps)) reps[0] = { appliedVersion: 0, lastActiveAt: 0 };
@@ -625,7 +665,12 @@ export class GatewayPoolDO extends DurableObject<Env> {
     const n = replicaIndexFromKey(replicaKey);
     this.inFlight.set(n, Math.max(0, (this.inFlight.get(n) ?? 1) - 1));
     const reps = await this.replicas();
-    if (reps[n]) { reps[n].lastActiveAt = Date.now(); await this.ctx.storage.put("replicas", reps); }
+    const now = Date.now();
+    if (reps[n]) { reps[n].lastActiveAt = now; await this.ctx.storage.put("replicas", reps); }
+    // Record REAL query activity for the keep-warm gate. Distinct from replicas[].lastActiveAt
+    // (which the warmer's own arm-pings refresh) — only genuine queries land here, so keepWarm
+    // stops warming a datalake once real traffic stops instead of warming itself forever.
+    await this.ctx.storage.put("lastRealActivityAt", now);
   }
 
   /** Runtime status WITHOUT waking any replica: asleep when nothing has been active within the
@@ -761,8 +806,26 @@ export class GatewayPoolDO extends DurableObject<Env> {
     const cache = await this.ctx.storage.get<PoolCache>("cache");
     if (!cache) throw new Error("no cached snapshot");
     const gw = getSandbox(this.env.GATEWAY, replicaDoId(this.datalakeId, n), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
-    const { coldBooted } = await ensureGateway(gw, cache.bootEnv);
-    const applied = coldBooted ? 0 : rec.appliedVersion; // a cold container lost its loaded config
+
+    // Fold the cached snapshot into the boot env so a cold container arms ITSELF during boot
+    // (GW_BOOT_SNAPSHOT), turning the normal post-boot /ctrl/snapshot round-trip into a no-op.
+    // The version travels alongside so healthz can confirm exactly which policy got applied —
+    // we only trust the self-arm when the confirmed version covers the current one (fail-safe).
+    const bootEnv: Record<string, string> = { ...(cache.bootEnv ?? {}) };
+    const bootSnapB64 = b64(JSON.stringify({ snapshot: cache.snapshot, auth: cache.auth, lakeCatalog: cache.lakeCatalog ?? "memory" }));
+    // Guard the env-var size: an enormous policy could blow the process env limit and break the
+    // boot entirely. Past the cap, skip the fold and let doArm push via /ctrl/snapshot as before
+    // (correctness unchanged — only the round-trip optimization is forgone).
+    if (bootSnapB64.length <= 48_000) {
+      bootEnv.GW_BOOT_SNAPSHOT = bootSnapB64;
+      bootEnv.GW_BOOT_SNAPSHOT_VERSION = String(currentVersion);
+    }
+    const { coldBooted, waitedMs, health } = await ensureGateway(gw, bootEnv);
+    let applied = coldBooted ? 0 : rec.appliedVersion; // a cold container lost its loaded config
+    // Cold boot that self-armed the current (or newer) snapshot ⇒ already current, skip the push.
+    const bootArmedVersion = Number(health?.snapshotVersion ?? 0);
+    if (coldBooted && bootArmedVersion >= currentVersion) applied = currentVersion;
+    console.log(`[gateway:arm] datalake=${this.datalakeId} replica=${n} coldBooted=${coldBooted} waitedMs=${waitedMs} bootArmed=v${bootArmedVersion} current=v${currentVersion} pushSnapshot=${applied < currentVersion}`);
     if (applied < currentVersion) {
       const r = await gwFwd(gw, "/ctrl/snapshot", {
         method: "POST", headers: { "content-type": "application/json" },
@@ -875,6 +938,49 @@ export class GatewayPoolDO extends DurableObject<Env> {
     }));
     return { version: currentVersion, replicas: out };
   }
+
+  // ── keep-warm (Track 1) ────────────────────────────────────────────────────────
+  /** Called by the scheduled() cron. If this datalake has served a real query within the
+   *  active window, ping/arm replica 0 — which resets its sleepAfter timer (and cold-boots +
+   *  re-arms it if it had slept), so an actively-used datalake never cold-boots on the user
+   *  path. Past the window we let it sleep: we keep the HOT datalakes warm, not every one ever
+   *  configured. Self-gating + cheap (a storage read) when idle, so the cron can fan out wide. */
+  async keepWarm(datalakeId: string): Promise<{ warmed: boolean; reason?: string }> {
+    this.datalakeId = datalakeId;
+    const { currentVersion } = await this.meta();
+    if (currentVersion === 0) return { warmed: false, reason: "unconfigured" };
+    const lastReal = (await this.ctx.storage.get<number>("lastRealActivityAt")) ?? 0;
+    if (Date.now() - lastReal > KEEP_WARM_ACTIVE_WINDOW_MS) return { warmed: false, reason: "idle" };
+    try {
+      // force=true so doArm pings the container (resets sleepAfter) even on the warm hot-path;
+      // it still only re-pushes the snapshot when the replica actually cold-booted.
+      await this.armReplica(0, /*force*/ true);
+      return { warmed: true };
+    } catch (e) {
+      return { warmed: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  // ── keep-warm registry (lives on the WARM_REGISTRY_ID sentinel instance only) ────
+  // A flat id→lastSeen map of configured datalakes so the cron can enumerate what to warm.
+  // Pruned by TTL so it doesn't accumulate dead datalakes for the worker's lifetime.
+  /** Record that `datalakeId` was (re)configured now; prune stale entries. */
+  async registerDatalake(datalakeId: string): Promise<void> {
+    const reg = (await this.ctx.storage.get<Record<string, number>>("registry")) ?? {};
+    const now = Date.now();
+    reg[datalakeId] = now;
+    for (const [id, seen] of Object.entries(reg)) {
+      if (now - seen > WARM_REGISTRY_TTL_MS) delete reg[id];
+    }
+    await this.ctx.storage.put("registry", reg);
+  }
+
+  /** The datalake ids seen within the TTL — the cron's warm list. */
+  async listDatalakes(): Promise<string[]> {
+    const reg = (await this.ctx.storage.get<Record<string, number>>("registry")) ?? {};
+    const now = Date.now();
+    return Object.entries(reg).filter(([, seen]) => now - seen <= WARM_REGISTRY_TTL_MS).map(([id]) => id);
+  }
 }
 
 // ── presigned R2 (Model B; aws4fetch — from ws-probe) ──────────────────────────
@@ -934,15 +1040,17 @@ async function configureWorkspace(env: Env, args: ConfigureArgs): Promise<{ lake
     await ws.startProcess(WS_SIDECAR_CMD);
   }
 
-  const deadline = Date.now() + 90_000;
+  const startedAt = Date.now();
   let healthy = false, lastErr = "";
-  while (Date.now() < deadline) {
+  while (Date.now() - startedAt < 90_000) {
     try {
       const r = await ws.containerFetch("http://ws/health", { method: "GET" }, WS_SIDECAR_PORT);
       if (r.ok) { healthy = true; break; }
       lastErr = `health ${r.status}`;
     } catch (e) { lastErr = e instanceof Error ? e.message : String(e); }
-    await new Promise((res) => setTimeout(res, 1000));
+    // Fast early polls then back off (mirrors ensureGateway).
+    const elapsed = Date.now() - startedAt;
+    await new Promise((res) => setTimeout(res, elapsed < 3_000 ? 150 : 1_000));
   }
   if (!healthy) throw new Error(`workspace sidecar not healthy in 90s: ${lastErr}`);
 
@@ -1553,5 +1661,25 @@ export default {
     } catch (e) {
       return Response.json({ error: e instanceof Error ? e.message : String(e), stack: e instanceof Error ? e.stack : undefined }, { status: 500 });
     }
+  },
+
+  // ── keep-warm tick (Track 1) ─────────────────────────────────────────────────────
+  // Cron (wrangler triggers.crons). Enumerate the configured datalakes and ping the ones with
+  // recent real traffic so they never cold-boot on the user path. keepWarm self-gates on each
+  // datalake's own activity (idle ones are a cheap storage read, no container touch), so this
+  // warms only the HOT datalakes — the cost is bounded to actually-active compute. The cron
+  // interval is shorter than sleepAfter so an active datalake never falls through a gap.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const ids = await getWarmRegistry(env).listDatalakes().catch(() => [] as string[]);
+    let warmed = 0;
+    await Promise.all(ids.map(async (id) => {
+      try {
+        const r = await getPool(env, id).keepWarm(id);
+        if (r.warmed) warmed++;
+      } catch { /* a single datalake's warm failure must not abort the tick */ }
+    }));
+    console.log(`[gateway:keepwarm] tick: ${warmed}/${ids.length} datalakes warmed`);
+    // Nothing to defer past the tick, but keep the ctx in the signature for future async work.
+    void ctx;
   },
 };

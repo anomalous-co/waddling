@@ -147,16 +147,30 @@ async function bootstrapQuackboardSchema(connection: DuckDBConnection): Promise<
 
 /** Boot DuckDB, load birdshot, create the S3 secret, ATTACH the lake, serve quack. */
 export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntime> {
+  // Per-phase cold-boot instrumentation (Track 0): the two phases that dominate cold start are
+  // the lake ATTACH (a cold Postgres catalog can stall the retry loop for seconds) and quack_serve.
+  // Emit one line per phase so a single real boot trace tells us where the time actually goes —
+  // grep `[gateway:boot]` in the logs. Cheap (Date.now diffs); leave it on in production.
+  const tBoot = Date.now();
+  let tPhase = tBoot;
+  const mark = (phase: string): void => {
+    const now = Date.now();
+    console.log(`[gateway:boot] ${phase} +${now - tPhase}ms (total ${now - tBoot}ms)`);
+    tPhase = now;
+  };
+
   // A lake gateway opens ':memory:' (durable data lives in the ATTACHed lake); a quackboard
   // opens its durable .duckdb file directly, so quack serves the agent-coordination tables.
   const instance = await DuckDBInstance.create(config.databasePath, {
     allow_unsigned_extensions: "true",
   });
   const connection = await instance.connect();
+  mark("duckdb-create");
 
   // quack (HTTP catalog federation) + birdshot (ACL enforcement).
   await connection.run("INSTALL quack; LOAD quack");
   await connection.run(`LOAD ${q(config.birdshotExtensionPath)}`);
+  mark("load-quack-birdshot");
 
   // httpfs underlies quack's wire transport — needed for both lake and quackboard.
   await connection.run("INSTALL httpfs;");
@@ -182,9 +196,11 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
     // Create the shared coordination tables on the un-gated control connection, before the
     // birdshot hooks + quack_serve below. Idempotent — a no-op on a restored db.
     await bootstrapQuackboardSchema(connection);
+    mark("quackboard-schema");
   } else {
     // ducklake + postgres for the lake catalog/object store.
     await connection.run("INSTALL ducklake; INSTALL postgres;");
+    mark("install-ducklake-postgres");
   }
 
   // quack's wire transport rides HTTPFS, so cache + reuse the underlying HTTP(S)
@@ -242,6 +258,7 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   const useMetadataSchema = isPgCatalog && config.metadataSchema;
   if (useMetadataSchema) {
     await ensureCatalogSchema(connection, config.ducklakeCatalogDsn, config.metadataSchema);
+    mark("ensure-catalog-schema");
   }
 
   const opts: string[] = [`DATA_PATH ${q(config.ducklakeDataPath)}`];
@@ -255,6 +272,7 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
       try {
         await connection.run(attachSql);
         lastErr = undefined;
+        if (attempt > 1) console.log(`[gateway:boot] ATTACH ducklake succeeded on attempt ${attempt}`);
         break;
       } catch (err) {
         lastErr = err;
@@ -266,6 +284,9 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
     }
     if (lastErr) throw lastErr;
   }
+  // The single biggest cold-boot variable: a cold Postgres catalog can hold this for seconds
+  // across retries. The attempt count above pinpoints catalog-warmth cost in a boot trace.
+  mark("attach-ducklake");
 
   // Make the lake the default catalog on the control connection so this process's
   // own control/introspection ops (e.g. ducklakeSnapshot, ad-hoc admin queries)
@@ -283,6 +304,7 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   // memory.main is shared across the instance's connections, so quack's per-request
   // serving connections see these views. Restores on every (re)boot from the durable lake.
   await restoreLakeViews(connection, config.lakeAlias);
+  mark("restore-lake-views");
   } // end if (!config.quackboard) — quackboard skips the entire lake-mount section
 
   // Hand quack's auth/authz hooks to birdshot BEFORE the server starts listening.
@@ -299,6 +321,8 @@ export async function bootDuckRuntime(config: GatewayConfig): Promise<DuckRuntim
   await connection.run(
     `CALL quack_serve('quack:localhost:${config.quackPort}', token := ${q(config.serverToken)})`,
   );
+  mark("quack-serve");
+  console.log(`[gateway:boot] bootDuckRuntime ready in ${Date.now() - tBoot}ms`);
 
   const runtime: DuckRuntime = {
     connection,

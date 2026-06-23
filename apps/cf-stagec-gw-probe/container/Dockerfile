@@ -61,6 +61,17 @@ RUN node prebake-extensions.mjs
 COPY gateway/gateway-src/ ./gateway-src/
 COPY gateway/entrypoint.mjs ./entrypoint.mjs
 
+# ── pre-compile entrypoint + gateway-src to plain JS (cold-start optimization) ───
+# Boot was `node --import tsx entrypoint.mjs`, which transpiled the TypeScript gateway-src
+# (duck.ts) on EVERY cold start. Bundle it once here with esbuild into entrypoint.js, leaving
+# node_modules (the native @duckdb/node-api bindings) external, so the BOOT_CMD runs plain
+# `node entrypoint.js` with zero runtime transpilation. esbuild is installed transiently (not
+# saved, then removed) so it doesn't bloat the runtime image, and tsx is dropped from deps.
+RUN npm install --no-save --no-audit --no-fund esbuild \
+ && node_modules/.bin/esbuild entrypoint.mjs --bundle --platform=node --format=esm --packages=external --outfile=entrypoint.js \
+ && rm -rf node_modules/esbuild node_modules/@esbuild \
+ && test -s entrypoint.js
+
 ENV GW_STATE_DIR=/var/lib/waddling
 ENV QUACK_PORT=9500
 ENV FORWARDER_PORT=8080

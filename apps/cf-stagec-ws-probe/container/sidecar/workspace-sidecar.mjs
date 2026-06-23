@@ -93,6 +93,12 @@ let conn = null;
 let booted = false;
 let lakeAttached = false;
 
+// Lake quack ingress, retained from /init so /query can fall back to Form B
+// (quack_query) for multi-table reads the Form-A ATTACH+scan path cannot carry.
+let lakeProxy = null;
+let lakeToken = null;
+let lakeDisableSsl = false;
+
 // Presigned R2 PUT for THIS session's object, vended by the DO on /init. Held so
 // /snapshot and /shutdown can persist without another round-trip to mint one. The
 // DO refreshes it on each /init (presigned URLs are short-lived).
@@ -213,15 +219,19 @@ async function init(body) {
     booted = true;
   }
 
-  // (Re)attach the lake — DEFERRED in this probe (gateway infra-blocked). The code
-  // path exists so the contract is complete; the probe never sends lakeProxy/lakeToken.
+  // (Re)attach the lake. Form A — `ATTACH 'quack:…' AS lake; SELECT … FROM lake.t` —
+  // is the realistic single-table scan path. Retain the ingress so /query can fall back
+  // to Form B (quack_query) for cross-table reads Form A cannot carry (see /query).
   if (body.lakeProxy && body.lakeToken) {
+    lakeProxy = body.lakeProxy;
+    lakeToken = body.lakeToken;
+    lakeDisableSsl = !!body.disableSsl;
     if (lakeAttached) {
       try { await conn.run("DETACH lake"); } catch { /* not attached */ }
       lakeAttached = false;
     }
     await conn.run(
-      `ATTACH 'quack:${body.lakeProxy}' AS lake (TOKEN ${q(body.lakeToken)}, DISABLE_SSL ${body.disableSsl ? "true" : "false"})`,
+      `ATTACH 'quack:${body.lakeProxy}' AS lake (TOKEN ${q(body.lakeToken)}, DISABLE_SSL ${lakeDisableSsl ? "true" : "false"})`,
     );
     lakeAttached = true;
   }
@@ -255,6 +265,32 @@ async function persist() {
   }
 }
 
+/** Run a read, shaping the reader into JSON-safe { columns, rows, rowCount }. */
+async function runReader(sql) {
+  const reader = await conn.runAndReadAll(sql);
+  const columns = reader.columnNames();
+  const objs = reader.getRowObjects();
+  const rows = objs.map((o) => columns.map((cn) => normalize(o[cn])));
+  return { columns, rows, rowCount: rows.length };
+}
+
+// Strip the lake ATTACH-alias catalog qualifier from 3-part refs so Form-B SQL runs
+// against the gateway's served `memory.main.<t>` views — the SAME bind-walk birdshot
+// already authorizes for single-table Form-A reads (`lake.main.t` → server memory.main.t
+// view → birdshot sees the expanded `lake.main.t`). Only rewrites `lake.<schema>.<table>`
+// → `<schema>.<table>`; leaves 2-part refs and lake-as-a-word elsewhere untouched.
+const stripLakeCatalog = (sql) =>
+  sql.replace(/\blake\s*\.\s*(?=("?[A-Za-z_]\w*"?)\s*\.\s*("?[A-Za-z_]\w*"?))/gi, "");
+
+// Form B: ship the WHOLE statement to the gateway to run server-side (where the lake is
+// attached and birdshot authorizes the exact SQL), streaming ONE result set back. This is
+// the only path that carries a JOIN / cross-table / correlated subquery — Form A's
+// ATTACH+scan opens one streaming cursor per table and quack rejects a second
+// ("Multiple streaming scans … not currently supported") BEFORE birdshot runs.
+const formB = (sql) =>
+  `FROM quack_query('quack:${lakeProxy}', ${q(stripLakeCatalog(sql))}, ` +
+  `token => ${q(lakeToken)}, disable_ssl => ${lakeDisableSsl ? "true" : "false"})`;
+
 const server = createServer((req, res) => {
   void (async () => {
     const url = (req.url ?? "/").split("?")[0];
@@ -277,12 +313,24 @@ const server = createServer((req, res) => {
         return sendJson(res, 200, { ok: true, queueDepth });
       }
       if (url === "/query") {
+        const sql = String(body.sql);
         const out = await enqueue(async () => {
-          const reader = await conn.runAndReadAll(String(body.sql));
-          const columns = reader.columnNames();
-          const objs = reader.getRowObjects();
-          const rows = objs.map((o) => columns.map((cn) => normalize(o[cn])));
-          return { columns, rows, rowCount: rows.length };
+          try {
+            // Form A: run on the workspace connection (single-table lake scans, and
+            // pure private-scratch reads, stay entirely here — behavior unchanged).
+            return await runReader(sql);
+          } catch (e) {
+            // Only multi-table lake reads reach here: Form A can't carry them (quack
+            // throws "Multiple streaming scans" before birdshot runs). Retry the SAME
+            // statement via Form B so it runs server-side and joins work. Scoped to the
+            // already-failed set, and only when a lake is attached — so single-table and
+            // workspace-scratch queries never change paths. A statement that also touches
+            // private workspace tables can't go server-side and surfaces its own error.
+            if (lakeProxy && lakeToken && /streaming scan/i.test(String(e?.message ?? e))) {
+              return await runReader(formB(sql));
+            }
+            throw e;
+          }
         });
         return sendJson(res, 200, { ...out, queueDepth, peakDepth });
       }

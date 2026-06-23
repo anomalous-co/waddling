@@ -31,11 +31,11 @@ import { getSpec } from './registry';
 import { CursorStore } from './cursor';
 import { runStarBuild } from './lib/governed-load';
 
-// The settle sleep must be ≥ the sink's roll-interval (README provisions the
-// sink with --roll-interval 300), or governed-load reads staging before any
-// Parquet has rolled → an empty fact. Margin covers sink scheduling jitter.
-// Keep this in lockstep with the README's roll-interval.
-const SINK_ROLL_INTERVAL_SECONDS = 300;
+// The settle sleep must be ≥ the sink's roll-interval (the sink is provisioned
+// with --roll-interval 120 for the 15-minute cadence), or governed-load reads
+// staging before any Parquet has rolled → an empty fact. Margin covers sink
+// scheduling jitter. Keep this in lockstep with the sink's roll-interval.
+const SINK_ROLL_INTERVAL_SECONDS = 120;
 const SETTLE_MARGIN_SECONDS = 60;
 
 // Pipelines: max 1 MB / send; chunk conservatively by record count.

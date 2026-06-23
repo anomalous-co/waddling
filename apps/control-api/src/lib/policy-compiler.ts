@@ -358,12 +358,24 @@ export function compilePolicy(
     const role = ensureRole(r.agent_id);
     if (PARSE_AUTHORIZED_CATALOG.has(cap)) rolesWithParseAuthorized.add(role);
 
-    const grantKey = `${role} ${tableRef(r)} ${cap}`;
+    // A fully-wildcard DDL grant (create/drop/alter/detach on `*.*`) means "any
+    // object". birdshot's RefMatch treats a bare `*` as match-everything, but `*.*`
+    // falls into the `.*`-prefix branch and matches NOTHING (no real ref starts with
+    // the literal "*."), so such grants silently authorized nothing — which is why an
+    // agent with `create:*.*` still couldn't CREATE a new table. Emit `*` so the grant
+    // means what it says. SCOPED to parse-authorized DDL caps: read/write keep their
+    // catalog expansion (and stay fail-closed as literal `*.*` when the catalog is
+    // unknown) — they are NEVER broadened to `*`, since that would expose row data.
+    const ref =
+      PARSE_AUTHORIZED_CATALOG.has(cap) && r.schema_name === '*' && r.table_name === '*'
+        ? '*'
+        : tableRef(r);
+    const grantKey = `${role} ${ref} ${cap}`;
     if (!seenGrant.has(grantKey)) {
       seenGrant.add(grantKey);
       roleGrants.push({
         role,
-        tableRef: tableRef(r),
+        tableRef: ref,
         action: cap as BirdshotCatalogCapability,
       });
     }

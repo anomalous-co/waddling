@@ -40,8 +40,13 @@ export const REGISTRY: PipelineSpec[] = [
     streamBinding: 'FUNNEL_STREAM',
     // The Stream's sink writes Parquet under this prefix, INSIDE the lake bucket
     // so the gateway's lake S3 secret already covers the read_parquet egress.
-    stagingGlob: 's3://waddling-lake/org-<ID>/_ingest/funnel/**/*.parquet',
-    datalakeId: '<DATALAKE_ID>',
+    // Anomalous Context Lake's per-org R2 bucket (anom-context-lake). The sink
+    // writes under the <datalakeId>/ prefix so the gateway's lake read-credential
+    // covers it whether that cred is whole-bucket (BYO) or faucet-scoped to
+    // <datalakeId>/ (managed-postgres). ** recurses through the sink's
+    // year=/month=/day= time-partition dirs.
+    stagingGlob: 's3://anom-context-lake/0d4ae298-2039-46a8-9473-c5f41d1620af/_ingest/funnel/**/*.parquet',
+    datalakeId: '0d4ae298-2039-46a8-9473-c5f41d1620af',
     agentKeySecret: 'FUNNEL_AGENT_KEY',
     targetModel: funnelStar,
     schedule: '0 * * * *',
