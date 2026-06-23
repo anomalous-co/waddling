@@ -1,8 +1,10 @@
 /**
  * PostHog provider setup for Next.js App Router (Stream C — FUNNEL).
  *
- * @posthog/next v0.4.x ships PostHogProvider as a React Server Component and
- * PostHogPageView as a 'use client' component — they must live in separate files.
+ * @posthog/next v0.5.x ships PostHogProvider as an async React Server Component
+ * and PostHogPageView as a 'use client' component — they must live in separate
+ * files. When `bootstrapFlags` is enabled, the provider reads cookies() for
+ * server-side flag evaluation, switching the route to dynamic rendering.
  *
  * PostHogSetup is a SERVER component (no 'use client' directive):
  *   - wraps @posthog/next's PostHogProvider so the SDK is initialised server-side

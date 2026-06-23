@@ -287,10 +287,9 @@ posthog.optIn()   // resumes tracking
 
 | Package | Version | Use |
 |---------|---------|-----|
-| `posthog-js` | ^1.156.0 | Browser capture + Next.js integration |
-| `@posthog/next` | ^1.11.0 | Next.js App Router setup, `PostHogProvider` |
-| `posthog-node` | ^3.4.0 | Server-side & CLI capture (CommonJS/ESM) |
-| `@posthog/nextjs-config` | ^1.2.0 | Optional: sourcemap uploads |
+| `posthog-js` | ^1.393.0 | Browser capture + Next.js integration |
+| `@posthog/next` | ^0.5.0 | Next.js App Router setup, `PostHogProvider` |
+| `posthog-node` | ^5.38.3 | Server-side & CLI capture (CommonJS/ESM) |
 
 **Install:**
 ```bash

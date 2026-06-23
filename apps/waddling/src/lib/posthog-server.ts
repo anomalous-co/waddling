@@ -1,7 +1,7 @@
 /**
  * Canonical server-side PostHog singleton (Stream C — FUNNEL).
  *
- * Rules:
+ * Uses posthog-node v5.x. Rules:
  *  - Returns a NOOP client when POSTHOG_KEY (or NEXT_PUBLIC_POSTHOG_KEY fallback)
  *    is absent — never constructs PostHog with an empty/placeholder key.
  *  - Returns a NOOP client when WADDLING_TELEMETRY=0.
