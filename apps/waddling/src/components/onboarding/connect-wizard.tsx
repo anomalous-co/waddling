@@ -323,7 +323,7 @@ export function ConnectWizard() {
     router.push('/dashboard');
   }, [router]);
 
-  const demoQuery = status?.demoQuery ?? 'SELECT * FROM lake.demo.events LIMIT 5';
+  const demoQuery = status?.demoQuery ?? 'SELECT * FROM lake.main.events LIMIT 5';
 
   const body = useMemo(() => {
     if (loadError && !status) {

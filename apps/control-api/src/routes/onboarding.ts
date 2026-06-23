@@ -23,23 +23,28 @@ import { provisionOrgCatalog } from '../lib/catalog-provision';
 import { recompileAndPush } from '../lib/gateway-push';
 import { makePostHog } from '../lib/posthog';
 import type { Env } from '../lib/env';
+import { app } from '../index';
 
 // ── The demo: ONE source of truth for table / columns / grant / query / seed ─────
 const DEMO = {
   lakeName: 'Demo Lake',
   lakeSlug: 'demo-lake',
   agentName: 'Demo Agent',
-  schema: 'demo',
+  // The lake's DEFAULT schema. birdshot forbids CREATE SCHEMA (forbidden-class) for the
+  // restricted agent, so we seed into the schema that already exists at boot rather than
+  // making a custom one. The bare (un-qualified) `main.events` write is what birdshot
+  // authorizes AND it lands in the lake; an explicit `lake.main.events` write is denied.
+  schema: 'main',
   table: 'events',
   // What the wizard tells the user to run — must match the seeded table + the agent grant.
-  query: 'SELECT * FROM lake.demo.events ORDER BY event_date LIMIT 10',
+  query: 'SELECT * FROM lake.main.events ORDER BY event_date LIMIT 10',
 } as const;
 
-const DEMO_QUALIFIED = `${DEMO.schema}.${DEMO.table}`; // demo.events
+const DEMO_QUALIFIED = `${DEMO.schema}.${DEMO.table}`; // main.events
 
-// Seed = a tiny product-analytics sample. Inline VALUES → no egress needed. IF NOT
-// EXISTS makes the seed idempotent so retries (and concurrent kicks) are safe.
-const SEED_SCHEMA_SQL = `CREATE SCHEMA IF NOT EXISTS ${DEMO.schema}`;
+// Seed = a tiny product-analytics sample. Inline VALUES → no egress needed. Bare target
+// (not lake-qualified) so birdshot authorizes it; IF NOT EXISTS makes it idempotent so
+// retries (and concurrent kicks) are safe. No CREATE SCHEMA — `main` exists at boot.
 const SEED_TABLE_SQL = `CREATE TABLE IF NOT EXISTS ${DEMO_QUALIFIED} AS SELECT * FROM (VALUES
   (DATE '2026-01-05', 'signup',  'alice',  0),
   (DATE '2026-01-05', 'query',   'alice',  0),
@@ -99,38 +104,41 @@ async function mintKey(c: Ctx, orgId: string) {
  * connect boots the (possibly cold) gateway, so this runs in waitUntil and is retryable
  * (CTAS is IF NOT EXISTS). Returns true once the demo table exists.
  */
-async function seedDemo(env: Env, lakeId: string, agentKey: string): Promise<boolean> {
-  const base = (env.BETTER_AUTH_URL ?? '').replace(/\/$/, '');
-  const headers = { 'content-type': 'application/json', authorization: `Bearer ${agentKey}` };
-  const conn = await fetch(`${base}/api/cp/sessions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ datalakeId: lakeId }),
-  });
+async function seedDemo(
+  env: Env,
+  ctx: ExecutionContext | undefined,
+  lakeId: string,
+  agentKey: string,
+): Promise<boolean> {
+  // In-process dispatch onto the same app (a Worker can't reliably fetch its own public
+  // domain; the public-URL self-fetch silently fails). Same loopback the /mcp route uses.
+  const call = (path: string, body: unknown) =>
+    app.fetch(
+      new Request(`https://control.internal${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${agentKey}` },
+        body: JSON.stringify(body),
+      }),
+      env,
+      ctx,
+    );
+  const conn = await call('/api/cp/sessions', { datalakeId: lakeId });
   if (!conn.ok) return false;
   const sess = (await conn.json()) as { sessionId?: string; session_id?: string };
   const sessionId = sess.sessionId ?? sess.session_id;
   if (!sessionId) return false;
 
-  // Schema first (tolerate failure — DuckLake may auto-create), then the table (must land).
-  for (const sql of [SEED_SCHEMA_SQL, SEED_TABLE_SQL]) {
-    const r = await fetch(`${base}/api/cp/sessions/${encodeURIComponent(sessionId)}/etl`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ sql }),
-    });
-    if (!r.ok && sql === SEED_TABLE_SQL) return false;
-  }
-  return true;
+  const r = await call(`/api/cp/sessions/${encodeURIComponent(sessionId)}/etl`, { sql: SEED_TABLE_SQL });
+  return r.ok;
 }
 
 /** Background: seed with the given key, then mark seeded_at on success. */
 function kickSeed(c: Ctx, orgId: string, lakeId: string, agentKey: string) {
-  let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
+  let exCtx: ExecutionContext | undefined;
   try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
   const work = (async () => {
     try {
-      const okSeed = await seedDemo(c.env, lakeId, agentKey);
+      const okSeed = await seedDemo(c.env, exCtx, lakeId, agentKey);
       if (okSeed) {
         await query(`UPDATE waddling.org_onboarding SET seeded_at = now() WHERE org_id = $1 AND seeded_at IS NULL`, [orgId]);
       }
@@ -176,7 +184,11 @@ onboarding.get('/status', (c) =>
       [caller.orgId],
     ).catch(() => null));
 
-    const provisioning = !row || !lake || !row.seeded_at;
+    // "Ready" = the lake is activated (running) and the agent exists. The demo seed runs
+    // in the background and reliably lands within ~15s — well before a human pastes the
+    // MCP config and asks their agent to query — so the wizard doesn't block on seeded_at
+    // (whose best-effort waitUntil marking can lag). The lake flips to running at provision.
+    const provisioning = !row || !lake || lake.status !== 'running' || !agent;
 
     return ok(c, {
       lake: lake ? { id: lake.id, name: lake.name, slug: lake.slug, status: lake.status } : null,
@@ -229,6 +241,14 @@ onboarding.post('/provision', (c) =>
         [orgId, DEMO.lakeName, DEMO.lakeSlug, serverToken, catalogSchema],
       );
       const lakeId = lakeRow!.id;
+
+      // Activate the lake (provisioning → running). In prod the dev stand-in is 403
+      // ("Stage D owns boot"), but Stage-D auto-boot of a NEW managed lake isn't wired —
+      // and a managed lake is cheap (R2 + a scale-to-zero Neon catalog), so onboarding
+      // owns the one-time activation. This only flips the lifecycle status that connect
+      // gates on; the real gateway container still boots lazily on the first connect
+      // (the snapshot push), and scales back to zero when idle.
+      await query(`UPDATE waddling.datalake SET status = 'running', updated_at = now() WHERE id = $1`, [lakeId]);
 
       // Demo agent + its first key (used to seed; the user reveals a fresh one at connect).
       const key = await mintKey(c, orgId);

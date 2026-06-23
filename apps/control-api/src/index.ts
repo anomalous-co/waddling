@@ -642,4 +642,9 @@ async function scheduled(
   });
 }
 
+// Exported for in-process loopback (onboarding seed dispatches /sessions+/etl on the same
+// app — a Worker can't reliably fetch its own public domain). Runtime-only use keeps the
+// circular import (index ⇄ routes/onboarding) safe.
+export { app };
+
 export default { fetch: app.fetch, scheduled };
