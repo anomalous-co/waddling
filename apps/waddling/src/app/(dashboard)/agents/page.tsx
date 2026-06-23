@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
-import { Plus, RefreshCw, Copy, Check, TriangleAlert } from 'lucide-react';
+import { Plus, RefreshCw, Copy, Check, TriangleAlert, Ellipsis } from 'lucide-react';
 import {
   Card,
   CardHeader,
@@ -52,7 +52,14 @@ import {
 } from '@/components/ui/field';
 import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp, cpPost } from '@/components/dashboard/fetch';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { ScopePicker, type GrantRow } from '@/components/dashboard/scope-picker';
+import { AgentAccess } from '@/components/dashboard/agent-access';
 import { toast } from 'sonner';
 import type { AgentSummary } from '@/lib/types';
 
@@ -306,6 +313,7 @@ export default function AgentsPage() {
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [revealKey, setRevealKey] = useState<{ name: string; key: string } | null>(null);
+  const [editAccessAgent, setEditAccessAgent] = useState<AgentSummary | null>(null);
 
   const load = useCallback(async () => {
     const [agentsRes, lakesRes] = await Promise.all([
@@ -402,6 +410,7 @@ export default function AgentsPage() {
                     <TableHead>Mode</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead>Last seen</TableHead>
+                    <TableHead className="w-10" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -409,7 +418,7 @@ export default function AgentsPage() {
                     <TableRow key={a.id}>
                       <TableCell>
                         <Link
-                          href={`/dashboard/agents/${a.id}`}
+                          href={`/agents/${a.id}`}
                           className="text-primary hover:underline"
                         >
                           {a.name}
@@ -426,6 +435,20 @@ export default function AgentsPage() {
                       </TableCell>
                       <TableCell className="text-sm text-muted-foreground">
                         {a.lastSeenAt ? relativeTime(a.lastSeenAt) : '—'}
+                      </TableCell>
+                      <TableCell>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button variant="ghost" size="icon-sm" className="size-7">
+                              <Ellipsis className="size-3.5" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onClick={() => setEditAccessAgent(a)}>
+                              Edit access
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -453,6 +476,24 @@ export default function AgentsPage() {
           apiKey={revealKey.key}
         />
       ) : null}
+
+      <Dialog
+        open={!!editAccessAgent}
+        onOpenChange={(open) => {
+          if (!open) setEditAccessAgent(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>
+              Edit access &mdash; {editAccessAgent?.name}
+            </DialogTitle>
+          </DialogHeader>
+          {editAccessAgent ? (
+            <AgentAccess agentId={editAccessAgent.id} />
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

@@ -7,5 +7,5 @@ export default async function EndpointDetailRedirect({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  redirect(`/dashboard/datalakes/${id}`);
+  redirect(`/datalakes/${id}`);
 }

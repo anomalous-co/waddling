@@ -324,8 +324,8 @@ export function BillingTab() {
     const res = (await authClient.subscription.upgrade({
       plan: 'pro',
       referenceId: orgId,
-      successUrl: `${origin}/dashboard/settings?tab=billing`,
-      cancelUrl: `${origin}/dashboard/settings?tab=billing`,
+      successUrl: `${origin}/settings?tab=billing`,
+      cancelUrl: `${origin}/settings?tab=billing`,
     })) as unknown as { data?: { url?: string }; error?: { message?: string } };
     if (res?.error) {
       toast.error(res.error.message ?? 'Could not start checkout');
@@ -338,7 +338,7 @@ export function BillingTab() {
     setBusy(true);
     const res = await cpPost<{ url: string }>('/api/cp/billing/credit-pack', {
       packId,
-      returnPath: '/dashboard/settings?tab=billing',
+      returnPath: '/settings?tab=billing',
     });
     setBusy(false);
     if (!res.ok) {

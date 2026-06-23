@@ -135,7 +135,7 @@ export default function AgentDetailPage() {
     if (res.ok) {
       toast.success(`Agent "${agent.name}" revoked`);
       setRevokeOpen(false);
-      router.push('/dashboard/agents');
+      router.push('/agents');
     } else {
       toast.error(`Failed to revoke agent: ${res.error}`);
     }

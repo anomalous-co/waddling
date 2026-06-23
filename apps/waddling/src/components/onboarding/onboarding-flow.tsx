@@ -103,7 +103,7 @@ export function OnboardingFlow({
     const statusRes = await fetchCp<{ paid: boolean }>('/api/cp/billing/status');
     setLoading(false);
     if (statusRes.ok && statusRes.data.paid) {
-      router.replace('/dashboard/onboarding');
+      router.replace('/onboarding/connect');
       return;
     }
     setStep('choose');
@@ -170,7 +170,7 @@ export function OnboardingFlow({
       attempts += 1;
       if (await checkPaid()) {
         // Paid → straight into the guided connect wizard (the "aha" flow), not a bare dashboard.
-        router.replace('/dashboard/onboarding');
+        router.replace('/onboarding/connect');
         return;
       }
       if (attempts >= 15) {

@@ -121,7 +121,7 @@ export default function NewDatalakePage() {
       return;
     }
     toast.success('Data lake created');
-    router.push(`/dashboard/datalakes/${res.data.datalakeId}`);
+    router.push(`/datalakes/${res.data.datalakeId}`);
   }
 
   return (
@@ -140,7 +140,7 @@ export default function NewDatalakePage() {
           <AlertDescription className="flex flex-col items-start gap-3">
             {quotaError}
             <Button asChild variant="outline" size="sm">
-              <Link href="/dashboard/billing">
+              <Link href="/billing">
                 <CreditCard data-icon="inline-start" />
                 View billing
               </Link>
@@ -350,7 +350,7 @@ export default function NewDatalakePage() {
 
         <div className="flex items-center justify-end gap-2">
           <Button asChild variant="outline">
-            <Link href="/dashboard/datalakes">Cancel</Link>
+            <Link href="/datalakes">Cancel</Link>
           </Button>
           <Button type="submit" disabled={!canSubmit || submitting}>
             {submitting ? <Loader2 data-icon="inline-start" className="animate-spin" /> : null}

@@ -301,7 +301,7 @@ export default function SessionsPage() {
                         </TableCell>
                         <TableCell>
                           <Link
-                            href={`/dashboard/agents/${s.agentId}`}
+                            href={`/agents/${s.agentId}`}
                             className="text-primary hover:underline"
                           >
                             {agent?.name ?? `${s.agentId.slice(0, 8)}…`}
@@ -310,7 +310,7 @@ export default function SessionsPage() {
                         <TableCell>
                           {datalake ? (
                             <Link
-                              href={`/dashboard/datalakes/${s.datalakeId}`}
+                              href={`/datalakes/${s.datalakeId}`}
                               className="text-primary hover:underline"
                             >
                               {datalake.name}

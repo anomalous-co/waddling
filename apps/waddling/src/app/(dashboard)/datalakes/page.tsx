@@ -110,7 +110,7 @@ export default function DatalakesPage() {
           </p>
         </div>
         <Button asChild>
-          <Link href="/dashboard/datalakes/new">
+          <Link href="/datalakes/new">
             <Plus data-icon="inline-start" />
             New data lake
           </Link>
@@ -136,7 +136,7 @@ export default function DatalakesPage() {
                 </EmptyDescription>
               </EmptyHeader>
               <Button asChild>
-                <Link href="/dashboard/datalakes/new">
+                <Link href="/datalakes/new">
                   <Plus data-icon="inline-start" />
                   Create your first data lake
                 </Link>
@@ -156,7 +156,7 @@ export default function DatalakesPage() {
                   <TableRow key={dl.id}>
                     <TableCell>
                       <Link
-                        href={`/dashboard/datalakes/${dl.id}`}
+                        href={`/datalakes/${dl.id}`}
                         className="text-primary hover:underline"
                       >
                         {dl.name}

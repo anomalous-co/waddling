@@ -811,7 +811,7 @@ export function SettingsContent() {
 
         <Tabs
           value={activeTab}
-          onValueChange={(v) => router.replace(`/dashboard/settings?tab=${v}`)}
+          onValueChange={(v) => router.replace(`/settings?tab=${v}`)}
         >
           <TabsList>
             <TabsTrigger value="account">Account</TabsTrigger>

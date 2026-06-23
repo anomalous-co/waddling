@@ -104,25 +104,25 @@ const NAV_GROUPS = [
     label: 'Platform',
     items: [
       { href: '/dashboard', label: 'Overview', icon: LayoutDashboard },
-      { href: '/dashboard/datalakes', label: 'Data Lakes', icon: DataLakeIcon },
-      { href: '/dashboard/agents', label: 'Agents', icon: Bot },
-      { href: '/dashboard/connected', label: 'Connected', icon: Link2 },
-      { href: '/dashboard/acl', label: 'Access', icon: ShieldCheck },
+      { href: '/datalakes', label: 'Data Lakes', icon: DataLakeIcon },
+      { href: '/agents', label: 'Agents', icon: Bot },
+      { href: '/connected', label: 'Connected', icon: Link2 },
+      { href: '/acl', label: 'Access', icon: ShieldCheck },
     ],
   },
   {
     label: 'Operations',
     items: [
-      { href: '/dashboard/sessions', label: 'Sessions', icon: Radio },
-      { href: '/dashboard/audit', label: 'Audit', icon: ScrollText },
-      { href: '/dashboard/usage', label: 'Usage', icon: BarChart3 },
+      { href: '/sessions', label: 'Sessions', icon: Radio },
+      { href: '/audit', label: 'Audit', icon: ScrollText },
+      { href: '/usage', label: 'Usage', icon: BarChart3 },
     ],
   },
   {
     label: 'Workspace',
     items: [
-      { href: '/dashboard/notebooks', label: 'Notebooks', icon: NotebookText },
-      { href: '/dashboard/views', label: 'Views', icon: Table2 },
+      { href: '/notebooks', label: 'Notebooks', icon: NotebookText },
+      { href: '/views', label: 'Views', icon: Table2 },
     ],
   },
 ] as const;
@@ -222,7 +222,7 @@ function UserMenu({
             <DropdownMenuSeparator />
             <DropdownMenuGroup>
               <DropdownMenuItem asChild>
-                <Link href="/dashboard/settings?tab=account">
+                <Link href="/settings?tab=account">
                   <User data-icon="inline-start" />
                   Account
                 </Link>
@@ -247,13 +247,13 @@ function UserMenu({
                   ))}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem asChild>
-                    <Link href="/dashboard/settings?tab=organization">
+                    <Link href="/settings?tab=organization">
                       <Settings data-icon="inline-start" />
                       Organization settings
                     </Link>
                   </DropdownMenuItem>
                   <DropdownMenuItem asChild>
-                    <Link href="/dashboard/settings?tab=organization&create=org">
+                    <Link href="/settings?tab=organization&create=org">
                       <Plus data-icon="inline-start" />
                       Create organization
                     </Link>
@@ -261,7 +261,7 @@ function UserMenu({
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
               <DropdownMenuItem asChild>
-                <Link href="/dashboard/settings?tab=billing">
+                <Link href="/settings?tab=billing">
                   <CreditCard data-icon="inline-start" />
                   Billing
                 </Link>
@@ -382,7 +382,7 @@ function DatalakeSwitcher() {
           {datalakes.map((dl) => (
             <DropdownMenuItem
               key={dl.id}
-              onClick={() => router.push(`/dashboard/datalakes/${dl.id}`)}
+              onClick={() => router.push(`/datalakes/${dl.id}`)}
             >
               <span
                 className={cn(
@@ -399,7 +399,7 @@ function DatalakeSwitcher() {
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuItem asChild>
-          <Link href="/dashboard/datalakes/new">
+          <Link href="/datalakes/new">
             <Plus data-icon="inline-start" />
             New data lake
           </Link>
@@ -467,7 +467,7 @@ export function DashboardShell({
             <div className="flex shrink-0 items-center gap-1.5">
               <DatalakeSwitcher />
               <Button asChild size="sm">
-                <Link href="/dashboard/onboarding">
+                <Link href="/onboarding/connect">
                   <Plug data-icon="inline-start" />
                   <span className="hidden sm:inline">Connect</span>
                 </Link>

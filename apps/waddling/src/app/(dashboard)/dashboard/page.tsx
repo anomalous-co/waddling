@@ -310,7 +310,7 @@ export default function OverviewPage() {
                       </TableCell>
                       <TableCell>
                         <Link
-                          href={`/dashboard/agents/${s.agentId}`}
+                          href={`/agents/${s.agentId}`}
                           className="text-primary hover:underline"
                         >
                           {agent?.name ?? `${s.agentId.slice(0, 8)}…`}
@@ -319,7 +319,7 @@ export default function OverviewPage() {
                       <TableCell>
                         {datalake ? (
                           <Link
-                            href={`/dashboard/datalakes/${s.datalakeId}`}
+                            href={`/datalakes/${s.datalakeId}`}
                             className="text-primary hover:underline"
                           >
                             {datalake.name}
@@ -377,7 +377,7 @@ export default function OverviewPage() {
                   <TableRow key={dl.id}>
                     <TableCell>
                       <Link
-                        href={`/dashboard/datalakes/${dl.id}`}
+                        href={`/datalakes/${dl.id}`}
                         className="text-primary hover:underline"
                       >
                         {dl.name}

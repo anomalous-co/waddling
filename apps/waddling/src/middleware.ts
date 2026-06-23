@@ -18,13 +18,25 @@ import { NextResponse, type NextRequest } from 'next/server';
 const SITE_HOST = 'getwaddling.com';
 const APP_HOST = 'app.getwaddling.com';
 
-// Path prefixes that belong to the APP host. Everything else is marketing.
-// `/oauth` is the OAuth/MCP consent screen — it must stay on the app host (where the
-// session cookie + sign-in live), never bounce to marketing.
-const APP_PREFIXES = ['/dashboard', '/sign-in', '/sign-up', '/link', '/oauth'];
+// MARKETING owns a small, stable set of public paths; EVERYTHING ELSE is the app.
+// We allowlist marketing (not the app) because the product surface is large and grows
+// often (every dashboard section now lives at its own top-level path, e.g. /agents,
+// /acl, /datalakes, /settings) — enumerating app paths would silently bounce any new
+// section to marketing. Marketing routes are the (marketing) group + /docs + /duck-lab;
+// the apex `/` is the marketing landing.
+const MARKETING_PREFIXES = [
+  '/blog',
+  '/customers',
+  '/enterprise',
+  '/memory',
+  '/pricing',
+  '/docs',
+  '/duck-lab',
+];
 
-function isAppPath(pathname: string): boolean {
-  return APP_PREFIXES.some((p) => pathname === p || pathname.startsWith(`${p}/`));
+function isMarketingPath(pathname: string): boolean {
+  if (pathname === '/') return true; // apex landing
+  return MARKETING_PREFIXES.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 }
 
 export function middleware(req: NextRequest): NextResponse {
@@ -32,19 +44,25 @@ export function middleware(req: NextRequest): NextResponse {
   // (localhost, *.workers.dev preview) passes through untouched — single origin.
   const host = (req.headers.get('host') ?? '').split(':')[0].toLowerCase();
   const { pathname, search } = req.nextUrl;
-  const appPath = isAppPath(pathname);
+  const marketing = isMarketingPath(pathname);
 
-  if (host === SITE_HOST && appPath) {
-    return NextResponse.redirect(`https://${APP_HOST}${pathname}${search}`, 307);
-  }
-
-  if (host === APP_HOST && !appPath) {
+  if (host === APP_HOST) {
     // The app host's root is not a real page — send it into the product. /dashboard
-    // SSR-gates to /sign-in when unauthenticated.
+    // SSR-gates to /sign-in when unauthenticated. This MUST precede the marketing
+    // bounce: `/` is a marketing path, but on the app host we want the dashboard.
     if (pathname === '/') {
       return NextResponse.redirect(`https://${APP_HOST}/dashboard`, 307);
     }
-    return NextResponse.redirect(`https://${SITE_HOST}${pathname}${search}`, 307);
+    // A genuine marketing path requested on the app host → send it to marketing.
+    if (marketing) {
+      return NextResponse.redirect(`https://${SITE_HOST}${pathname}${search}`, 307);
+    }
+    return NextResponse.next();
+  }
+
+  if (host === SITE_HOST && !marketing) {
+    // A non-marketing (i.e. app) path on the marketing host → send it to the app.
+    return NextResponse.redirect(`https://${APP_HOST}${pathname}${search}`, 307);
   }
 
   return NextResponse.next();

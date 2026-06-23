@@ -183,7 +183,7 @@ function UpgradeAlert() {
         Dynamic ACL rules require the Pro plan. Free tier supports static
         reader/writer roles only.
         <Button asChild size="sm" variant="outline">
-          <Link href="/dashboard/billing">Upgrade to Pro</Link>
+          <Link href="/billing">Upgrade to Pro</Link>
         </Button>
       </AlertDescription>
     </Alert>
@@ -689,7 +689,7 @@ export default function AclPage() {
                       <TableCell className="font-mono text-xs">
                         {dl ? (
                           <Link
-                            href={`/dashboard/datalakes/${r.datalakeId}`}
+                            href={`/datalakes/${r.datalakeId}`}
                             className="text-primary hover:underline"
                           >
                             {dl.name}
@@ -712,7 +712,7 @@ export default function AclPage() {
                         ) : r.agentId ? (
                           ag ? (
                             <Link
-                              href={`/dashboard/agents/${r.agentId}`}
+                              href={`/agents/${r.agentId}`}
                               className="font-mono text-primary hover:underline"
                             >
                               {ag.name}

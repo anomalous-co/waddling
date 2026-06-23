@@ -158,7 +158,7 @@ export default function SessionDetailPage({
           </InfoRow>
           <InfoRow label="Source agent">
             <Link
-              href={`/dashboard/agents/${session.agentId}`}
+              href={`/agents/${session.agentId}`}
               className="text-primary hover:underline"
             >
               {session.agentName ?? `${session.agentId.slice(0, 8)}…`}
@@ -177,7 +177,7 @@ export default function SessionDetailPage({
           ) : null}
           <InfoRow label="Data Lake">
             <Link
-              href={`/dashboard/datalakes/${session.datalakeId}`}
+              href={`/datalakes/${session.datalakeId}`}
               className="text-primary hover:underline"
             >
               {session.endpointName ?? `${session.datalakeId.slice(0, 8)}…`}

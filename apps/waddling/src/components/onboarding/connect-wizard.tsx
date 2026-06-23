@@ -255,8 +255,10 @@ export function ConnectWizard() {
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [keyBusy, setKeyBusy] = useState(false);
 
+  // Lake provisioning is USER-triggered (step 1 button), never automatic.
+  const [provisionBusy, setProvisionBusy] = useState(false);
+
   const didInit = useRef(false);
-  const didKickProvision = useRef(false);
 
   const advanceTo = useCallback((next: number) => {
     setStep(next);
@@ -274,28 +276,42 @@ export function ConnectWizard() {
     return null;
   }, []);
 
-  // Initial load — resume to the furthest incomplete step, and kick provisioning
-  // if resources don't exist yet (idempotent; dashboard-kicked, never the auth hook).
+  // Initial load — resume to the furthest incomplete step. Provisioning is NOT kicked
+  // here: the user starts it explicitly on step 1 (see `provision` below).
   useEffect(() => {
     if (didInit.current) return;
     didInit.current = true;
     void (async () => {
       const s = await loadStatus();
       if (!s) return;
-      if ((!s.lake || !s.agent) && !s.provisioning && !didKickProvision.current) {
-        didKickProvision.current = true;
-        void cpPost('/api/cp/onboarding/provision', {});
-      }
       const resume = s.firstQuery ? 4 : s.connected ? 3 : s.agent ? 1 : 0;
       setStep(resume);
       setMaxReached(resume);
     })();
   }, [loadStatus]);
 
-  // Poll while provisioning, or while waiting on a live signal (connect/query steps).
+  // User-triggered lake provisioning. Idempotent server-side; the poll below picks up
+  // the running lake + agent + background-seeded sample data.
+  const provision = useCallback(async () => {
+    setProvisionBusy(true);
+    const res = await cpPost('/api/cp/onboarding/provision', {});
+    if (!res.ok) {
+      setProvisionBusy(false);
+      toast.error(res.error);
+      return;
+    }
+    await loadStatus();
+  }, [loadStatus]);
+
+  // Clear the busy spinner once the lake actually exists.
+  useEffect(() => {
+    if (status?.lake) setProvisionBusy(false);
+  }, [status?.lake]);
+
+  // Poll while a provision is in flight, or while waiting on a live signal (connect/query).
   const needsPoll =
     !!status &&
-    (status.provisioning ||
+    ((provisionBusy && (!status.lake || !status.agent || status.provisioning)) ||
       (step === 2 && !status.connected) ||
       (step === 3 && !status.firstQuery));
   useEffect(() => {
@@ -348,9 +364,11 @@ export function ConnectWizard() {
           icon={Database}
           eyebrow="Step 1 of 5"
           title="Your governed data lake"
-          blurb="waddling lets your AI agents query your data — and you decide exactly what each one can see. Everything flows through a data lake. We've created your first one and loaded it with sample data so you can try it right now."
-          onNext={() => advanceTo(1)}
+          blurb="waddling lets your AI agents query your data — and you decide exactly what each one can see. Everything flows through a data lake. Create your first one below — we'll seed it with sample data so you can try a real query in a minute."
+          onBack={undefined}
+          onNext={status?.lake ? () => advanceTo(1) : undefined}
           nextLabel="Next: your agent"
+          nextDisabled={!status?.lake}
         >
           {status?.lake ? (
             <div className="flex items-center gap-3 rounded-lg border p-4">
@@ -363,10 +381,21 @@ export function ConnectWizard() {
               </div>
               <StatusBadge status={status.lake.status} />
             </div>
-          ) : (
+          ) : provisionBusy ? (
             <div className="flex items-center gap-3 rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
               <Loader2 className="size-4 animate-spin" />
-              Setting up your demo lake and sample data…
+              Creating your lake and loading sample data…
+            </div>
+          ) : (
+            <div className="flex flex-col items-start gap-3 rounded-lg border border-dashed p-4">
+              <p className="text-sm text-muted-foreground">
+                This spins up a managed lake on object storage and scales to zero when idle
+                — there&apos;s no cost to keep it around.
+              </p>
+              <Button onClick={() => void provision()}>
+                <Database data-icon="inline-start" />
+                Create my demo lake
+              </Button>
             </div>
           )}
         </StepShell>
@@ -497,7 +526,7 @@ export function ConnectWizard() {
       >
         <div className="grid gap-3 sm:grid-cols-2">
           <Link
-            href="/dashboard/acl"
+            href="/acl"
             className="flex flex-col gap-1 rounded-lg border p-4 transition-colors hover:border-primary/50 hover:bg-muted/40"
           >
             <span className="text-sm font-medium">Control access →</span>
@@ -507,7 +536,7 @@ export function ConnectWizard() {
             </span>
           </Link>
           <Link
-            href="/dashboard/datalakes/new"
+            href="/datalakes/new"
             className="flex flex-col gap-1 rounded-lg border p-4 transition-colors hover:border-primary/50 hover:bg-muted/40"
           >
             <span className="text-sm font-medium">Connect your own data →</span>
@@ -528,7 +557,7 @@ export function ConnectWizard() {
         </div>
       </StepShell>
     );
-  }, [step, status, apiKey, keyBusy, loadError, demoQuery, advanceTo, revealKey, loadStatus, finish]);
+  }, [step, status, apiKey, keyBusy, provisionBusy, loadError, demoQuery, advanceTo, provision, revealKey, loadStatus, finish]);
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-8">
@@ -577,7 +606,7 @@ function AdvancedConnect() {
             <span className="text-xs font-medium">Device code</span>
             <p className="text-xs text-muted-foreground">
               For a headless agent: have it display a short code and claim it from{' '}
-              <Link href="/dashboard/agents" className="text-primary underline-offset-4 hover:underline">
+              <Link href="/agents" className="text-primary underline-offset-4 hover:underline">
                 Agents
               </Link>
               .
