@@ -12,8 +12,12 @@ export default async function OnboardingPage() {
   const session = await getServerSession();
   if (!session) redirect('/sign-in?next=/onboarding');
 
+  // Already paid (incl. comped orgs)? The payment step is done — carry them into the
+  // guided connect wizard rather than skipping onboarding entirely. The wizard is
+  // non-blocking and resumes from backend state, so a returning user just lands on
+  // whatever step they're up to (or its "you're set" finish).
   const status = await getPaidStatus();
-  if (status.paid) redirect('/dashboard');
+  if (status.paid) redirect('/onboarding/connect');
 
   const rawSession = session.session as Record<string, unknown>;
   let initialOrgId =
