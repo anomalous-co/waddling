@@ -9,9 +9,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Pencil, RefreshCw } from 'lucide-react';
 import {
-  Card, CardHeader, CardTitle, CardDescription, CardContent,
-} from '@/components/ui/card';
-import {
   Table, TableHeader, TableRow, TableHead, TableBody, TableCell,
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
@@ -19,6 +16,7 @@ import { Badge } from '@/components/ui/badge';
 import { Empty, EmptyHeader, EmptyTitle, EmptyDescription } from '@/components/ui/empty';
 import { fetchCp } from '@/components/dashboard/fetch';
 import { AccessEditorDialog } from '@/components/dashboard/access-editor-dialog';
+import { SectionHeader } from '@/components/dashboard/agent/kit';
 
 interface AclRuleRow {
   id: string;
@@ -63,19 +61,18 @@ export function AgentAccess({ agentId }: { agentId: string }) {
   const lakeName = (id?: string) => (id ? datalakes.find((d) => d.id === id)?.name ?? id.slice(0, 8) : 'all lakes');
 
   return (
-    <Card>
-      <CardHeader className="flex-row items-center justify-between gap-2">
-        <div>
-          <CardTitle>Access</CardTitle>
-          <CardDescription>Tables, capabilities, and external sources this agent is granted.</CardDescription>
-        </div>
-        {!loading && !error && (
-          <Button size="sm" onClick={() => setEditOpen(true)} disabled={datalakes.length === 0}>
-            <Pencil className="size-3.5" /> Edit access
-          </Button>
-        )}
-      </CardHeader>
-      <CardContent>
+    <div className="flex flex-col gap-3 pt-1">
+      <SectionHeader
+        title="Access"
+        action={
+          !loading && !error ? (
+            <Button size="sm" onClick={() => setEditOpen(true)} disabled={datalakes.length === 0}>
+              <Pencil className="size-3.5" /> Edit access
+            </Button>
+          ) : undefined
+        }
+      />
+      <div>
         {loading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
         ) : error ? (
@@ -147,7 +144,7 @@ export function AgentAccess({ agentId }: { agentId: string }) {
             )}
           </div>
         )}
-      </CardContent>
+      </div>
 
       {editOpen && (
         <AccessEditorDialog
@@ -159,6 +156,6 @@ export function AgentAccess({ agentId }: { agentId: string }) {
           onSaved={() => { setLoading(true); void load(); }}
         />
       )}
-    </Card>
+    </div>
   );
 }
