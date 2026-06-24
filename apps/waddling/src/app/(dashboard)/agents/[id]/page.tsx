@@ -274,7 +274,10 @@ export default function AgentDetailPage() {
   const isSuspended = agent.status === 'suspended';
 
   return (
-    <div className="flex flex-col gap-4">
+    // Bound the page to the viewport (below the sticky header + page padding) so the
+    // section content area — not the page — is what scrolls, consistently for every
+    // section. Header + banner are auto-height; the panel region takes the rest.
+    <div className="flex min-h-0 flex-col gap-4 h-[calc(100vh-var(--header-height)-3rem)]">
       {/* Header (breadcrumb lives in the top navbar — see useBreadcrumbLabel below) */}
       <div className="flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1.5">
@@ -357,8 +360,9 @@ export default function AgentDetailPage() {
         />
       )}
 
-      {/* Workspace panel — the canonical frame */}
-      <div className="flex min-h-[70vh] flex-col">
+      {/* Workspace panel — the canonical frame; fills remaining height so its
+          inner ScrollArea (not the page) scrolls the active section. */}
+      <div className="flex min-h-0 flex-1 flex-col">
         <WorkspacePanel
           sections={sections}
           agentId={agentId}
