@@ -33,6 +33,13 @@ export interface AgentSection {
   icon?: LucideIcon;
   /** Count shown on the rail item; null/undefined = no badge. Resolved by the page. */
   badge?: number | null;
+  /**
+   * When true, the section fills the content area as a bounded flex child (no
+   * outer ScrollArea) so it can own its internal scrolling — e.g. the Access
+   * editor, which has its own scroll region. Default false: wrapped in a
+   * ScrollArea so ordinary section content scrolls.
+   */
+  fill?: boolean;
   Component: ComponentType<{ agentId: string }>;
 }
 
@@ -92,12 +99,22 @@ export function WorkspacePanel({
   sections,
   agentId,
   className,
+  activeId: controlledId,
+  onSelect,
 }: {
   sections: AgentSection[];
   agentId: string;
   className?: string;
+  /** Controlled active section id (optional). Falls back to internal state. */
+  activeId?: string;
+  onSelect?: (id: string) => void;
 }) {
-  const [activeId, setActiveId] = useState(sections[0]?.id ?? '');
+  const [internalId, setInternalId] = useState(sections[0]?.id ?? '');
+  const activeId = controlledId ?? internalId;
+  const setActive = (id: string) => {
+    setInternalId(id);
+    onSelect?.(id);
+  };
   const [railOpen, setRailOpen] = useState(true);
   const active = sections.find((s) => s.id === activeId) ?? sections[0];
 
@@ -128,7 +145,7 @@ export function WorkspacePanel({
                 <button
                   key={s.id}
                   type="button"
-                  onClick={() => setActiveId(s.id)}
+                  onClick={() => setActive(s.id)}
                   className={cn(
                     'flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors',
                     isActive
@@ -158,9 +175,17 @@ export function WorkspacePanel({
           </Button>
         )}
 
-        <ScrollArea className="min-h-0 flex-1 pl-3 pr-2">
-          {active ? <active.Component agentId={agentId} /> : null}
-        </ScrollArea>
+        {active?.fill ? (
+          // Section owns its own scrolling (e.g. the Access editor) — give it a
+          // bounded flex area instead of wrapping in a ScrollArea.
+          <div className="flex min-h-0 flex-1 flex-col pl-3 pr-2">
+            {active ? <active.Component agentId={agentId} /> : null}
+          </div>
+        ) : (
+          <ScrollArea type="auto" className="min-h-0 flex-1 pl-3 pr-2">
+            {active ? <active.Component agentId={agentId} /> : null}
+          </ScrollArea>
+        )}
       </div>
     </div>
   );

@@ -353,7 +353,7 @@ export function AccessEditor({ datalakes, value, onChange, fixedDatalakeId }: Ac
           <Button type="button" size="sm" variant="outline" className="mb-2 self-start md:hidden" onClick={() => setNavSheetOpen(true)}>
             <PanelLeft className="size-3.5" /> {SECTIONS.find((s) => s.id === section)?.label}
           </Button>
-          <ScrollArea className="min-h-0 flex-1 pr-2">
+          <ScrollArea type="auto" className="min-h-0 flex-1 pr-2">
           {section === 'catalog' && (
             <div className="flex flex-col">
               <div className="flex items-center justify-between border-b pb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">

@@ -35,7 +35,6 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp, cpPatch, cpDelete } from '@/components/dashboard/fetch';
 import { AgentAccess } from '@/components/dashboard/agent-access';
-import { AccessEditorDialog } from '@/components/dashboard/access-editor-dialog';
 import {
   NoAccessBanner,
   WorkspacePanel,
@@ -69,12 +68,9 @@ interface AclRuleRow {
   capability: string;
 }
 
-// ── Access section wrapper (reuses AgentAccess as-is, no rail-in-rail) ─────────
-
+// ── Access section: the editor IS the view (no read-only table, no modal).
+//    A `fill` section so AgentAccess/AccessEditor owns its own scrolling. ───────
 function AccessSectionBody({ agentId }: { agentId: string }) {
-  // AgentAccess renders its own <Card> + fetches its own data + opens the editor.
-  // We render it inside the WorkspacePanel ScrollArea; intentional per the spec:
-  // "Access section reuses AgentAccess (read-only + existing dialog)."
   return <AgentAccess agentId={agentId} />;
 }
 
@@ -123,7 +119,6 @@ export default function AgentDetailPage() {
   const [agent, setAgent] = useState<AgentSummary | null>(null);
   const [keyCount, setKeyCount] = useState(0);
   const [grantCount, setGrantCount] = useState(0);
-  const [datalakes, setDatalakes] = useState<{ id: string; name: string }[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -132,7 +127,8 @@ export default function AgentDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [suspending, setSuspending] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
-  const [grantEditorOpen, setGrantEditorOpen] = useState(false);
+  // Active section (controlled) so the No-access banner can jump straight to Access.
+  const [activeSection, setActiveSection] = useState('overview');
 
   const agentId = params.id;
 
@@ -140,11 +136,10 @@ export default function AgentDetailPage() {
   useBreadcrumbLabel(agentId, agent?.name);
 
   const load = useCallback(async () => {
-    const [agentRes, aclRes, polRes, lakesRes] = await Promise.all([
+    const [agentRes, aclRes, polRes] = await Promise.all([
       fetchCp<AgentDetailEnvelope>(`/api/cp/agents/${agentId}`),
       fetchCp<{ rules: AclRuleRow[] }>(`/api/cp/acl?agentId=${agentId}`),
       fetchCp<{ policies: { id: string }[] }>(`/api/cp/acl-policy?agentId=${agentId}`),
-      fetchCp<{ datalakes: { id: string; name: string }[] }>('/api/cp/datalakes'),
     ]);
 
     if (!agentRes.ok) {
@@ -166,10 +161,6 @@ export default function AgentDetailPage() {
     if (aclRes.ok && polRes.ok) {
       const filteredRules = aclRes.data.rules.filter((r) => r.capability);
       setGrantCount(filteredRules.length + polRes.data.policies.length);
-    }
-
-    if (lakesRes.ok) {
-      setDatalakes(lakesRes.data.datalakes.map((d) => ({ id: d.id, name: d.name })));
     }
 
     setLoading(false);
@@ -220,6 +211,7 @@ export default function AgentDetailPage() {
       id: 'access',
       label: 'Access',
       icon: ShieldCheck,
+      fill: true,
       Component: AccessSectionBody,
     },
     {
@@ -349,23 +341,21 @@ export default function AgentDetailPage() {
       {showBanner && (
         <NoAccessBanner
           action={
-            <Button
-              size="sm"
-              onClick={() => setGrantEditorOpen(true)}
-              disabled={datalakes.length === 0}
-            >
+            <Button size="sm" onClick={() => setActiveSection('access')}>
               Grant access
             </Button>
           }
         />
       )}
 
-      {/* Workspace panel — the canonical frame; fills remaining height so its
-          inner ScrollArea (not the page) scrolls the active section. */}
+      {/* Workspace panel — the canonical frame; fills remaining height so the
+          active section's content (not the page) scrolls. */}
       <div className="flex min-h-0 flex-1 flex-col">
         <WorkspacePanel
           sections={sections}
           agentId={agentId}
+          activeId={activeSection}
+          onSelect={setActiveSection}
           className="flex-1"
         />
       </div>
@@ -377,20 +367,6 @@ export default function AgentDetailPage() {
         agentId={agentId}
         agentName={agent.name}
       />
-
-      {/* Grant access dialog (banner CTA → opens AccessEditorDialog directly) */}
-      {grantEditorOpen && (
-        <AccessEditorDialog
-          mode="edit"
-          open={grantEditorOpen}
-          onOpenChange={setGrantEditorOpen}
-          datalakes={datalakes}
-          agentId={agentId}
-          onSaved={() => {
-            void load();
-          }}
-        />
-      )}
 
       {/* Delete confirm dialog */}
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
