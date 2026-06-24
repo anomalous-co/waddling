@@ -255,6 +255,8 @@ export interface AgentSummary {
   apiKeyId?: string;
   /** Display name/email of the user who owns the agent's API key (if any). */
   owner?: string;
+  /** Count of live (status='active') sessions for this agent. Roster list only. */
+  activeSessions?: number;
 }
 
 export interface SessionSummary {

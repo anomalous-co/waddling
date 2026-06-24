@@ -92,6 +92,31 @@ delegations.get('/', (c) =>
     const caller = await resolveCaller(c);
     const url = new URL(c.req.url);
     const datalakeId = url.searchParams.get('datalakeId');
+    const scope = url.searchParams.get('scope');
+
+    // scope=org → every delegation across ALL principals in the org (the Agents ▸
+    // Delegations admin tab). Owner/admin only; enforced here, not just hidden in UI.
+    if (scope === 'org') {
+      const member = await queryOne<{ role: string }>(
+        `SELECT role FROM "member" WHERE "userId" = $1 AND "organizationId" = $2`,
+        [caller.callerId, caller.orgId],
+      );
+      const roles = (member?.role ?? '').split(',').map((r) => r.trim());
+      if (!roles.some((r) => r === 'owner' || r === 'admin')) {
+        return err(c, 'forbidden', 403, 'Owner or admin role required to view all delegations');
+      }
+      const rows = await query<DelegationDbRow & { agent_name: string | null }>(
+        `SELECT d.*, a.name AS agent_name
+           FROM waddling.delegation d
+           LEFT JOIN waddling.agent a ON a.id = d.agent_id
+          WHERE d.org_id = $1 AND ($2::text IS NULL OR d.datalake_id = $2)
+          ORDER BY d.created_at DESC`,
+        [caller.orgId, datalakeId],
+      );
+      return ok(c, {
+        delegations: rows.rows.map((r) => ({ ...mapDelegation(r), agentName: r.agent_name ?? undefined })),
+      });
+    }
 
     // Own delegation rows.
     const delegationRows = await query<DelegationDbRow>(

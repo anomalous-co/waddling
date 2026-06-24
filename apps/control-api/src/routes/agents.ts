@@ -48,6 +48,9 @@ const CreateSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
   defaultRole: z.string().default('reader'),
+  // Autonomous (agent holds its own key) is the default; delegated agents act on a
+  // user's behalf. Settable at creation (the column has existed since migration 003).
+  mode: z.enum(['autonomous', 'delegated']).default('autonomous'),
   // Optional: create the agent AND its initial scope in one action. Omitted ⇒
   // today's behavior (agent with no grants). Inserted as agent-subject acl_rule rows,
   // then a single recompile+push per datalake.
@@ -72,6 +75,7 @@ interface AgentRow {
   name: string;
   description: string | null;
   default_role: string;
+  mode: AgentSummary['mode'];
   status: string;
   api_key_id: string | null;
   last_seen_at: string | null;
@@ -79,7 +83,7 @@ interface AgentRow {
 
 async function load(id: string): Promise<AgentRow | null> {
   return queryOne<AgentRow>(
-    `SELECT id, org_id, name, description, default_role, status, api_key_id, last_seen_at
+    `SELECT id, org_id, name, description, default_role, mode, status, api_key_id, last_seen_at
        FROM waddling.agent WHERE id = $1`,
     [id],
   );
@@ -103,12 +107,16 @@ agents.get('/', (c) =>
       last_seen_at: string | null;
       api_key_id: string | null;
       owner: string | null;
+      active_sessions: number;
     }>(
       // owner = the user who owns the agent's API key. The Better Auth api-key plugin
       // references the owning user via "referenceId" (NOT "userId" — that column doesn't exist).
+      // active_sessions: live session count per agent, for the roster's session signal.
       `SELECT a.id, a.org_id, a.name, a.description, a.default_role, a.mode, a.status,
               a.last_seen_at, a.api_key_id,
-              COALESCE(u.name, u.email) AS owner
+              COALESCE(u.name, u.email) AS owner,
+              (SELECT count(*) FROM waddling.agent_session s
+                WHERE s.agent_id = a.id AND s.status = 'active')::int AS active_sessions
          FROM waddling.agent a
          LEFT JOIN "apikey" k ON k.id = a.api_key_id
          LEFT JOIN "user" u   ON u.id = k."referenceId"
@@ -127,6 +135,7 @@ agents.get('/', (c) =>
       lastSeenAt: r.last_seen_at ?? undefined,
       apiKeyId: r.api_key_id ?? undefined,
       owner: r.owner ?? undefined,
+      activeSessions: r.active_sessions ?? 0,
     }));
     return ok(c, { agents: list });
   }),
@@ -182,12 +191,12 @@ agents.post('/', (c) =>
 
     try {
       const agentRow = await queryOne<{ id: string; org_id: string; name: string; description: string | null; default_role: string; mode: AgentSummary['mode']; status: AgentSummary['status']; last_seen_at: string | null; api_key_id: string | null }>(
-        // mode defaults to 'autonomous' (agent holds its own key); set explicitly
-        // for clarity. Delegated agents are created via the OAuth/AAP flow (phase 2).
+        // mode is caller-supplied (defaults to 'autonomous'). Note: a delegated agent
+        // still gets a bound key here; the OAuth/AAP flow remains a separate path.
         `INSERT INTO waddling.agent (org_id, name, description, api_key_id, default_role, mode, status)
-         VALUES ($1,$2,$3,$4,$5,'autonomous','active')
+         VALUES ($1,$2,$3,$4,$5,$6,'active')
          RETURNING id, org_id, name, description, default_role, mode, status, api_key_id, last_seen_at`,
-        [caller.orgId, input.name, input.description ?? null, created.id, input.defaultRole],
+        [caller.orgId, input.name, input.description ?? null, created.id, input.defaultRole, input.mode],
       );
       if (agentRow?.id) {
         // Provisioning funnel: a new agent was created from the dashboard. Server-side,
@@ -332,6 +341,7 @@ agents.get('/:id', (c) =>
       name: row.name,
       description: row.description ?? undefined,
       defaultRole: row.default_role,
+      mode: row.mode,
       status: row.status,
       lastSeenAt: row.last_seen_at ?? undefined,
       apiKeyId: row.api_key_id ?? undefined,

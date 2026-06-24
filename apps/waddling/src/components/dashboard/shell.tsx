@@ -33,6 +33,7 @@ import { authClient } from '@/lib/auth-client';
 import { DataLakeIcon } from '@/components/data-lake-icon';
 import { BrandMark } from '@/components/brand-mark';
 import { fetchCp } from '@/components/dashboard/fetch';
+import { BreadcrumbProvider, useBreadcrumbOverrides } from '@/components/dashboard/breadcrumb-context';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
@@ -410,10 +411,11 @@ function DatalakeSwitcher() {
 }
 
 function Breadcrumbs({ pathname }: { pathname: string }) {
+  const overrides = useBreadcrumbOverrides();
   const segments = pathname.split('/').filter(Boolean);
   const crumbs = segments.map((seg, i) => ({
     href: '/' + segments.slice(0, i + 1).join('/'),
-    label: SEGMENT_LABELS[seg] ?? seg,
+    label: overrides[seg] ?? SEGMENT_LABELS[seg] ?? seg,
     last: i === segments.length - 1,
   }));
 
@@ -452,6 +454,7 @@ export function DashboardShell({
 
   return (
     <TooltipProvider delayDuration={200}>
+     <BreadcrumbProvider>
       <div className="[--header-height:calc(--spacing(14))]">
         <SidebarProvider className="flex flex-col">
           <header className="sticky top-0 z-50 flex h-(--header-height) shrink-0 items-center gap-2 border-b border-border bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -485,6 +488,7 @@ export function DashboardShell({
           </div>
         </SidebarProvider>
       </div>
+     </BreadcrumbProvider>
       <Toaster />
     </TooltipProvider>
   );
