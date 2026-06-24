@@ -24,10 +24,11 @@ export default async function OnboardingPage() {
     typeof rawSession.activeOrganizationId === 'string'
       ? rawSession.activeOrganizationId
       : undefined;
-  // Signup creates the org but does NOT setActive, so activeOrganizationId is often
-  // unset on the billing step. Fall back to the first membership so the Subscribe
-  // button has a referenceId (credit-pack + the gate already use the server-side
-  // membership fallback in resolveCaller).
+  // Org creation happens HERE (the OnboardingFlow 'org' step), not at sign-up — so a
+  // freshly-verified user arrives with no org and activeOrganizationId unset. For a user
+  // who already has an org (returning, or just created one) fall back to the first
+  // membership so the Subscribe button has a referenceId (credit-pack + the gate already
+  // use the server-side membership fallback in resolveCaller).
   if (!initialOrgId && status.hasOrg) {
     const orgs = await listOrgs();
     initialOrgId = orgs[0]?.id;

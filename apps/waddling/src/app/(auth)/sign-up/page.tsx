@@ -1,9 +1,8 @@
 'use client';
 
 import { useRef, useState, type FormEvent } from 'react';
-import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Loader2, Check } from 'lucide-react';
+import { Loader2, Check, MailCheck } from 'lucide-react';
 import { authClient } from '@/lib/auth-client';
 import { useFunnel } from '@/lib/funnel';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
@@ -14,7 +13,7 @@ import { Field, FieldLabel, FieldGroup } from '@/components/ui/field';
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 
-type Step = 'account' | 'org';
+type Step = 'account' | 'verify';
 
 function StepDot({
   active,
@@ -47,7 +46,6 @@ function StepDot({
 }
 
 export default function SignUpPage() {
-  const router = useRouter();
   const funnel = useFunnel();
   const startedRef = useRef(false);
   const [step, setStep] = useState<Step>('account');
@@ -66,15 +64,26 @@ export default function SignUpPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
 
-  // Org form
-  const [orgName, setOrgName] = useState('');
+  // Where the verification link returns the (now auto-signed-in) user. MUST be an
+  // absolute, trusted origin: Better Auth redirects here verbatim after
+  // autoSignInAfterVerification, so a relative path would resolve against the API
+  // origin (api.*) instead of the app. /onboarding creates the org + collects billing —
+  // none of which can run at sign-up time, because requireEmailVerification means
+  // sign-up returns no session until the email is verified.
+  const onboardingUrl = () =>
+    typeof window !== 'undefined' ? `${window.location.origin}/onboarding` : '/onboarding';
 
   const submitAccount = async (e: FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
 
-    const res = await authClient.signUp.email({ name, email, password });
+    const res = await authClient.signUp.email({
+      name,
+      email,
+      password,
+      callbackURL: onboardingUrl(),
+    });
     setLoading(false);
 
     if (res.error) {
@@ -85,28 +94,22 @@ export default function SignUpPage() {
     // connects. The authoritative `signup_completed` event fires server-side.
     const user = res.data?.user;
     if (user) funnel.identifyUser(user.id, { email: user.email, name: user.name });
-    setStep('org');
+    // requireEmailVerification is on → sign-up returned no session (token: null) and
+    // dispatched a verification email. Org creation + billing happen in /onboarding,
+    // reached only after the verify link signs the user in.
+    setStep('verify');
   };
 
-  const submitOrg = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!orgName.trim()) {
-      setError('Organization name is required');
-      return;
-    }
-    setLoading(true);
+  const [resent, setResent] = useState(false);
+  const resend = async () => {
+    setResent(false);
     setError(null);
-
-    const slug = orgName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-    const res = await authClient.organization.create({ name: orgName, slug });
-    setLoading(false);
-
+    const res = await authClient.sendVerificationEmail({ email, callbackURL: onboardingUrl() });
     if (res.error) {
-      setError(res.error.message ?? 'Failed to create organization');
+      setError(res.error.message ?? 'Could not resend the verification email');
       return;
     }
-    // Org created → straight to the (unavoidable) billing step, not the dashboard.
-    router.push('/onboarding?step=billing');
+    setResent(true);
   };
 
   return (
@@ -119,9 +122,9 @@ export default function SignUpPage() {
 
         {/* Step progress */}
         <div className="flex items-center gap-2">
-          <StepDot active={step === 'account'} done={step === 'org'} label="1. Account" />
+          <StepDot active={step === 'account'} done={step === 'verify'} label="1. Account" />
           <Separator className="flex-1" />
-          <StepDot active={step === 'org'} done={false} label="2. Organization" />
+          <StepDot active={step === 'verify'} done={false} label="2. Verify email" />
         </div>
 
         <Card>
@@ -208,50 +211,53 @@ export default function SignUpPage() {
           ) : (
             <>
               <CardHeader>
-                <CardTitle>Create organization</CardTitle>
+                <CardTitle>Check your email</CardTitle>
                 <CardDescription>
-                  Organizations group your data lakes, agents, and team members. You can create more
-                  later.
+                  We sent a verification link to <strong>{email}</strong>. Click it to finish
+                  setting up your account — you&apos;ll pick an organization and plan next.
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <form onSubmit={(e) => void submitOrg(e)}>
-                  <FieldGroup className="gap-4">
-                    <Field>
-                      <FieldLabel htmlFor="org-name">Organization name</FieldLabel>
-                      <Input
-                        id="org-name"
-                        value={orgName}
-                        onChange={(e) => setOrgName(e.target.value)}
-                        required
-                        placeholder="Acme Corp"
-                      />
-                    </Field>
+                <div className="flex flex-col items-center gap-4 py-2 text-center">
+                  <MailCheck className="size-8 text-primary" />
+                  <p className="text-sm text-muted-foreground">
+                    Didn&apos;t get it? Check your spam folder, or resend below.
+                  </p>
 
-                    {error ? (
-                      <Alert variant="destructive">
-                        <AlertTitle>Could not create organization</AlertTitle>
-                        <AlertDescription>{error}</AlertDescription>
-                      </Alert>
-                    ) : null}
+                  {error ? (
+                    <Alert variant="destructive">
+                      <AlertTitle>Could not resend</AlertTitle>
+                      <AlertDescription>{error}</AlertDescription>
+                    </Alert>
+                  ) : null}
+                  {resent ? (
+                    <p className="text-sm text-green-600">Verification email sent again.</p>
+                  ) : null}
 
-                    <Button type="submit" disabled={loading} className="w-full">
-                      {loading ? (
-                        <Loader2 data-icon="inline-start" className="animate-spin" />
-                      ) : null}
-                      Create org and continue
-                    </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full"
+                    onClick={() => void resend()}
+                  >
+                    Resend verification email
+                  </Button>
 
-                    <Button
+                  <p className="text-xs text-muted-foreground">
+                    Wrong address?{' '}
+                    <button
                       type="button"
-                      variant="ghost"
-                      className="w-full text-muted-foreground"
-                      onClick={() => router.push('/onboarding?step=org')}
+                      onClick={() => {
+                        setStep('account');
+                        setResent(false);
+                        setError(null);
+                      }}
+                      className="text-primary hover:underline"
                     >
-                      Skip for now
-                    </Button>
-                  </FieldGroup>
-                </form>
+                      Start over
+                    </button>
+                  </p>
+                </div>
               </CardContent>
             </>
           )}
