@@ -109,7 +109,9 @@ export interface Env {
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_PRICE_PRO: string;
-  STRIPE_PRICE_ENTERPRISE: string;
+  // 'scale' is the self-serve $199/mo tier (formerly labelled enterprise). The
+  // sales-led `enterprise` tier has no self-serve price, hence no var here.
+  STRIPE_PRICE_SCALE: string;
   // One-time credit-pack Prices (ANO-64 fills these). Unset/placeholder ⇒ pack hidden.
   STRIPE_PRICE_CREDIT_10: string;
   STRIPE_PRICE_CREDIT_25: string;

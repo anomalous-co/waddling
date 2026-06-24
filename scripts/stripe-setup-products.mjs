@@ -40,9 +40,14 @@ const CATALOG = [
     recurring: true,
   },
   {
+    // The self-serve $199/mo "Scale" tier. lookup_key stays 'enterprise_monthly'
+    // for continuity — this $199 price was created under that key before the tier
+    // split, so reusing it keeps the price id stable (wired in wrangler/.dev.vars).
+    // The product display name + env key are relabelled to Scale (re-run syncs the
+    // Stripe product name via the reuse path in ensure()).
     lookupKey: 'enterprise_monthly',
-    envKey: 'STRIPE_PRICE_ENTERPRISE',
-    product: { name: 'Waddling Enterprise', description: 'Enterprise tier — $199/mo, resets to $199 credits monthly.' },
+    envKey: 'STRIPE_PRICE_SCALE',
+    product: { name: 'Waddling Scale', description: 'Scale tier — $199/mo, resets to $199 credits monthly.' },
     unitAmount: 19900,
     recurring: true,
   },
@@ -78,6 +83,13 @@ async function existingPrice(lookupKey) {
 async function ensure(entry) {
   const found = await existingPrice(entry.lookupKey);
   if (found) {
+    // Keep the Stripe product label in sync with the catalog on re-run (e.g. the
+    // enterprise→scale rename) without disturbing the stable price id.
+    if (found.product) {
+      await stripe.products
+        .update(found.product, { name: entry.product.name, description: entry.product.description })
+        .catch(() => {});
+    }
     return { envKey: entry.envKey, lookupKey: entry.lookupKey, priceId: found.id, reused: true };
   }
   // Create the product, then a price carrying the stable lookup_key.

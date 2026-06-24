@@ -70,7 +70,9 @@ export interface AuditQuery {
 
 // ── Plans ──────────────────────────────────────────────────────────────────────
 export interface Plan {
-  name: 'free' | 'pro' | 'enterprise';
+  // 'scale' is the self-serve top tier ($199/mo, auto-provisionable); 'enterprise'
+  // is sales-led (dedicated gateways/SSO/SLA) with no self-serve Stripe price.
+  name: 'free' | 'pro' | 'scale' | 'enterprise';
   priceId: string;
   /** Monthly prepaid credit allotment (USD). The org's tier-credit bucket is RESET to
    *  this each billing cycle (unused tier credit expires; purchased top-ups persist).

@@ -32,7 +32,7 @@ import { authClient } from '@/lib/auth-client';
 import { toast } from 'sonner';
 
 interface PlanInfo {
-  name: 'free' | 'pro' | 'enterprise';
+  name: 'free' | 'pro' | 'scale' | 'enterprise';
   status: 'active' | 'past_due' | 'canceled' | 'trialing';
   currentPeriodEnd?: string;
   cancelAtPeriodEnd?: boolean;
@@ -79,7 +79,16 @@ interface BillingData {
 const PLAN_FEATURES: Record<string, string[]> = {
   free: ['1 data lake', '2 agents', 'Audit & monitor (read-only)', 'Static reader/writer roles', 'Community support'],
   pro: ['Up to 5 data lakes', '25 agents', 'Full dynamic ACL (column/row/window rules)', 'Instant revocation', 'Internal MCP admin server', '90-day audit retention', 'Email support'],
-  enterprise: ['Unlimited data lakes', 'Unlimited agents', 'Dedicated isolated gateways', 'Encrypted lakes', 'SSO/SAML', '1-year audit retention', 'SLA + priority support'],
+  scale: ['Unlimited data lakes', 'Unlimited agents', 'Everything in Pro, uncapped', '1-year audit retention', 'Priority email support'],
+  enterprise: ['Everything in Scale', 'Dedicated isolated gateways', 'Dedicated encrypted R2 buckets', 'SSO / SAML', 'Uptime SLA', 'Priority support + onboarding'],
+};
+
+// Per-plan monthly price label for the comparison grid + CTAs.
+const PLAN_PRICE: Record<string, string> = {
+  free: '$0',
+  pro: '$49 / mo',
+  scale: '$199 / mo',
+  enterprise: 'Contact us',
 };
 
 function BillingSkeleton() {
@@ -220,7 +229,13 @@ function InvoicesCard({ invoices }: { invoices: Invoice[] }) {
   );
 }
 
-function PlanComparisonCard({ currentPlan, onUpgrade }: { currentPlan: string; onUpgrade: () => void }) {
+function PlanComparisonCard({
+  currentPlan,
+  onUpgrade,
+}: {
+  currentPlan: string;
+  onUpgrade: (plan: 'pro' | 'scale') => void;
+}) {
   return (
     <Card>
       <CardHeader>
@@ -228,10 +243,11 @@ function PlanComparisonCard({ currentPlan, onUpgrade }: { currentPlan: string; o
         <CardDescription>Upgrade to unlock more data lakes, agents, and ACL power.</CardDescription>
       </CardHeader>
       <CardContent>
-        <div className="grid gap-4 md:grid-cols-3">
-          {(['free', 'pro', 'enterprise'] as const).map((name) => {
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+          {(['free', 'pro', 'scale', 'enterprise'] as const).map((name) => {
             const isCurrent = name === currentPlan;
             const isPro = name === 'pro';
+            const isSelfServePaid = name === 'pro' || name === 'scale';
             return (
               <div
                 key={name}
@@ -239,9 +255,7 @@ function PlanComparisonCard({ currentPlan, onUpgrade }: { currentPlan: string; o
               >
                 <div className="flex items-center justify-between">
                   <span className="font-semibold capitalize">{name}</span>
-                  <Badge variant={isPro ? 'default' : 'outline'}>
-                    {name === 'free' ? '$0' : name === 'pro' ? '$99 / mo' : 'Custom'}
-                  </Badge>
+                  <Badge variant={isPro ? 'default' : 'outline'}>{PLAN_PRICE[name]}</Badge>
                 </div>
                 <ul className="flex flex-col gap-1.5">
                   {PLAN_FEATURES[name]?.map((f) => (
@@ -251,14 +265,18 @@ function PlanComparisonCard({ currentPlan, onUpgrade }: { currentPlan: string; o
                     </li>
                   ))}
                 </ul>
-                {!isCurrent && isPro ? (
-                  <Button size="sm" onClick={onUpgrade}>
-                    Upgrade to Pro
-                  </Button>
-                ) : isCurrent ? (
+                {isCurrent ? (
                   <Badge variant="secondary" className="w-fit">
                     Current plan
                   </Badge>
+                ) : isSelfServePaid ? (
+                  <Button size="sm" onClick={() => onUpgrade(name)}>
+                    Upgrade to {name === 'pro' ? 'Pro' : 'Scale'}
+                  </Button>
+                ) : name === 'enterprise' ? (
+                  <Button size="sm" variant="outline" asChild>
+                    <a href="https://getwaddling.com/enterprise">Contact sales</a>
+                  </Button>
                 ) : null}
               </div>
             );
@@ -313,16 +331,16 @@ export function BillingTab() {
     }
   }, [params, load]);
 
-  const subscribe = useCallback(async () => {
+  const subscribe = useCallback(async (plan: 'pro' | 'scale' = 'pro') => {
     if (!orgId) {
       toast.error('No active organization to bill.');
       return;
     }
     // Conversion-funnel ping (best-effort, server-side, non-spoofable).
-    await cpPost('/billing/checkout-intent', { toPlan: 'pro' }).catch(() => {});
+    await cpPost('/billing/checkout-intent', { toPlan: plan }).catch(() => {});
     const origin = window.location.origin;
     const res = (await authClient.subscription.upgrade({
-      plan: 'pro',
+      plan,
       referenceId: orgId,
       successUrl: `${origin}/settings?tab=billing`,
       cancelUrl: `${origin}/settings?tab=billing`,
@@ -375,7 +393,9 @@ export function BillingTab() {
 
   const comped = !!data.comped;
   const isFree = data.plan.name === 'free';
-  const isPaidPlan = data.plan.name === 'pro' || data.plan.name === 'enterprise';
+  // 'scale' is self-serve, so it gets the Stripe customer portal like pro. Enterprise
+  // is sales-led (no portal); it never reaches this surface via self-serve checkout.
+  const isPaidPlan = data.plan.name === 'pro' || data.plan.name === 'scale';
 
   return (
     <div className="flex flex-col gap-6">
@@ -411,7 +431,12 @@ export function BillingTab() {
         {!comped ? (
           <CardContent>
             <div className="flex flex-wrap gap-2">
-              {isFree ? <Button onClick={() => void subscribe()}>Upgrade to Pro — $99/mo</Button> : null}
+              {isFree ? <Button onClick={() => void subscribe('pro')}>Upgrade to Pro — $49/mo</Button> : null}
+              {isFree ? (
+                <Button variant="outline" onClick={() => void subscribe('scale')}>
+                  Upgrade to Scale — $199/mo
+                </Button>
+              ) : null}
               {isPaidPlan ? (
                 <Button variant="outline" onClick={() => window.location.assign(data.actions.portal)}>
                   Manage subscription
@@ -436,7 +461,9 @@ export function BillingTab() {
       <EntitlementsCard entitlements={data.entitlements} />
 
       {/* Plan comparison (free upsell only; not for comped) */}
-      {isFree && !comped ? <PlanComparisonCard currentPlan={data.plan.name} onUpgrade={() => void subscribe()} /> : null}
+      {isFree && !comped ? (
+        <PlanComparisonCard currentPlan={data.plan.name} onUpgrade={(p) => void subscribe(p)} />
+      ) : null}
 
       {/* Invoices */}
       <InvoicesCard invoices={data.invoices ?? []} />

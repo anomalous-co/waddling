@@ -71,8 +71,8 @@ export const getStripeWebhookSecret = (): string =>
     : required('STRIPE_WEBHOOK_SECRET');
 export const getStripePricePro = (): string =>
   optional('STRIPE_PRICE_PRO', 'price_pro');
-export const getStripePriceEnterprise = (): string =>
-  optional('STRIPE_PRICE_ENTERPRISE', 'price_enterprise');
+export const getStripePriceScale = (): string =>
+  optional('STRIPE_PRICE_SCALE', 'price_scale');
 
 // ── App ─────────────────────────────────────────────────────────────────────
 export const getAppUrl = (): string =>

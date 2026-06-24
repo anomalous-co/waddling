@@ -62,7 +62,9 @@ export interface AuditQuery {
 
 // ── Plans ──────────────────────────────────────────────────────────────────────
 export interface Plan {
-  name: 'free' | 'pro' | 'enterprise';
+  // 'scale' is the self-serve top tier ($199/mo); 'enterprise' is sales-led
+  // (dedicated gateways/SSO/SLA) with no self-serve Stripe price.
+  name: 'free' | 'pro' | 'scale' | 'enterprise';
   priceId: string;
   entitlements: {
     endpoints: number;

@@ -10,7 +10,7 @@ import { TrackedLink } from '@/components/tracked-link';
 
 export const metadata: Metadata = {
   title: 'Pricing — waddling',
-  description: 'Prepaid credits, billed by usage at $0.50/active session-hour. Free $0, Pro $49/mo, Enterprise $199/mo — each includes monthly usage credits.',
+  description: 'Prepaid credits, billed by usage at $0.50/active session-hour. Free $0, Pro $49/mo, Scale $199/mo (each includes monthly usage credits), Enterprise contact-us.',
 };
 
 // Human copy — prices, descriptions, CTAs. Entitlement numbers pulled from PLANS at render time.
@@ -57,23 +57,40 @@ const PLAN_COPY = [
     ],
   },
   {
-    key: 'enterprise',
-    name: 'Enterprise',
+    key: 'scale',
+    name: 'Scale',
     price: '$199',
     period: 'month',
+    tagline: 'Everything in Pro, uncapped.',
+    cta: 'start scale trial',
+    ctaHref: appUrl('/dashboard?plan=scale'),
+    highlight: false,
+    features: [
+      '$199 / mo in usage credits included',
+      'Unlimited data lakes',
+      'Unlimited agents',
+      'Everything in Pro — uncapped',
+      '1-year audit retention',
+      'Priority email support',
+    ],
+  },
+  {
+    key: 'enterprise',
+    name: 'Enterprise',
+    price: 'Custom',
+    period: 'contact us',
     tagline: 'Dedicated gateways, SSO, and SLA.',
     cta: 'talk to us',
     ctaHref: '/enterprise',
     highlight: false,
     features: [
-      '$199 / mo in usage credits included',
-      'Unlimited data lakes + agents',
+      'Everything in Scale',
       'Dedicated isolated gateways',
       'Dedicated encrypted R2 buckets',
       'SSO / SAML',
-      '1-year audit retention',
       'Uptime SLA',
       'Priority support + onboarding',
+      'Custom credit + volume terms',
     ],
   },
 ];
@@ -86,7 +103,7 @@ export default function PricingPage() {
   // Pull live entitlement numbers from PLANS (W1); human copy stays in PLAN_COPY.
   const freePlan = PLANS.find((p) => p.name === 'free');
   const proPlan = PLANS.find((p) => p.name === 'pro');
-  const entPlan = PLANS.find((p) => p.name === 'enterprise');
+  const scalePlan = PLANS.find((p) => p.name === 'scale');
 
   const freeEndpoints = freePlan ? fmtEntitlement(freePlan.entitlements.endpoints) : '1';
   const freeAgents = freePlan ? fmtEntitlement(freePlan.entitlements.agents) : '2';
@@ -94,7 +111,7 @@ export default function PricingPage() {
   const proEndpoints = proPlan ? fmtEntitlement(proPlan.entitlements.endpoints) : '5';
   const proAgents = proPlan ? fmtEntitlement(proPlan.entitlements.agents) : '25';
   const proAudit = proPlan ? `${proPlan.entitlements.auditRetentionDays} days` : '90 days';
-  const entAudit = entPlan ? `${entPlan.entitlements.auditRetentionDays} days` : '365 days';
+  const scaleAudit = scalePlan ? `${scalePlan.entitlements.auditRetentionDays} days` : '365 days';
 
   return (
     <main className="mx-auto max-w-6xl px-6 py-20">
@@ -106,7 +123,7 @@ export default function PricingPage() {
         </p>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         {PLAN_COPY.map((plan) => (
           <div
             key={plan.key}
@@ -191,23 +208,24 @@ export default function PricingPage() {
                 <th className="text-left py-2 pr-4 font-normal">feature</th>
                 <th className="text-center py-2 px-4 font-normal">free</th>
                 <th className="text-center py-2 px-4 font-normal text-emerald-400">pro</th>
+                <th className="text-center py-2 px-4 font-normal">scale</th>
                 <th className="text-center py-2 px-4 font-normal">enterprise</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800/60">
-              <Row label="monthly usage credits" free="$5" pro="$49" enterprise="$199" />
-              <Row label="usage rate" free="$0.50 / session-hr" pro="$0.50 / session-hr" enterprise="$0.50 / session-hr" />
-              <Row label="data lakes" free={freeEndpoints} pro={proEndpoints} enterprise="unlimited" />
-              <Row label="agents" free={freeAgents} pro={proAgents} enterprise="unlimited" />
-              <Row label="dynamic ACL (column · row · time)" free="✗" pro="✓" enterprise="✓" proGreen />
-              <Row label="instant revoke (birdshot denylist)" free="✗" pro="✓" enterprise="✓" proGreen />
-              <Row label="admin MCP server" free="✗" pro="✓" enterprise="✓" proGreen />
-              <Row label="audit retention" free={freeAudit} pro={proAudit} enterprise={entAudit} />
-              <Row label="dedicated gateway" free="✗" pro="✗" enterprise="✓" />
-              <Row label="dedicated R2 bucket" free="✗" pro="✗" enterprise="✓" />
-              <Row label="SSO / SAML" free="✗" pro="✗" enterprise="✓" />
-              <Row label="SLA" free="✗" pro="✗" enterprise="✓" />
-              <Row label="support" free="community" pro="email" enterprise="priority + onboarding" />
+              <Row label="monthly usage credits" free="$5" pro="$49" scale="$199" enterprise="custom" />
+              <Row label="usage rate" free="$0.50 / session-hr" pro="$0.50 / session-hr" scale="$0.50 / session-hr" enterprise="custom" />
+              <Row label="data lakes" free={freeEndpoints} pro={proEndpoints} scale="unlimited" enterprise="unlimited" />
+              <Row label="agents" free={freeAgents} pro={proAgents} scale="unlimited" enterprise="unlimited" />
+              <Row label="dynamic ACL (column · row · time)" free="✗" pro="✓" scale="✓" enterprise="✓" proGreen />
+              <Row label="instant revoke (birdshot denylist)" free="✗" pro="✓" scale="✓" enterprise="✓" proGreen />
+              <Row label="admin MCP server" free="✗" pro="✓" scale="✓" enterprise="✓" proGreen />
+              <Row label="audit retention" free={freeAudit} pro={proAudit} scale={scaleAudit} enterprise={scaleAudit} />
+              <Row label="dedicated gateway" free="✗" pro="✗" scale="✗" enterprise="✓" />
+              <Row label="dedicated R2 bucket" free="✗" pro="✗" scale="✗" enterprise="✓" />
+              <Row label="SSO / SAML" free="✗" pro="✗" scale="✗" enterprise="✓" />
+              <Row label="SLA" free="✗" pro="✗" scale="✗" enterprise="✓" />
+              <Row label="support" free="community" pro="email" scale="priority email" enterprise="priority + onboarding" />
             </tbody>
           </table>
         </div>
@@ -233,11 +251,12 @@ interface RowProps {
   label: string;
   free: string;
   pro: string;
+  scale: string;
   enterprise: string;
   proGreen?: boolean;
 }
 
-function Row({ label, free, pro, enterprise, proGreen }: RowProps) {
+function Row({ label, free, pro, scale, enterprise, proGreen }: RowProps) {
   return (
     <tr>
       <td className="py-2.5 pr-4 text-zinc-400">{label}</td>
@@ -245,6 +264,7 @@ function Row({ label, free, pro, enterprise, proGreen }: RowProps) {
       <td className={`py-2.5 px-4 text-center ${proGreen && pro === '✓' ? 'text-emerald-400' : 'text-zinc-300'}`}>
         {pro}
       </td>
+      <td className="py-2.5 px-4 text-center text-zinc-300">{scale}</td>
       <td className="py-2.5 px-4 text-center text-zinc-300">{enterprise}</td>
     </tr>
   );

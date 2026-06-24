@@ -41,7 +41,7 @@ interface SubRow {
 
 /** Mirrors the dashboard billing page's PlanInfo / Invoice shapes. */
 interface PlanInfo {
-  name: 'free' | 'pro' | 'enterprise';
+  name: 'free' | 'pro' | 'scale' | 'enterprise';
   status: 'active' | 'past_due' | 'canceled' | 'trialing';
   currentPeriodEnd?: string;
   cancelAtPeriodEnd?: boolean;
@@ -145,7 +145,8 @@ billing.get('/status', (c) =>
     // Complimentary orgs (company domains) are free forever — paid regardless of plan.
     const comped = await isOrgComped(caller.orgId);
     const planName = await getActivePlanName(caller.orgId);
-    const subscribed = planName === 'pro' || planName === 'enterprise';
+    const subscribed =
+      planName === 'pro' || planName === 'scale' || planName === 'enterprise';
     const boughtPack = await queryOne<{ one: number }>(
       `SELECT 1 AS one FROM waddling.credit_ledger
         WHERE org_id = $1 AND reason = 'credit_pack' LIMIT 1`,
@@ -210,7 +211,8 @@ billing.post('/credit-pack', (c) =>
   }),
 );
 
-const CheckoutIntentSchema = z.object({ toPlan: z.enum(['pro', 'enterprise']) });
+// Only the self-serve paid tiers reach Checkout; enterprise is contact-us.
+const CheckoutIntentSchema = z.object({ toPlan: z.enum(['pro', 'scale']) });
 
 /**
  * POST /checkout-intent — record that the user is starting a subscription checkout,

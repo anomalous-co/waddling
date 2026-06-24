@@ -38,13 +38,15 @@ import { captureCheckoutCompletedEvent } from './funnel-stripe';
 
 /**
  * Shape the @better-auth/stripe plugin wants: `{ name, priceId }`. The free plan
- * has no Stripe price and is omitted. Inlined from the original lib/plans.ts —
- * full plan/entitlement table is not needed for auth construction.
+ * has no Stripe price and is omitted. So is `enterprise` — it is sales-led
+ * (contact-us, no self-serve price). The self-serve paid tiers are `pro` and the
+ * uncapped `scale`. Inlined from the original lib/plans.ts — full plan/entitlement
+ * table is not needed for auth construction.
  */
 function stripePlans(env: Env): { name: string; priceId: string }[] {
   return [
     { name: 'pro', priceId: env.STRIPE_PRICE_PRO },
-    { name: 'enterprise', priceId: env.STRIPE_PRICE_ENTERPRISE },
+    { name: 'scale', priceId: env.STRIPE_PRICE_SCALE },
   ].filter((p) => p.priceId);
 }
 

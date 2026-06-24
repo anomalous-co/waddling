@@ -124,7 +124,10 @@
     // Price ids below are TEST-mode, created idempotently (by lookup_key) via
     // `scripts/stripe-setup-products.mjs` — re-run with a live key + push as secrets for prod.
     "STRIPE_PRICE_PRO": "price_1TlgZVDNZoqvxQqoVjX1v0yO",
-    "STRIPE_PRICE_ENTERPRISE": "price_1TlgZWDNZoqvxQqoTFuZKTdV",
+    // 'scale' = the self-serve $199/mo tier (this $199 price was created as
+    // enterprise_monthly before the tier split; relabelled scale_monthly by the
+    // setup script). The sales-led `enterprise` tier has no self-serve price.
+    "STRIPE_PRICE_SCALE": "price_1TlgZWDNZoqvxQqoTFuZKTdV",
     "STRIPE_PRICE_CREDIT_10": "price_1TlgZWDNZoqvxQqozUuYB4Co",
     "STRIPE_PRICE_CREDIT_25": "price_1TlgZXDNZoqvxQqokMAhJEPa",
     "STRIPE_PRICE_CREDIT_100": "price_1TlgZXDNZoqvxQqoLH4ZcQ4Y",

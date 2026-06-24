@@ -7,7 +7,7 @@
  * env-free here and its signatures are stable for the route wave.
  *
  * Workers difference vs the original: the original read Stripe price ids from env
- * (`getStripePricePro()`/`getStripePriceEnterprise()`) at call time. On workerd
+ * (`getStripePricePro()`/`getStripePriceScale()`) at call time. On workerd
  * there is no module-load env, and the ONLY consumer of priceId — the
  * @better-auth/stripe `subscription.plans` array — is built by auth.ts's own
  * inlined `stripePlans(env)` (which threads env.STRIPE_PRICE_* directly). So this
@@ -20,7 +20,7 @@ import type { Plan } from './types';
 export type PlanName = Plan['name'];
 
 /** Plan tiers in increasing order of capability. Index = rank for `requirePlan`. */
-export const PLAN_ORDER: readonly PlanName[] = ['free', 'pro', 'enterprise'];
+export const PLAN_ORDER: readonly PlanName[] = ['free', 'pro', 'scale', 'enterprise'];
 
 /**
  * Build the plan table (entitlement limits per tier). Functioned (not a frozen
@@ -56,6 +56,25 @@ export function getPlans(): Plan[] {
       },
     },
     {
+      // 'scale' is the self-serve top tier — everything pro has, uncapped, billed
+      // at $199/mo. Its live Stripe price id is threaded in via env.STRIPE_PRICE_SCALE.
+      name: 'scale',
+      priceId: '',
+      monthlyCreditUsd: 199,
+      entitlements: {
+        endpoints: Number.POSITIVE_INFINITY,
+        agents: Number.POSITIVE_INFINITY,
+        dynamicAcl: true,
+        adminMcp: true,
+        auditRetentionDays: 365,
+      },
+    },
+    {
+      // 'enterprise' is sales-led (contact-us): dedicated isolated gateways, dedicated
+      // R2, SSO/SAML, SLA — none of which is auto-provisionable yet, so there is NO
+      // self-serve Stripe price (priceId stays ''; excluded from stripePlans). Its
+      // entitlements mirror scale until the dedicated-tenancy gates exist; the monthly
+      // credit is a negotiated baseline set per-contract.
       name: 'enterprise',
       priceId: '',
       monthlyCreditUsd: 199,
