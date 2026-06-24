@@ -16,7 +16,12 @@ import { AwsClient } from "aws4fetch";
 import { Pool } from "pg";
 import type { Env } from "./lib/env";
 import { runInDbScope, query } from "./lib/db";
-import { sweepExpiredSessions, resetAllTierCredits, currentBillingPeriod } from "./lib/credits";
+import {
+  sweepExpiredSessions,
+  resetAllTierCredits,
+  currentBillingPeriod,
+  reconcileDebits,
+} from "./lib/credits";
 import { buildAuth, runMigrations, runInAuthScope } from "./lib/auth";
 import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
@@ -646,6 +651,16 @@ async function scheduled(
       if (reset > 0) console.log(`[cron] reset tier credit for ${reset} org(s)`);
     } catch (e) {
       console.log(`[cron] resetAllTierCredits failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    try {
+      // Metering integrity (ANO-67): re-derive billed session debits from source and
+      // flag any drift vs the ledger. Read-only; never auto-corrects.
+      const { checked, drift } = await reconcileDebits();
+      if (drift.length > 0) {
+        console.log(`[cron] reconcile: DRIFT on ${drift.length}/${checked} billed session(s) — review needed`);
+      }
+    } catch (e) {
+      console.log(`[cron] reconcileDebits failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   });
 }

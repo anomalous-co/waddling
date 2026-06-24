@@ -434,3 +434,93 @@ export async function sweepExpiredSessions(): Promise<number> {
   }
   return debited;
 }
+
+/** One row of metering drift — a billed session whose ledger debit doesn't match the
+ *  duration we'd re-derive from the source `agent_session` row. */
+export interface DebitDrift {
+  sessionId: string;
+  orgId: string;
+  /** What the session-duration debit SHOULD be (µUSD, positive). */
+  expectedMicro: number;
+  /** What the ledger actually holds for `session:<id>` (µUSD, signed; null = no row). */
+  ledgerMicro: number | null;
+  kind: 'missing_debit' | 'amount_mismatch' | 'unexpected_debit';
+}
+
+export interface ReconcileResult {
+  checked: number;
+  drift: DebitDrift[];
+}
+
+/**
+ * Reconciliation pass for metering integrity (ANO-67). Re-derives each billed
+ * session's expected duration charge straight from the source `agent_session` row —
+ * using the SAME formula as debitSessionDuration — and asserts a 1:1 match against the
+ * `credit_ledger` debit keyed `session:<id>`. It only FLAGS drift (logs + returns a
+ * report); it never writes a correcting entry, because an auto-correct is itself a new
+ * double-charge vector — a human reviews drift and decides.
+ *
+ * Bounded to the most-recently-billed `limit` sessions per tick (a drift alarm, not a
+ * full-history audit). Cheap, read-only; safe to run every cron tick.
+ *
+ * Caveat — rate history: expectation is re-derived at the CURRENT SESSION_MICRO_PER_MS.
+ * A session billed under a different rate (e.g. before a retail-margin change) will
+ * surface as `amount_mismatch` even though its debit was correct at the time. So a
+ * non-empty drift report right after a rate change is expected, not necessarily a bug;
+ * a clean "zero drift" is only meaningful for sessions billed at today's rate.
+ */
+export async function reconcileDebits(limit = 1000): Promise<ReconcileResult> {
+  const rows = await query<{
+    session_id: string;
+    org_id: string;
+    started_at: string;
+    ended_at: string;
+    expires_at: string;
+    ledger_micro: string | null;
+  }>(
+    `SELECT s.id AS session_id, s.org_id, s.started_at, s.ended_at, s.expires_at,
+            l.amount_micro AS ledger_micro
+       FROM waddling.agent_session s
+       LEFT JOIN waddling.credit_ledger l
+         ON l.org_id = s.org_id AND l.idempotency_key = 'session:' || s.id
+      WHERE s.billed_at IS NOT NULL AND s.ended_at IS NOT NULL
+      ORDER BY s.billed_at DESC
+      LIMIT $1`,
+    [limit],
+  );
+
+  const drift: DebitDrift[] = [];
+  for (const r of rows.rows) {
+    // Identical derivation to debitSessionDuration so the expectation is byte-exact.
+    const startMs = Date.parse(r.started_at);
+    const endMs = Math.min(Date.parse(r.ended_at), Date.parse(r.expires_at));
+    const durationMs = Math.max(0, endMs - startMs);
+    const expectedMicro = Math.round(durationMs * SESSION_MICRO_PER_MS);
+    const ledgerMicro = r.ledger_micro == null ? null : Number(r.ledger_micro);
+
+    let kind: DebitDrift['kind'] | null = null;
+    if (expectedMicro > 0 && ledgerMicro === null) {
+      kind = 'missing_debit'; // a charge we owe but never posted (lost revenue)
+    } else if (expectedMicro > 0 && ledgerMicro !== -expectedMicro) {
+      kind = 'amount_mismatch'; // posted, but not the amount we'd re-derive
+    } else if (expectedMicro === 0 && ledgerMicro !== null) {
+      kind = 'unexpected_debit'; // zero-duration session that somehow got charged
+    }
+    if (kind) {
+      drift.push({ sessionId: r.session_id, orgId: r.org_id, expectedMicro, ledgerMicro, kind });
+    }
+  }
+
+  if (drift.length > 0) {
+    console.log(
+      `[credits] reconcile: ${drift.length}/${rows.rows.length} billed sessions DRIFTED — ` +
+        drift
+          .slice(0, 20)
+          .map((d) => `${d.sessionId}(${d.kind} exp=${d.expectedMicro} got=${d.ledgerMicro})`)
+          .join(', '),
+    );
+  } else {
+    console.log(`[credits] reconcile: ${rows.rows.length} billed sessions OK (no drift).`);
+  }
+  return { checked: rows.rows.length, drift };
+}

@@ -115,12 +115,17 @@ async function dpFetch(
  */
 async function recordQueryAudit(
   sess: { org_id: string; agent_id: string; datalake_id: string },
+  queryId: string,
 ): Promise<void> {
-  // Usage — exactly one query ran in this session.
+  // Usage — exactly one query ran in this session. `queryId` is minted once per
+  // /query|/etl call (synchronously, before this best-effort waitUntil), so a retry
+  // or redelivery of this insert is a no-op (UNIQUE org_id+idempotency_key, migration
+  // 018) instead of an over-count. Same id keys the per-query floor debit.
   await query(
-    `INSERT INTO waddling.usage_event (org_id, agent_id, datalake_id, kind, quantity)
-       VALUES ($1, $2, $3, 'query', 1)`,
-    [sess.org_id, sess.agent_id, sess.datalake_id],
+    `INSERT INTO waddling.usage_event (org_id, agent_id, datalake_id, kind, quantity, idempotency_key)
+       VALUES ($1, $2, $3, 'query', 1, $4)
+     ON CONFLICT (org_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+    [sess.org_id, sess.agent_id, sess.datalake_id, queryId],
   );
 
   // Drain birdshot's audit log from the per-endpoint gateway and persist each record.
@@ -946,7 +951,12 @@ sessions.post('/:id/query', (c) =>
     // important audit row, so this runs before the deny/error branches below too.
     let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
     try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
-    const recording = recordQueryAudit(sess).catch((e) => {
+    // One stable id for this executed query, minted synchronously (before the
+    // best-effort waitUntil work) so it survives a retry. It keys BOTH the usage_event
+    // row (idempotent insert) and the per-query floor debit, so a redelivery can't
+    // over-count either.
+    const queryId = crypto.randomUUID();
+    const recording = recordQueryAudit(sess, queryId).catch((e) => {
       console.log(`[sessions] recordQueryAudit failed: ${e instanceof Error ? e.message : String(e)}`);
     });
     if (exCtx) exCtx.waitUntil(recording);
@@ -1000,8 +1010,9 @@ sessions.post('/:id/query', (c) =>
     };
 
     // Per-query floor debit — minor + best-effort (the dominant session-duration charge is
-    // billed durably by the sweeper). Unique key per call: this is a top-up, not a dedupe.
-    const flooring = debitQueryFloor(sess.org_id, sess.id, crypto.randomUUID()).catch((e) => {
+    // billed durably by the sweeper). Keyed by the stable queryId so a retry charges the
+    // floor exactly once per query (one floor per executed query, no double on redelivery).
+    const flooring = debitQueryFloor(sess.org_id, sess.id, queryId).catch((e) => {
       console.log(`[sessions] query floor debit failed: ${e instanceof Error ? e.message : String(e)}`);
     });
     if (exCtx) exCtx.waitUntil(flooring);
@@ -1092,13 +1103,16 @@ sessions.post('/:id/etl', (c) =>
     // Best-effort audit AFTER the response (waitUntil) — never adds latency or fails the call.
     let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
     try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
-    const recording = recordQueryAudit(sess).catch((e) => {
+    // Stable per-statement id (see /query) — idempotent usage_event + floor debit.
+    const queryId = crypto.randomUUID();
+    const recording = recordQueryAudit(sess, queryId).catch((e) => {
       console.log(`[sessions] recordEtlAudit failed: ${e instanceof Error ? e.message : String(e)}`);
     });
     if (exCtx) exCtx.waitUntil(recording);
 
     // Per-query floor debit for the ETL statement (best-effort; duration billed by sweeper).
-    const flooring = debitQueryFloor(sess.org_id, sess.id, crypto.randomUUID()).catch((e) => {
+    // Keyed by queryId so a retry charges the floor exactly once.
+    const flooring = debitQueryFloor(sess.org_id, sess.id, queryId).catch((e) => {
       console.log(`[sessions] etl floor debit failed: ${e instanceof Error ? e.message : String(e)}`);
     });
     if (exCtx) exCtx.waitUntil(flooring);

@@ -164,32 +164,39 @@ END $$;
 -- read_source/copy URIs, INSTALL/LOAD extension names, ATTACH targets — gated by
 -- birdshot_add_{source,dest,ext,attach}_policy, NOT table RefMatch. A policy only
 -- WIDENS what an already-CONSTANT literal may match (un-pinnable resource = DENY).
-CREATE TABLE IF NOT EXISTS waddling.acl_policy (
-  id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-  org_id       TEXT NOT NULL,
-  datalake_id  TEXT REFERENCES waddling.datalake(id) ON DELETE CASCADE,  -- NULL = all
-  subject_kind TEXT NOT NULL DEFAULT 'agent'
-                 CHECK (subject_kind IN ('agent','user','org')),
-  agent_id     TEXT REFERENCES waddling.agent(id) ON DELETE CASCADE,
-  user_id      TEXT,                                   -- → auth.user.id (no FK: cross-schema)
-  policy_kind  TEXT NOT NULL
-                 CHECK (policy_kind IN ('source','dest','extension','attach')),
-  capability   TEXT NOT NULL
-                 CHECK (capability IN (
-                   'read_source','copy_to','copy_from','attach','install','load'
-                 )),
-  pattern      TEXT NOT NULL,                          -- host/domain or extension name
-  expires_at   TIMESTAMPTZ,
-  created_by   TEXT NOT NULL,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT acl_policy_subject_resolvable CHECK (
-    (subject_kind = 'agent' AND agent_id IS NOT NULL) OR
-    (subject_kind = 'user'  AND user_id  IS NOT NULL) OR
-    (subject_kind = 'org')
-  )
-);
-CREATE INDEX IF NOT EXISTS acl_policy_lookup_idx
-  ON waddling.acl_policy (datalake_id, subject_kind, user_id, agent_id);
+-- Guarded: on a fresh DB schema.sql runs before migration 008 renames endpoint→datalake,
+-- so waddling.datalake doesn't exist yet. Migration 012 creates it instead.
+DO $$
+BEGIN
+  IF to_regclass('waddling.datalake') IS NOT NULL THEN
+    CREATE TABLE IF NOT EXISTS waddling.acl_policy (
+      id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+      org_id       TEXT NOT NULL,
+      datalake_id  TEXT REFERENCES waddling.datalake(id) ON DELETE CASCADE,  -- NULL = all
+      subject_kind TEXT NOT NULL DEFAULT 'agent'
+                     CHECK (subject_kind IN ('agent','user','org')),
+      agent_id     TEXT REFERENCES waddling.agent(id) ON DELETE CASCADE,
+      user_id      TEXT,                                   -- → auth.user.id (no FK: cross-schema)
+      policy_kind  TEXT NOT NULL
+                     CHECK (policy_kind IN ('source','dest','extension','attach')),
+      capability   TEXT NOT NULL
+                     CHECK (capability IN (
+                       'read_source','copy_to','copy_from','attach','install','load'
+                     )),
+      pattern      TEXT NOT NULL,                          -- host/domain or extension name
+      expires_at   TIMESTAMPTZ,
+      created_by   TEXT NOT NULL,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CONSTRAINT acl_policy_subject_resolvable CHECK (
+        (subject_kind = 'agent' AND agent_id IS NOT NULL) OR
+        (subject_kind = 'user'  AND user_id  IS NOT NULL) OR
+        (subject_kind = 'org')
+      )
+    );
+    CREATE INDEX IF NOT EXISTS acl_policy_lookup_idx
+      ON waddling.acl_policy (datalake_id, subject_kind, user_id, agent_id);
+  END IF;
+END $$;
 
 -- ── Agent sessions (live ATTACH sessions; NOT Better Auth session) ──
 CREATE TABLE IF NOT EXISTS waddling.agent_session (
@@ -238,10 +245,25 @@ CREATE TABLE IF NOT EXISTS waddling.usage_event (
   endpoint_id     TEXT,
   kind            TEXT NOT NULL,        -- 'query'|'rows_scanned'|'bytes_scanned'|'session'
   quantity        BIGINT NOT NULL DEFAULT 1,
-  duration_ms     INTEGER
+  duration_ms     INTEGER,
+  -- Stable per-statement id (migration 018); a replayed ingest is a no-op. NULLABLE:
+  -- legacy rows carry none. Partial-unique only over non-null keys.
+  idempotency_key TEXT
 );
 CREATE INDEX IF NOT EXISTS usage_event_org_ts_idx
   ON waddling.usage_event (org_id, ts DESC);
+-- Re-run safety: on a DB that predates migration 018 the column may not exist.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema='waddling' AND table_name='usage_event'
+                   AND column_name='idempotency_key') THEN
+    ALTER TABLE waddling.usage_event ADD COLUMN idempotency_key TEXT;
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS usage_event_idem_uq
+  ON waddling.usage_event (org_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
 -- Rollups for billing read this; W1 computes monthly aggregates from it.
 
 -- ── Notebooks (saved SQL workbooks for the dashboard's Notebooks view) ──

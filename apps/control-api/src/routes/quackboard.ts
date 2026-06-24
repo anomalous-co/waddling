@@ -238,10 +238,15 @@ function isAuthzDeny(r: { status: number; json: any }): boolean {
  *  each record is attributed to ITS own agent via `user` ('agent:<id>'), so interleaved agents'
  *  queries on the shared board still attribute correctly. Best-effort (callers run in waitUntil). */
 async function recordQbAudit(env: Env, ctx: QbContext): Promise<void> {
+  // Stable per-op id for the idempotency_key column (migration 018) — keeps the
+  // quackboard usage row shaped like the lake path. This op is awaited (not waitUntil)
+  // and un-billed, so a fresh id per call is sufficient; the ON CONFLICT guard makes
+  // the insert a no-op if the same key ever recurs.
   await query(
-    `INSERT INTO waddling.usage_event (org_id, agent_id, datalake_id, kind, quantity)
-       VALUES ($1, $2, $3, 'query', 1)`,
-    [ctx.orgId, ctx.agentId, ctx.datalakeId],
+    `INSERT INTO waddling.usage_event (org_id, agent_id, datalake_id, kind, quantity, idempotency_key)
+       VALUES ($1, $2, $3, 'query', 1, $4)
+     ON CONFLICT (org_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+    [ctx.orgId, ctx.agentId, ctx.datalakeId, crypto.randomUUID()],
   );
   const drained = await dpFetch(env, '/qb/audit-drain', { orgId: ctx.orgId });
   const records: any[] = drained.json?.records ?? [];

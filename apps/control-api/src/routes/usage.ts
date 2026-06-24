@@ -23,10 +23,6 @@ const IngestSchema = z.object({
   durationMs: z.number().int().nonnegative().optional(),
 });
 
-// Rough per-unit cost estimate (USD) for the dashboard $ figure; not billed.
-const COST_PER_QUERY = 0.0005;
-const COST_PER_BYTE = 0.0000000005;
-
 /**
  * Resolve a `period` query param into a [start,end) window + the time-bucket
  * granularity for the series. Accepts rolling windows ('24h','7d','30d') and a
@@ -137,6 +133,21 @@ usage.get('/', (c) =>
 
     const queries = Number(agg?.queries ?? 0);
     const bytes = Number(agg?.bytes_scanned ?? 0);
+
+    // Real spend for this period = the sum of the actual credit_ledger DEBIT rows
+    // (session duration + per-query floor), not a per-unit estimate. amount_micro is
+    // negative for debits, so negate to get a positive µUSD spend. Org-scoped: the
+    // ledger has no agent_id, so a per-agent rollup can't attribute spend (left
+    // undefined there rather than showing a wrong number). See docs/credit-unit-economics.md.
+    const spend = await queryOne<{ spent_micro: string }>(
+      `SELECT COALESCE(-SUM(amount_micro) FILTER (WHERE entry_type='debit'), 0)::text AS spent_micro
+         FROM waddling.credit_ledger
+        WHERE org_id = $1 AND ts >= $2::timestamptz AND ts < $3::timestamptz`,
+      [caller.orgId, startIso, endIso],
+    );
+    const spentMicro = Number(spend?.spent_micro ?? 0);
+    const spentUsd = spentMicro / MICRO_PER_USD;
+
     const rollup: UsageRollup = {
       orgId: caller.orgId,
       agentId: agentId ?? undefined,
@@ -145,7 +156,8 @@ usage.get('/', (c) =>
       rowsScanned: Number(agg?.rows_scanned ?? 0),
       bytesScanned: bytes,
       activeSessions: Number(active?.n ?? 0),
-      estimatedCost: queries * COST_PER_QUERY + bytes * COST_PER_BYTE,
+      // Org-wide actual spend; omitted for a per-agent view (ledger isn't agent-scoped).
+      estimatedCost: agentId ? undefined : spentUsd,
     };
     const planName = await getActivePlanName(caller.orgId);
     const totalSessions = series.reduce((acc, p) => acc + p.sessions, 0);
@@ -162,6 +174,9 @@ usage.get('/', (c) =>
       credit: {
         balanceMicro,
         balanceUsd: balanceMicro / MICRO_PER_USD,
+        // Actual prepaid spend drawn down this period (org-wide).
+        spentMicro,
+        spentUsd,
       },
     });
   }),
