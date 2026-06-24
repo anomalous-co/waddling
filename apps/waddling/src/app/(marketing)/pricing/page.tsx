@@ -10,7 +10,7 @@ import { TrackedLink } from '@/components/tracked-link';
 
 export const metadata: Metadata = {
   title: 'Pricing — waddling',
-  description: 'Free to start. Pro for dynamic ACLs. Enterprise for dedicated gateways and SSO.',
+  description: 'Prepaid credits, billed by usage at $0.50/active session-hour. Free $0, Pro $49/mo, Enterprise $199/mo — each includes monthly usage credits.',
 };
 
 // Human copy — prices, descriptions, CTAs. Entitlement numbers pulled from PLANS at render time.
@@ -25,6 +25,7 @@ const PLAN_COPY = [
     ctaHref: appUrl('/dashboard'),
     highlight: false,
     features: [
+      '$5 / mo in usage credits included',
       '1 data lake · 2 agents',
       'Static reader / writer roles',
       'Audit log (7-day retention)',
@@ -38,13 +39,14 @@ const PLAN_COPY = [
   {
     key: 'pro',
     name: 'Pro',
-    price: '$99',
-    period: 'seat / month',
+    price: '$49',
+    period: 'month',
     tagline: 'Full dynamic ACL for your agents.',
     cta: 'start pro trial',
     ctaHref: appUrl('/dashboard?plan=pro'),
     highlight: true,
     features: [
+      '$49 / mo in usage credits included',
       'Up to 5 data lakes',
       '25 agents',
       'Full dynamic ACL (column · row limit · time window · TTL · instant revoke)',
@@ -57,13 +59,14 @@ const PLAN_COPY = [
   {
     key: 'enterprise',
     name: 'Enterprise',
-    price: 'Custom',
-    period: 'contact sales',
+    price: '$199',
+    period: 'month',
     tagline: 'Dedicated gateways, SSO, and SLA.',
     cta: 'talk to us',
     ctaHref: '/enterprise',
     highlight: false,
     features: [
+      '$199 / mo in usage credits included',
       'Unlimited data lakes + agents',
       'Dedicated isolated gateways',
       'Dedicated encrypted R2 buckets',
@@ -163,8 +166,23 @@ export default function PricingPage() {
         ))}
       </div>
 
+      {/* Usage-based pricing explainer */}
+      <div className="mt-12 border border-zinc-800 rounded-lg p-6 bg-zinc-900/40">
+        <h2 className="font-mono font-semibold text-zinc-50 mb-3">how usage works</h2>
+        <p className="text-sm text-zinc-400 max-w-3xl leading-relaxed">
+          Every plan is <span className="text-zinc-200">prepaid credits</span>. Your monthly
+          plan resets your credit balance to its included amount each billing cycle, then usage
+          draws it down at{' '}
+          <span className="text-emerald-400 font-mono">$0.50 / active session-hour</span>{' '}
+          — you only pay while an agent session is live. Run out before the month is up? Top up
+          any time (<span className="text-zinc-200 font-mono">$10 minimum</span>); purchased
+          credits carry over and are spent after your monthly credits. At a zero balance, serving
+          pauses until you top up — no surprise overage bills.
+        </p>
+      </div>
+
       {/* Comparison note */}
-      <div className="mt-16 border border-zinc-800 rounded-lg p-6">
+      <div className="mt-12 border border-zinc-800 rounded-lg p-6">
         <h2 className="font-mono font-semibold text-zinc-50 mb-6">detailed comparison</h2>
         <div className="overflow-x-auto">
           <table className="w-full text-sm font-mono">
@@ -177,6 +195,8 @@ export default function PricingPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800/60">
+              <Row label="monthly usage credits" free="$5" pro="$49" enterprise="$199" />
+              <Row label="usage rate" free="$0.50 / session-hr" pro="$0.50 / session-hr" enterprise="$0.50 / session-hr" />
               <Row label="data lakes" free={freeEndpoints} pro={proEndpoints} enterprise="unlimited" />
               <Row label="agents" free={freeAgents} pro={proAgents} enterprise="unlimited" />
               <Row label="dynamic ACL (column · row · time)" free="✗" pro="✓" enterprise="✓" proGreen />

@@ -235,8 +235,9 @@ LIMIT 500;
             ready to govern your agents?
           </h2>
           <p className="mx-auto mb-8 max-w-xl text-muted-foreground">
-            Free tier includes 1 data lake, 2 agents, and full audit. No credit
-            card required.
+            Free tier includes 1 data lake, 2 agents, full audit, and $5/mo in
+            usage credits. Prepaid, billed at $0.50 per active session-hour — no
+            credit card required to start.
           </p>
           <div className="flex flex-wrap justify-center gap-4">
             <Button asChild size="lg" className={BRAND_BTN}>
