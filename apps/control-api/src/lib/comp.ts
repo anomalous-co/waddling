@@ -9,11 +9,10 @@
  * by inviting a company user as a member. The check is org-scoped so it covers the
  * agent/session credit path (which has no human email), not just the human gate.
  *
- * NOTE (abuse window): email verification is not yet enforced at signup (ANO-56), so this
- * does NOT require `emailVerified` — otherwise the founder's own (unverified) account
- * wouldn't be comped. Once verification is live, add `AND u."emailVerified" = true` here
- * so a signup can't claim a comp domain it doesn't control. The blast radius today is
- * limited to free usage of the attacker's own org (no data access).
+ * Email verification is enforced at signup (ANO-56, requireEmailVerification), so the
+ * comp check requires `emailVerified` — a signup can't claim a comp domain it doesn't
+ * control (it could never confirm the verification email). Founder accounts verify like
+ * any other, so this doesn't lock them out.
  */
 import { queryOne } from './db';
 
@@ -52,6 +51,7 @@ export async function isOrgComped(orgId: string): Promise<boolean> {
          JOIN "user" u ON u.id = m."userId"
         WHERE m."organizationId" = $1
           AND m.role = 'owner'
+          AND u."emailVerified" = true
           AND (${likeClause})
         LIMIT 1`,
       [orgId, ...COMP_EMAIL_DOMAINS.map((d) => `%@${d.toLowerCase()}`)],

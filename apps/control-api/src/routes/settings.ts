@@ -6,14 +6,15 @@
  *                  `apiKeys` are the org's agents' Better Auth `apikey` rows (linked
  *                  via agent.api_key_id).
  * POST /members  → invite a member: create a pending invitation row (Better Auth
- *                  `invitation` schema). Email delivery is owned by the deployment's
- *                  mailer; the demo just records the pending invite. Returns { ok }.
+ *                  `invitation` schema) and send the invitation email (lib/email).
+ *                  Returns { ok }.
  */
 import { z } from 'zod';
 import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
 import { resolveCaller, parseBody, handle, ok, err } from '../lib/cp-shared';
+import { sendEmail, invitationEmail } from '../lib/email';
 
 interface OrgRow {
   id: string;
@@ -111,11 +112,35 @@ settings.post('/members', (c) =>
     const caller = await resolveCaller(c);
     const { email, role } = await parseBody(c, InviteSchema);
 
+    const invitationId = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + INVITE_TTL_DAYS * 86400e3).toISOString();
     await query(
       `INSERT INTO "invitation" (id, "organizationId", email, role, status, "expiresAt", "inviterId")
        VALUES ($1, $2, $3, $4, 'pending', $5, $6)`,
-      [crypto.randomUUID(), caller.orgId, email, role, expiresAt, caller.callerId],
+      [invitationId, caller.orgId, email, role, expiresAt, caller.callerId],
+    );
+
+    // Send the invitation email (best-effort: the pending row is the source of truth, so a
+    // mailer failure must not fail the invite). Accept URL mirrors the Better Auth org hook.
+    const org = await queryOne<{ name: string }>(
+      `SELECT name FROM "organization" WHERE id = $1`,
+      [caller.orgId],
+    );
+    const inviter = await queryOne<{ name: string | null }>(
+      `SELECT name FROM "user" WHERE id = $1`,
+      [caller.callerId],
+    );
+    const webOrigin =
+      (c.env.WEB_ORIGIN ?? c.env.BETTER_AUTH_URL ?? '').split(',')[0]?.trim() || '';
+    await sendEmail(
+      c.env,
+      email,
+      invitationEmail({
+        acceptUrl: `${webOrigin}/accept-invitation/${invitationId}`,
+        orgName: org?.name ?? 'your team',
+        role,
+        inviterName: inviter?.name ?? undefined,
+      }),
     );
 
     return ok(c, { ok: true, email, role }, 201);

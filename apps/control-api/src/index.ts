@@ -16,7 +16,7 @@ import { AwsClient } from "aws4fetch";
 import { Pool } from "pg";
 import type { Env } from "./lib/env";
 import { runInDbScope, query } from "./lib/db";
-import { sweepExpiredSessions } from "./lib/credits";
+import { sweepExpiredSessions, resetAllTierCredits, currentBillingPeriod } from "./lib/credits";
 import { buildAuth, runMigrations, runInAuthScope } from "./lib/auth";
 import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
@@ -623,10 +623,12 @@ app.get("/probe", async (c) => {
   });
 });
 
-// Scheduled (cron) handler — the prepaid-credit duration-debit driver. Each tick closes
-// abandoned-but-active sessions past TTL and debits every closed-but-unbilled session's
-// wall-clock (the dominant COGS). Runs in its own per-invocation DB scope (no ambient
-// pool on workerd). Cadence is set by the cron trigger in wrangler.jsonc.
+// Scheduled (cron) handler — the prepaid-credit driver. Each tick (1) closes abandoned-
+// but-active sessions past TTL and debits every closed-but-unbilled session's wall-clock
+// (the dominant COGS), and (2) resets each org's monthly tier-credit allotment for the
+// current period (idempotent per period, so all but the month's first tick is near-zero
+// work). Runs in its own per-invocation DB scope (no ambient pool on workerd). Cadence is
+// set by the cron trigger in wrangler.jsonc.
 async function scheduled(
   _event: ScheduledController,
   env: Env,
@@ -638,6 +640,12 @@ async function scheduled(
       if (n > 0) console.log(`[cron] swept + debited ${n} session(s)`);
     } catch (e) {
       console.log(`[cron] sweepExpiredSessions failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    try {
+      const reset = await resetAllTierCredits(currentBillingPeriod());
+      if (reset > 0) console.log(`[cron] reset tier credit for ${reset} org(s)`);
+    } catch (e) {
+      console.log(`[cron] resetAllTierCredits failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   });
 }

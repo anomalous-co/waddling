@@ -24,7 +24,14 @@ import Stripe from 'stripe';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Env } from './env';
 import { makePostHog } from './posthog';
-import { grantCredits, STARTER_GRANT_MICRO } from './credits';
+import { resetTierCreditsForOrg, currentBillingPeriod } from './credits';
+import {
+  sendEmail,
+  verificationEmail,
+  resetPasswordEmail,
+  invitationEmail,
+  paymentFailedEmail,
+} from './email';
 import { queryOne } from './db';
 import { fulfillCreditPackEvent } from './credit-packs';
 import { captureCheckoutCompletedEvent } from './funnel-stripe';
@@ -94,7 +101,35 @@ function construct(env: Env, pool: Pool) {
     // owned by a prior request → opaque 1101). Per-request is Better Auth's own
     // documented Cloudflare pattern. Cap at 5; Hyperdrive pools server-side.
     database: pool,
-    emailAndPassword: { enabled: true },
+    emailAndPassword: {
+      enabled: true,
+      // ANO-56 decision: a new account must verify its email before it can be used.
+      requireEmailVerification: true,
+      sendResetPassword: async ({
+        user,
+        url,
+      }: {
+        user: { email: string; name?: string };
+        url: string;
+      }) => {
+        await sendEmail(env, { email: user.email, name: user.name }, resetPasswordEmail(url, user.name));
+      },
+    },
+    // Verification mail is sent on sign-up; the account stays unusable until verified
+    // (requireEmailVerification above), then auto-signs-in on confirm.
+    emailVerification: {
+      sendOnSignUp: true,
+      autoSignInAfterVerification: true,
+      sendVerificationEmail: async ({
+        user,
+        url,
+      }: {
+        user: { email: string; name?: string };
+        url: string;
+      }) => {
+        await sendEmail(env, { email: user.email, name: user.name }, verificationEmail(url, user.name));
+      },
+    },
 
     // PostHog funnel hooks. posthog-node is Node-only and does not bundle/run on
     // workerd, so capture goes over PostHog's HTTP ingestion endpoint instead (see
@@ -135,6 +170,27 @@ function construct(env: Env, pool: Pool) {
       organization({
         allowUserToCreateOrganization: true,
         creatorRole: 'owner',
+        // Member-invite email (unblocks ANO-79). Fires when an invite is created via
+        // Better Auth's organization API; the manual /settings/members route sends its
+        // own invite mail with the same template + accept URL.
+        sendInvitationEmail: async (data: {
+          id: string;
+          email: string;
+          role: string;
+          organization: { name?: string };
+          inviter?: { user?: { name?: string } };
+        }) => {
+          await sendEmail(
+            env,
+            data.email,
+            invitationEmail({
+              acceptUrl: `${uiOrigin}/accept-invitation/${data.id}`,
+              orgName: data.organization?.name ?? 'your team',
+              role: data.role,
+              inviterName: data.inviter?.user?.name,
+            }),
+          );
+        },
         organizationHooks: {
           afterCreateOrganization: async (args: {
             organization: { id: string; name?: string };
@@ -150,26 +206,22 @@ function construct(env: Env, pool: Pool) {
             } catch {
               // swallow — telemetry must never break org creation.
             }
-            // Free-tier starter credit grant — the single onboarding path for the prepaid
-            // ledger (NEW orgs; existing orgs are backfilled by a one-off script). Idempotent
-            // on `starter:<orgId>` so a retried create can't double-grant. Runs in this auth
-            // request's DB scope. Swallow errors: a grant failure must not fail sign-up —
-            // it can be reconciled by re-running the (idempotent) grant.
+            // Seed the prepaid ledger with this period's tier allotment (free ⇒ $5). This
+            // IS the new-org starter: resetTierCreditsForOrg uses the period-keyed idempotency
+            // (`tier_reset:<org>:<YYYY-MM>`), so the monthly cron tick in the same month is a
+            // no-op — the org gets one allotment now, not a starter grant PLUS a reset.
+            // Swallow errors so a seed failure never fails sign-up — but LOG loudly: a missing
+            // seed means no balance row, and hasCredit() fails open, so the org would get
+            // unlimited free service invisibly until the next cron reset reconciles it.
             try {
-              await grantCredits(
+              await resetTierCreditsForOrg(
                 args.organization.id,
-                STARTER_GRANT_MICRO,
-                'starter_grant',
-                `starter:${args.organization.id}`,
-                { createdBy: args.user.id },
+                currentBillingPeriod(),
+                args.user.id,
               );
             } catch (e) {
-              // Swallow so a grant failure never fails sign-up — but LOG loudly: a missing
-              // grant means no balance row, and hasCredit() fails open, so the org would get
-              // unlimited free service invisibly. This makes that leak observable + reconcilable
-              // (re-run the idempotent backfill script).
               console.log(
-                `[credits] STARTER GRANT FAILED for org ${args.organization.id} — reconcile via backfill: ${e instanceof Error ? e.message : String(e)}`,
+                `[credits] TIER SEED FAILED for org ${args.organization.id} — reconcile on next cron reset: ${e instanceof Error ? e.message : String(e)}`,
               );
             }
           },
@@ -222,6 +274,21 @@ function construct(env: Env, pool: Pool) {
           // Conversion funnel: emit checkout_completed for a settled subscription
           // Checkout (no-op for credit-pack/payment events). Best-effort, never throws.
           await captureCheckoutCompletedEvent(env, event, authExecutionCtx());
+          // Dunning: a failed subscription payment → notify the customer. sendEmail never
+          // throws, so this can't turn a dunning email into a Stripe webhook retry.
+          if (event.type === 'invoice.payment_failed') {
+            const inv = event.data.object as {
+              customer_email?: string | null;
+              customer_name?: string | null;
+            };
+            if (inv.customer_email) {
+              await sendEmail(
+                env,
+                { email: inv.customer_email, name: inv.customer_name ?? undefined },
+                paymentFailedEmail({ name: inv.customer_name ?? undefined }),
+              );
+            }
+          }
         },
         // Stripe's customer/subscription side-effects make external Stripe API calls
         // during auth + org-create flows. With PLACEHOLDER keys those calls don't

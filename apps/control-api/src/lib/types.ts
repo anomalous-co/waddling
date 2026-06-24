@@ -72,6 +72,10 @@ export interface AuditQuery {
 export interface Plan {
   name: 'free' | 'pro' | 'enterprise';
   priceId: string;
+  /** Monthly prepaid credit allotment (USD). The org's tier-credit bucket is RESET to
+   *  this each billing cycle (unused tier credit expires; purchased top-ups persist).
+   *  Equals the tier's monthly subscription price. See docs/credit-unit-economics.md. */
+  monthlyCreditUsd: number;
   entitlements: {
     endpoints: number;
     agents: number;

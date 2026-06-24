@@ -31,6 +31,7 @@ export function getPlans(): Plan[] {
     {
       name: 'free',
       priceId: '',
+      monthlyCreditUsd: 5,
       entitlements: {
         endpoints: 1,
         agents: 2,
@@ -45,6 +46,7 @@ export function getPlans(): Plan[] {
       // own stripePlans(env) from env.STRIPE_PRICE_PRO; the entitlement gates that
       // read this catalog never look at priceId.
       priceId: '',
+      monthlyCreditUsd: 49,
       entitlements: {
         endpoints: 5,
         agents: 25,
@@ -56,6 +58,7 @@ export function getPlans(): Plan[] {
     {
       name: 'enterprise',
       priceId: '',
+      monthlyCreditUsd: 199,
       entitlements: {
         endpoints: Number.POSITIVE_INFINITY,
         agents: Number.POSITIVE_INFINITY,

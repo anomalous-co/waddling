@@ -12,6 +12,26 @@
 // back to a minimal local shape. The runtime binding always has an async `.get()`.
 export type SecretBinding = { get(): Promise<string> };
 
+// Cloudflare Email Service `send_email` binding shape. May not exist in older
+// @cloudflare/workers-types, so declare the minimal surface we use locally (mirrors
+// the SecretBinding fallback above). See docs/cloudflare-email-service.md.
+export interface EmailAddress {
+  email: string;
+  name?: string;
+}
+export interface EmailMessage {
+  to: string | EmailAddress | (string | EmailAddress)[];
+  from: string | EmailAddress;
+  subject: string;
+  html?: string;
+  text?: string;
+  replyTo?: string | EmailAddress;
+  headers?: Record<string, string>;
+}
+export interface SendEmailBinding {
+  send(message: EmailMessage): Promise<{ messageId: string }>;
+}
+
 export interface Env {
   // ── Bindings ────────────────────────────────────────────────────────────
   HYPERDRIVE: Hyperdrive;
@@ -21,6 +41,10 @@ export interface Env {
   // Native R2 binding for user avatars (upload + public serve). Distinct from the
   // credential-based R2 path used for lake/workspace buckets.
   AVATARS: R2Bucket;
+  // Cloudflare Email Service (Email Sending) — transactional mail (verification,
+  // password reset, org invites, billing dunning). Optional so a deploy without the
+  // binding still types; lib/email.sendEmail no-ops + logs when it is absent.
+  EMAIL?: SendEmailBinding;
 
   // ── Worker secret (set via `wrangler secret put`, NOT in vars) ───────────
   BETTER_AUTH_SECRET: string;
