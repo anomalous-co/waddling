@@ -102,7 +102,19 @@ async function main() {
   let catalogSslCert = process.env.DUCKLAKE_CATALOG_SSLCERT ?? "";
   let catalogSslKey = process.env.DUCKLAKE_CATALOG_SSLKEY ?? "";
   let catalogSslRootCert = process.env.DUCKLAKE_CATALOG_SSLROOTCERT ?? "";
-  if (process.env.GW_PG_SSLCERT_PEM || process.env.GW_PG_SSLKEY_PEM || process.env.GW_PG_SSLROOTCERT_PEM) {
+  // PEMs arrive base64-encoded (GW_PG_SSL*_PEM_B64): the startProcess env channel indents
+  // continuation lines of a multi-line value, which corrupts a raw PEM ("bad end line").
+  // A single-line base64 value is immune; decode it here. Fall back to the raw *_PEM names
+  // for any caller that still injects them directly (local/file paths).
+  const pemFromEnv = (name) => {
+    const b64 = process.env[`${name}_B64`];
+    if (b64) return Buffer.from(b64, "base64").toString("utf8");
+    return process.env[name] || "";
+  };
+  const certPem = pemFromEnv("GW_PG_SSLCERT_PEM");
+  const keyPem = pemFromEnv("GW_PG_SSLKEY_PEM");
+  const rootPem = pemFromEnv("GW_PG_SSLROOTCERT_PEM");
+  if (certPem || keyPem || rootPem) {
     const sslDir = resolve(STATE_DIR, "cloudsql");
     mkdirSync(sslDir, { recursive: true });
     const writePem = (pem, name, mode) => {
@@ -110,9 +122,9 @@ async function main() {
       writeFileSync(p, pem, { mode });
       return p;
     };
-    if (process.env.GW_PG_SSLCERT_PEM) catalogSslCert = writePem(process.env.GW_PG_SSLCERT_PEM, "client-cert.pem", 0o600);
-    if (process.env.GW_PG_SSLKEY_PEM) catalogSslKey = writePem(process.env.GW_PG_SSLKEY_PEM, "client-key.pem", 0o600);
-    if (process.env.GW_PG_SSLROOTCERT_PEM) catalogSslRootCert = writePem(process.env.GW_PG_SSLROOTCERT_PEM, "server-ca.pem", 0o644);
+    if (certPem) catalogSslCert = writePem(certPem, "client-cert.pem", 0o600);
+    if (keyPem) catalogSslKey = writePem(keyPem, "client-key.pem", 0o600);
+    if (rootPem) catalogSslRootCert = writePem(rootPem, "server-ca.pem", 0o644);
   }
 
   // Boot config is injected as per-process env by the GatewayDO at startProcess. Two modes:

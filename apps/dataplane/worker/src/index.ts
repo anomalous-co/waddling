@@ -224,9 +224,13 @@ function bootEnvFromConfig(boot: GatewayBoot | undefined, workerEnv: Env): Recor
   const set = (k: string, v: unknown) => { if (v !== undefined && v !== null && v !== '') env[k] = String(v); };
   // Shared mTLS material for the postgres catalog (Cloud SQL). Harmless for quackboard (no
   // catalog ATTACH); never reaches WorkspaceSandbox (different boot command).
-  set('GW_PG_SSLCERT_PEM', workerEnv.GW_PG_SSLCERT_PEM);
-  set('GW_PG_SSLKEY_PEM', workerEnv.GW_PG_SSLKEY_PEM);
-  set('GW_PG_SSLROOTCERT_PEM', workerEnv.GW_PG_SSLROOTCERT_PEM);
+  // base64-encoded: the startProcess env channel INDENTS continuation lines of a multi-line
+  // value (each PEM line gained leading spaces → OpenSSL "bad end line" → catalog ATTACH failed
+  // every boot). A single-line base64 value has no newlines to indent; the entrypoint decodes.
+  const b64pem = (s: unknown) => (typeof s === 'string' && s ? btoa(s) : undefined);
+  set('GW_PG_SSLCERT_PEM_B64', b64pem(workerEnv.GW_PG_SSLCERT_PEM));
+  set('GW_PG_SSLKEY_PEM_B64', b64pem(workerEnv.GW_PG_SSLKEY_PEM));
+  set('GW_PG_SSLROOTCERT_PEM_B64', b64pem(workerEnv.GW_PG_SSLROOTCERT_PEM));
   set('GW_SERVER_TOKEN', boot.serverToken);
   if (boot.quackboard) {
     // No lake: boot birdshot + serve quack against the restored .duckdb file.
