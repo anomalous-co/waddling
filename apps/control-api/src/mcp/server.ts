@@ -28,7 +28,10 @@ const SERVER_INSTRUCTIONS =
   'lake as lake.<schema>.<table>). To LOAD data into the lake from an external source ' +
   '(CTAS/INSERT over read_json/read_csv/read_parquet), use waddling_etl — it runs on the ' +
   'gateway with egress after birdshot authorizes the statement. Use waddling_whoami to check ' +
-  "grants WITHOUT triggering a denial. Denials are structured { error, table, reason } — read `reason` and self-correct.";
+  "grants WITHOUT triggering a denial. Denials are structured { error, table, reason } — read `reason` and self-correct. " +
+  'If you genuinely need access you lack, call waddling_request_access to get a human-approval ' +
+  'link, give it to the user, then call waddling_await_access (it blocks ~20s and returns { granted }) ' +
+  'in a loop until granted, up to ~10 min, before retrying.';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';

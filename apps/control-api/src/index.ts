@@ -207,7 +207,12 @@ app.on(["GET", "POST", "DELETE"], "/mcp", async (c) => {
     return { ok: res.ok, status: res.status, data };
   };
 
-  return handleMcp(c.req.raw, { loopback });
+  // UI origin for operator-facing deep links (e.g. waddling_request_access). The render
+  // plane runs on WEB_ORIGIN (app.getwaddling.com), NOT this API origin — mirror billing's
+  // first-WEB_ORIGIN-then-fallback resolution so links don't point at the API by mistake.
+  const webOrigin = (c.env.WEB_ORIGIN ?? "").split(",")[0]?.trim();
+  const appUrl = (webOrigin || c.env.APP_URL || c.env.BETTER_AUTH_URL).replace(/\/+$/, "");
+  return handleMcp(c.req.raw, { loopback, appUrl });
 });
 
 // ─── /probe/db ──────────────────────────────────────────────────────────────

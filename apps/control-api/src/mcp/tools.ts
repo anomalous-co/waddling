@@ -40,6 +40,8 @@ export interface LoopbackResult {
 export interface ToolCtx {
   /** Dispatch into this Worker's own routes carrying the caller's Authorization. */
   loopback: (path: string, init?: { method?: string; body?: unknown }) => Promise<LoopbackResult>;
+  /** UI origin (no trailing slash) for building operator-facing deep links. */
+  appUrl: string;
 }
 
 export interface McpTool {
@@ -82,6 +84,68 @@ function failErr(err: unknown): ToolResult {
 }
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+
+/** The catalog capabilities a delegation/acl_rule can carry (matches the control plane). */
+const CATALOG_CAPS = ['read', 'write', 'create', 'drop', 'alter', 'detach'];
+
+/** utf8-safe base64url. Inverse of the frontend's decodeProposal (lib/access-diff.ts). */
+function b64urlEncode(obj: unknown): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** Resolve the calling agent's id via /api/cp/whoami (api-key agents resolve to self). */
+async function resolveAgentId(ctx: ToolCtx): Promise<string | undefined> {
+  const r = await ctx.loopback('/api/cp/whoami');
+  if (!r.ok || !r.data || typeof r.data !== 'object') return undefined;
+  const id = (r.data as { agentId?: unknown }).agentId;
+  return typeof id === 'string' ? id : undefined;
+}
+
+/** A single requested catalog grant flattened to one (schema, table, capability). */
+interface GrantTarget { datalakeId: string; schema: string; table: string; cap: string }
+
+/**
+ * Parse the shared `{ datalake_id, grants:[{schema,table,caps}] }` arg shape into flat
+ * (schema, table, capability) targets. Returns an error string on invalid input.
+ */
+function parseGrantTargets(args: Record<string, unknown>): GrantTarget[] | string {
+  const datalakeId = str(args.datalake_id) ?? str(args.endpoint_id);
+  if (!datalakeId) return 'datalake_id is required';
+  const grantsInput = Array.isArray(args.grants) ? args.grants : undefined;
+  if (!grantsInput || grantsInput.length === 0) {
+    return 'grants is required: a non-empty array of { schema, table, caps }';
+  }
+  const targets: GrantTarget[] = [];
+  for (const g of grantsInput) {
+    const gg = (g ?? {}) as Record<string, unknown>;
+    const schema = str(gg.schema) ?? '*';
+    const table = str(gg.table) ?? '*';
+    const caps = Array.isArray(gg.caps) ? gg.caps : [];
+    for (const c of caps) {
+      if (typeof c === 'string' && CATALOG_CAPS.includes(c)) targets.push({ datalakeId, schema, table, cap: c });
+    }
+  }
+  if (targets.length === 0) return `each grant needs at least one catalog capability (${CATALOG_CAPS.join(', ')})`;
+  return targets;
+}
+
+/** A grant rule as returned by GET /api/cp/acl. */
+interface AclRow { datalakeId: string; capability: string; schemaName: string; tableName: string; effect: string }
+
+/** Does any allow rule COVER this (schema, table, capability) target? (wildcards widen.) */
+function targetCovered(rules: AclRow[], t: GrantTarget): boolean {
+  return rules.some(
+    (r) =>
+      r.effect === 'allow' &&
+      r.datalakeId === t.datalakeId &&
+      r.capability === t.cap &&
+      (r.schemaName === '*' || r.schemaName === t.schema) &&
+      (r.tableName === '*' || r.tableName === t.table),
+  );
+}
 
 // ── tool descriptors ─────────────────────────────────────────────────────────
 
@@ -197,6 +261,128 @@ const installExtension: McpTool['handler'] = async () =>
       'this — the waddling gateway runs birdshot for you; just connect with waddling_connect.',
   });
 
+// ── request access: surface a human-approval deep link to expand this agent ─────
+// No DB write — stateless. The tool returns a URL that opens the agent's Access editor
+// with the requested grants overlaid as a pending diff; a human operator clicks Save to
+// approve. The agent waits by polling waddling_whoami until the new grants appear.
+const requestAccess: McpTool['handler'] = async (args, ctx) => {
+  try {
+    const datalakeId = str(args.datalake_id) ?? str(args.endpoint_id);
+    if (!datalakeId) return failErr(new Error('datalake_id is required'));
+
+    const grantsInput = Array.isArray(args.grants) ? args.grants : undefined;
+    if (!grantsInput || grantsInput.length === 0) {
+      return failErr(new Error('grants is required: a non-empty array of { schema, table, caps }'));
+    }
+    const grants = grantsInput
+      .map((g) => {
+        const gg = (g ?? {}) as Record<string, unknown>;
+        const capsRaw = Array.isArray(gg.caps) ? gg.caps : [];
+        return {
+          datalakeId,
+          schema: str(gg.schema) ?? '*',
+          table: str(gg.table) ?? '*',
+          caps: capsRaw.filter((c): c is string => typeof c === 'string' && CATALOG_CAPS.includes(c)),
+        };
+      })
+      .filter((g) => g.caps.length > 0);
+    if (grants.length === 0) {
+      return failErr(new Error(`each grant needs at least one catalog capability (${CATALOG_CAPS.join(', ')})`));
+    }
+
+    // The agent being expanded: an explicit agent_id, else the calling agent itself.
+    const agentId = str(args.agent_id) ?? (await resolveAgentId(ctx));
+    if (!agentId) {
+      return failErr(new Error('could not resolve an agent to expand — pass agent_id explicitly'));
+    }
+
+    const propose = b64urlEncode({ grants, policies: [] });
+    const url = `${ctx.appUrl}/agents/${encodeURIComponent(agentId)}?section=access&propose=${propose}`;
+    return ok({
+      url,
+      agent_id: agentId,
+      requested: grants.map((g) => ({ schema: g.schema, table: g.table, caps: g.caps })),
+      wait_for: {
+        tool: 'waddling_await_access',
+        args: { datalake_id: datalakeId, grants: grants.map((g) => ({ schema: g.schema, table: g.table, caps: g.caps })), timeout_seconds: 20 },
+        note: 'blocks up to ~20s per call and returns { granted }; call it again until granted, and give up after ~10 minutes total.',
+      },
+      message:
+        'Access is NOT granted yet — this call only creates an approval link; it does not change ' +
+        'access. Do this:\n' +
+        '1. Show `url` to a human operator (an org owner or admin) and ask them to open it and click ' +
+        'Save — it opens the agent’s Access editor with the requested grants highlighted as a pending ' +
+        'change.\n' +
+        '2. Wait for approval by calling waddling_await_access (the `wait_for` block has the exact ' +
+        'args): it blocks ~20s server-side and returns { granted }. Call it again while granted=false.\n' +
+        '3. Once granted=true, retry the work that was blocked. If still not granted after ~10 minutes, ' +
+        'stop, tell the user the request is still pending, and let them approve via the link and ask you ' +
+        'to retry. Do not loop indefinitely.',
+    });
+  } catch (e) {
+    return failErr(e);
+  }
+};
+
+// ── await access: bounded server-side wait for an approval to land ──────────────
+// Blocks up to ~timeout_seconds (clamped ≤25s so a single call stays workerd-safe),
+// polling the agent's grants until every requested (schema,table,cap) is covered. The
+// agent loops this for longer total waits — the loop + clamp express the timeout.
+const awaitAccess: McpTool['handler'] = async (args, ctx) => {
+  try {
+    const parsed = parseGrantTargets(args);
+    if (typeof parsed === 'string') return failErr(new Error(parsed));
+    const targets = parsed;
+    const datalakeId = targets[0].datalakeId;
+
+    const agentId = str(args.agent_id) ?? (await resolveAgentId(ctx));
+    if (!agentId) return failErr(new Error('could not resolve an agent — pass agent_id explicitly'));
+
+    const wantSecs = typeof args.timeout_seconds === 'number' ? args.timeout_seconds : 20;
+    const budgetMs = Math.min(Math.max(wantSecs, 1), 25) * 1000;
+    const POLL_MS = 2500;
+    const started = Date.now();
+
+    const check = async (): Promise<GrantTarget[]> => {
+      const r = await ctx.loopback(
+        `/api/cp/acl?agentId=${encodeURIComponent(agentId)}&datalakeId=${encodeURIComponent(datalakeId)}`,
+      );
+      if (r.status === 403) {
+        throw new Error(
+          'waddling_await_access needs an agent API key (sk_…) — a delegated OAuth session cannot read ' +
+            'agent grants. Confirm approval with waddling_whoami (pass your session_id) instead.',
+        );
+      }
+      if (!r.ok) throw new Error(`could not read grants: http_${r.status}`);
+      const rules = ((r.data as { rules?: AclRow[] }).rules ?? []) as AclRow[];
+      return targets.filter((t) => !targetCovered(rules, t));
+    };
+
+    let missing = await check();
+    while (missing.length > 0 && Date.now() - started < budgetMs) {
+      await new Promise((res) => setTimeout(res, POLL_MS));
+      missing = await check();
+    }
+
+    const requested = targets.map((t) => ({ schema: t.schema, table: t.table, capability: t.cap }));
+    if (missing.length === 0) {
+      return ok({ granted: true, agent_id: agentId, requested, message: 'Access granted — retry the work that was blocked.' });
+    }
+    return ok({
+      granted: false,
+      agent_id: agentId,
+      waited_seconds: Math.round((Date.now() - started) / 1000),
+      still_missing: missing.map((t) => ({ schema: t.schema, table: t.table, capability: t.cap })),
+      message:
+        'Not granted within this wait window. If a human has not approved the request yet, call ' +
+        'waddling_await_access again to keep waiting; after ~10 minutes total, stop and tell the user ' +
+        'it is still pending.',
+    });
+  } catch (e) {
+    return failErr(e);
+  }
+};
+
 // ── quackboard: the per-org agent coordination board ───────────────────────────
 // Each loops back to /api/cp/quackboard/*; the route binds agent_role from the caller's
 // identity. No session_id — the agent's key IS the identity, resolved per call.
@@ -306,12 +492,89 @@ export const TOOLS: McpTool[] = [
     description:
       'Orient yourself: returns your agent identity, org, active grants (tables/verbs), and remaining ' +
       'session TTL. Call any time to understand exactly what you can do — no trial-and-error denials. ' +
-      'Pass `session_id` for live grants + TTL, or omit for your standing identity.',
+      'Pass `session_id` for live grants + TTL, or omit for your standing identity. Also the way to ' +
+      'confirm a waddling_request_access approval: poll this until the requested grants show in `granted`.',
     inputSchema: {
       type: 'object',
       properties: { session_id: { type: 'string', description: 'Optional open session to report live grants + TTL for.' } },
     },
     handler: whoami,
+  },
+  {
+    name: 'waddling_request_access',
+    description:
+      'Request EXPANDED access for this agent when a query was denied or you need a table/capability ' +
+      'you lack. Returns { url, wait_for, message }: `url` is a link a human operator (org owner/admin) ' +
+      'opens to review the requested grants as a pending change in the agent’s Access editor and ' +
+      'approve by clicking Save. This does NOT grant access by itself, and there is no push ' +
+      'notification — you must WAIT for approval: show the url to the user, then call ' +
+      'waddling_await_access (the `wait_for` block has the exact args) in a loop until it returns ' +
+      'granted=true, giving up after ~10 minutes (then tell the user it is still pending). For agents ' +
+      'authenticated with an agent API key (sk_…); delegated OAuth sessions have no standing agent.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...datalakeIdProp,
+        grants: {
+          type: 'array',
+          description:
+            'The catalog access to request, one entry per table or schema. Use table:"*" for a whole ' +
+            'schema, or schema:"*" too for the entire lake.',
+          items: {
+            type: 'object',
+            properties: {
+              schema: { type: 'string', description: 'Schema name, or "*" for all schemas.' },
+              table: { type: 'string', description: 'Table name, or "*" for all tables in the schema.' },
+              caps: {
+                type: 'array',
+                description: 'Catalog capabilities: read, write, create, drop, alter, detach.',
+                items: { type: 'string' },
+              },
+            },
+            required: ['caps'],
+          },
+        },
+        agent_id: { type: 'string', description: 'Agent to expand (defaults to the calling agent).' },
+      },
+      required: ['grants'],
+    },
+    handler: requestAccess,
+  },
+  {
+    name: 'waddling_await_access',
+    description:
+      'Wait for a pending waddling_request_access approval to land. Pass the SAME { datalake_id, grants } ' +
+      'you requested; this BLOCKS up to ~timeout_seconds (≤25s) server-side, polling your grants, and ' +
+      'returns { granted } as soon as every requested table/capability is covered (or after the wait ' +
+      'window). Call it again while granted=false to keep waiting; give up after ~10 minutes total. Use ' +
+      'this instead of hand-rolling a poll loop over waddling_whoami.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...datalakeIdProp,
+        grants: {
+          type: 'array',
+          description: 'The same grants passed to waddling_request_access, one entry per table or schema.',
+          items: {
+            type: 'object',
+            properties: {
+              schema: { type: 'string', description: 'Schema name, or "*" for all schemas.' },
+              table: { type: 'string', description: 'Table name, or "*" for all tables in the schema.' },
+              caps: {
+                type: 'array',
+                description: 'Catalog capabilities: read, write, create, drop, alter, detach.',
+                items: { type: 'string' },
+              },
+            },
+            required: ['caps'],
+          },
+        },
+        timeout_seconds: { type: 'number', description: 'Max seconds to block this call (default 20, capped at 25).' },
+        agent_id: { type: 'string', description: 'Agent to check (defaults to the calling agent).' },
+      },
+      required: ['grants'],
+    },
+    handler: awaitAccess,
   },
   {
     name: 'waddling_install_extension',

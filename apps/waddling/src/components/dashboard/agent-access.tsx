@@ -7,7 +7,7 @@
  * against what was loaded and issues the minimal POST/DELETE. Removing access is
  * gated behind a confirm, same as before — just without a popup to get here.
  */
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { Loader2, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -19,14 +19,14 @@ import { fetchCp, cpPost, cpDelete } from '@/components/dashboard/fetch';
 import { AccessEditor } from '@/components/dashboard/access-editor';
 import { SectionHeader } from '@/components/dashboard/agent/kit';
 import {
-  diffAccess, modelFromExisting, policyKindFor,
+  diffAccess, modelFromExisting, mergeGrants, policyKindFor,
   type AccessModel, type ExistingRule, type ExistingPolicy,
 } from '@/lib/access-diff';
 
 interface AclRuleRow { id: string; datalakeId: string; capability: string; schemaName: string; tableName: string }
 interface AclPolicyRow { id: string; datalakeId?: string; capability: string; pattern: string }
 
-export function AgentAccess({ agentId }: { agentId: string }) {
+export function AgentAccess({ agentId, proposed }: { agentId: string; proposed?: AccessModel | null }) {
   const [model, setModel] = useState<AccessModel>({ grants: [], policies: [] });
   const [initialRules, setInitialRules] = useState<ExistingRule[]>([]);
   const [initialPolicies, setInitialPolicies] = useState<ExistingPolicy[]>([]);
@@ -35,6 +35,10 @@ export function AgentAccess({ agentId }: { agentId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  // Overlay the requested-access proposal (from the deep link) onto the loaded grants
+  // exactly once, so it surfaces as a pending diff. Re-loads after a save reflect the
+  // persisted state without re-injecting the proposal.
+  const proposalApplied = useRef(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -52,11 +56,17 @@ export function AgentAccess({ agentId }: { agentId: string }) {
     }));
     setInitialRules(rules);
     setInitialPolicies(policies);
-    setModel(modelFromExisting(rules, policies));
+    const base = modelFromExisting(rules, policies);
+    if (proposed && !proposalApplied.current) {
+      proposalApplied.current = true;
+      setModel({ grants: mergeGrants(base.grants, proposed.grants), policies: base.policies });
+    } else {
+      setModel(base);
+    }
     if (lakesRes.ok) setDatalakes(lakesRes.data.datalakes.map((d) => ({ id: d.id, name: d.name })));
     setError(null);
     setLoading(false);
-  }, [agentId]);
+  }, [agentId, proposed]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -133,7 +143,12 @@ export function AgentAccess({ agentId }: { agentId: string }) {
         </p>
       ) : (
         <div className="min-h-0 flex-1">
-          <AccessEditor datalakes={datalakes} value={model} onChange={setModel} />
+          <AccessEditor
+            datalakes={datalakes}
+            value={model}
+            onChange={setModel}
+            defaultDatalakeId={proposed?.grants[0]?.datalakeId}
+          />
         </div>
       )}
 

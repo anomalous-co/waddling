@@ -71,7 +71,10 @@ const DelegationSchema = z
   .object({
     agentId: z.string().optional(),
     clientId: z.string().optional(),
-    datalakeId: z.string().optional(),
+    // min(1): an empty string is never a valid lake — reject it cleanly instead of letting
+    // it slip past the `if (input.datalakeId)` existence check and FK-violate on insert.
+    // Omit the field entirely for an all-lakes delegation.
+    datalakeId: z.string().min(1).optional(),
     schema: z.string().default('*'),
     table: z.string().default('*'),
     columns: z.array(z.string()).optional(),
@@ -151,24 +154,8 @@ delegations.post('/', (c) =>
     const caller = await resolveCaller(c);
     const input = await parseBody(c, DelegationSchema);
 
-    // Gate: caller must have at least one user-subject grant to delegate anything.
-    // The exact intersection (deriveEffectiveRules) is the backstop; here we only
-    // enforce "the user has some grants" to prevent creating meaningless delegations.
-    const hasGrants = await queryOne<{ exists: boolean }>(
-      `SELECT EXISTS (
-         SELECT 1 FROM waddling.acl_rule
-          WHERE org_id = $1
-            AND subject_kind = 'user'
-            AND user_id = $2
-            AND ($3::text IS NULL OR datalake_id = $3)
-       ) AS exists`,
-      [caller.orgId, caller.callerId, input.datalakeId ?? null],
-    );
-    if (!hasGrants?.exists) {
-      return err(c, 'forbidden', 403, 'No user-subject grants to delegate from');
-    }
-
-    // Tenant-isolate datalake if provided.
+    // Tenant-isolate datalake if provided. (Done before the grant logic so auto-grant
+    // can only ever materialize rows on a lake the caller's org actually owns.)
     if (input.datalakeId) {
       const lake = await queryOne<{ org_id: string }>(
         `SELECT org_id FROM waddling.datalake WHERE id = $1`,
@@ -176,6 +163,91 @@ delegations.post('/', (c) =>
       );
       if (!lake) return err(c, 'endpoint_not_found', 404);
       assertOrg(caller, lake.org_id);
+    }
+
+    // A delegation derives from the caller's own user-subject grants (deriveEffectiveRules
+    // intersects owner-grants ∩ delegation scope, matching on CAPABILITY). A brand-new org
+    // owner has none — they never had a reason to grant themselves access to data they
+    // already own — so the OAuth consent flow used to dead-end here: the delegation POST
+    // 403'd, the consent form swallowed it, and the agent connected with zero grants. Close
+    // that loop: if the caller lacks the backing grant but is an org OWNER/ADMIN (so they
+    // have authority over the data), materialize the user-subject grant for EXACTLY the
+    // scope being delegated, then proceed. A non-admin still can't self-grant — they need an
+    // admin to grant them first.
+    //
+    // The check is PER-CAPABILITY AND COVERAGE-AWARE: derivation only intersects a
+    // delegation against a user-grant of the SAME capability whose selector overlaps the
+    // requested resource. Since owners start with NO grants and the backing grants this
+    // flow materializes are now per-table (granular consent, not the old `*.*`), a
+    // capability-only "has any grant?" gate would wrongly skip: an owner who consented
+    // `read` on sales.orders, then `read` on sales.customers, would find the second
+    // delegation backed only by the orders grant (orders ∩ customers = ∅ → derives
+    // nothing). So we skip materialization only when an existing same-capability grant
+    // actually COVERS the requested (schema, table) — a `*.*`, `schema.*`, or exact-match
+    // grant — and otherwise materialize the exact requested scope below.
+    const hasGrants = await queryOne<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM waddling.acl_rule
+          WHERE org_id = $1
+            AND subject_kind = 'user'
+            AND user_id = $2
+            AND ($3::text IS NULL OR datalake_id = $3)
+            AND capability = $4
+            AND (schema_name = '*' OR schema_name = $5)
+            AND (table_name = '*' OR table_name = $6)
+            AND effect = 'allow'
+       ) AS exists`,
+      [caller.orgId, caller.callerId, input.datalakeId ?? null, input.capability, input.schema, input.table],
+    );
+    if (!hasGrants?.exists) {
+      const member = await queryOne<{ role: string }>(
+        `SELECT role FROM "member" WHERE "userId" = $1 AND "organizationId" = $2`,
+        [caller.callerId, caller.orgId],
+      );
+      if (!member || !['owner', 'admin'].includes(member.role)) {
+        return err(
+          c,
+          'forbidden',
+          403,
+          'You need an org owner or admin to grant you access to this data before it can be delegated to an agent.',
+        );
+      }
+      // Target lakes: the specific one, or every lake in the org for an all-lakes ('*')
+      // delegation (compileEndpointPolicy matches user-subject grants per datalake_id, so an
+      // all-lakes delegation needs a backing grant on each lake to derive anything).
+      let lakeIds: string[];
+      if (input.datalakeId) {
+        lakeIds = [input.datalakeId];
+      } else {
+        const lakes = await query<{ id: string }>(
+          `SELECT id FROM waddling.datalake WHERE org_id = $1`,
+          [caller.orgId],
+        );
+        lakeIds = lakes.rows.map((r) => r.id);
+      }
+      const verb = input.capability === 'write' ? 'write' : 'read';
+      for (const lakeId of lakeIds) {
+        // Idempotent: only insert when an equivalent user-subject grant isn't already present
+        // (acl_rule has no unique key on this tuple, so guard with NOT EXISTS).
+        await query(
+          `INSERT INTO waddling.acl_rule
+             (org_id, datalake_id, agent_id, subject_kind, user_id, capability,
+              schema_name, table_name, columns, verb, effect, created_by)
+           SELECT $1, $2, NULL, 'user', $3, $4, $5, $6, NULL, $7, 'allow', $3
+            WHERE NOT EXISTS (
+              SELECT 1 FROM waddling.acl_rule
+               WHERE org_id = $1 AND datalake_id = $2 AND subject_kind = 'user'
+                 AND user_id = $3 AND capability = $4
+                 AND schema_name = $5 AND table_name = $6 AND effect = 'allow'
+            )`,
+          [caller.orgId, lakeId, caller.callerId, input.capability, input.schema, input.table, verb],
+        );
+        await query(
+          `INSERT INTO waddling.audit_event (org_id, source, event, datalake_id, decision, actor)
+           VALUES ($1, 'control-plane', 'grant', $2, 'allow', $3)`,
+          [caller.orgId, lakeId, caller.callerId],
+        ).catch(() => {/* audit is best-effort */});
+      }
     }
 
     // Tenant-isolate agentId if provided.
@@ -188,30 +260,66 @@ delegations.post('/', (c) =>
       assertOrg(caller, agent.org_id);
     }
 
-    const created = await queryOne<DelegationDbRow>(
+    // Idempotent on the identity tuple (principal + lake + scope + capability): the
+    // delegation table has no unique key here, and granular consent POSTs one row per
+    // (table, capability), so re-approving the same access would otherwise pile up
+    // duplicate rows on every reconnect. Guard with NOT EXISTS; on a repeat, fetch and
+    // return the existing row so the response still carries a delegation id.
+    const insertParams = [
+      caller.orgId,
+      caller.callerId,
+      input.agentId ?? null,
+      input.clientId ?? null,
+      input.datalakeId ?? null,
+      input.schema,
+      input.table,
+      input.columns ?? null,
+      input.capability,
+      input.rowLimit ?? null,
+      input.window?.start ?? null,
+      input.window?.end ?? null,
+      input.expiresAt ?? null,
+      caller.callerId,
+    ];
+    let created = await queryOne<DelegationDbRow>(
       `INSERT INTO waddling.delegation
          (org_id, user_id, agent_id, client_id, datalake_id,
           schema_name, table_name, columns, capability,
           row_limit, window_start, window_end, expires_at, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+        WHERE NOT EXISTS (
+          SELECT 1 FROM waddling.delegation
+           WHERE org_id = $1 AND user_id = $2
+             AND agent_id IS NOT DISTINCT FROM $3
+             AND client_id IS NOT DISTINCT FROM $4
+             AND datalake_id IS NOT DISTINCT FROM $5
+             AND schema_name = $6 AND table_name = $7 AND capability = $9
+        )
        RETURNING *`,
-      [
-        caller.orgId,
-        caller.callerId,
-        input.agentId ?? null,
-        input.clientId ?? null,
-        input.datalakeId ?? null,
-        input.schema,
-        input.table,
-        input.columns ?? null,
-        input.capability,
-        input.rowLimit ?? null,
-        input.window?.start ?? null,
-        input.window?.end ?? null,
-        input.expiresAt ?? null,
-        caller.callerId,
-      ],
+      insertParams,
     );
+    if (!created) {
+      created = await queryOne<DelegationDbRow>(
+        `SELECT * FROM waddling.delegation
+          WHERE org_id = $1 AND user_id = $2
+            AND agent_id IS NOT DISTINCT FROM $3
+            AND client_id IS NOT DISTINCT FROM $4
+            AND datalake_id IS NOT DISTINCT FROM $5
+            AND schema_name = $6 AND table_name = $7 AND capability = $8
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [
+          caller.orgId,
+          caller.callerId,
+          input.agentId ?? null,
+          input.clientId ?? null,
+          input.datalakeId ?? null,
+          input.schema,
+          input.table,
+          input.capability,
+        ],
+      );
+    }
 
     // Enqueue the recompiled policy for delivery. When datalakeId is NULL (all-lakes
     // scope) there's no single gateway to reach — compile-only; the next per-endpoint

@@ -181,6 +181,63 @@ export function modelFromExisting(rules: ExistingRule[], policies: ExistingPolic
   return { grants: [...byTarget.values()], policies: pol };
 }
 
+/**
+ * Merge `add`'s grants into `base` (union of caps per (lake,schema,table) target).
+ * Used to overlay a proposed-access diff onto an agent's current grants so the editor
+ * renders the proposal as pending additions. Policies are left untouched (the
+ * request-access proposal is catalog-only).
+ */
+export function mergeGrants(base: GrantTarget[], add: GrantTarget[]): GrantTarget[] {
+  const out = base.map((g) => ({ ...g, caps: [...g.caps] }));
+  for (const a of add) {
+    const match = out.find(
+      (g) => g.datalakeId === a.datalakeId && g.schema === a.schema && g.table === a.table,
+    );
+    if (match) {
+      for (const cap of a.caps) if (!match.caps.includes(cap)) match.caps.push(cap);
+    } else {
+      out.push({ ...a, caps: [...a.caps] });
+    }
+  }
+  return out;
+}
+
+/**
+ * Decode a base64url-encoded access proposal (carried on the `?propose=` deep link the
+ * `waddling_request_access` MCP tool returns) into an AccessModel. Catalog grants only —
+ * unknown caps and malformed entries are dropped, and a parse failure returns null.
+ */
+export function decodeProposal(param: string): AccessModel | null {
+  try {
+    const b64 = param.replace(/-/g, '+').replace(/_/g, '/');
+    const bin = atob(b64);
+    const bytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+    const obj = JSON.parse(new TextDecoder().decode(bytes)) as Partial<AccessModel>;
+    const raw = Array.isArray(obj.grants) ? obj.grants : [];
+    const grants: GrantTarget[] = raw
+      .filter(
+        (g): g is GrantTarget =>
+          !!g &&
+          typeof g.datalakeId === 'string' &&
+          typeof g.schema === 'string' &&
+          typeof g.table === 'string' &&
+          Array.isArray(g.caps),
+      )
+      .map((g) => ({
+        datalakeId: g.datalakeId,
+        schema: g.schema,
+        table: g.table,
+        caps: g.caps.filter((c): c is CatalogCapability =>
+          (CATALOG_CAPABILITIES as string[]).includes(c),
+        ),
+      }))
+      .filter((g) => g.caps.length > 0);
+    return { grants, policies: [] };
+  } catch {
+    return null;
+  }
+}
+
 /** Compute the minimal create/delete set to move from `existing` rows to `desired`. */
 export function diffAccess(
   existingRules: ExistingRule[],

@@ -1,7 +1,7 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
-import { useParams, useRouter } from 'next/navigation';
+import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import {
   Info,
   KeyRound,
@@ -35,6 +35,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp, cpPatch, cpDelete } from '@/components/dashboard/fetch';
 import { AgentAccess } from '@/components/dashboard/agent-access';
+import { decodeProposal } from '@/lib/access-diff';
 import {
   NoAccessBanner,
   WorkspacePanel,
@@ -66,12 +67,6 @@ interface AgentDetailEnvelope {
 interface AclRuleRow {
   id: string;
   capability: string;
-}
-
-// ── Access section: the editor IS the view (no read-only table, no modal).
-//    A `fill` section so AgentAccess/AccessEditor owns its own scrolling. ───────
-function AccessSectionBody({ agentId }: { agentId: string }) {
-  return <AgentAccess agentId={agentId} />;
 }
 
 // ── Loading skeleton ────────────────────────────────────────────────────────────
@@ -114,6 +109,17 @@ function formatRelative(dateStr: string): string {
 export default function AgentDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // Deep-link support for the `waddling_request_access` MCP tool: ?section= jumps to a
+  // section, ?propose= carries a base64url access proposal that the Access editor overlays
+  // as a pending diff. A proposal with no explicit section opens straight on Access.
+  const sectionParam = searchParams.get('section');
+  const proposeParam = searchParams.get('propose');
+  const proposed = useMemo(
+    () => (proposeParam ? decodeProposal(proposeParam) : null),
+    [proposeParam],
+  );
 
   // Page-level agent data
   const [agent, setAgent] = useState<AgentSummary | null>(null);
@@ -127,8 +133,11 @@ export default function AgentDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [suspending, setSuspending] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
-  // Active section (controlled) so the No-access banner can jump straight to Access.
-  const [activeSection, setActiveSection] = useState('overview');
+  // Active section (controlled) so the No-access banner can jump straight to Access,
+  // and so a request-access deep link can open directly on the requested section.
+  const [activeSection, setActiveSection] = useState(
+    () => sectionParam ?? (proposeParam ? 'access' : 'overview'),
+  );
 
   const agentId = params.id;
 
@@ -199,6 +208,14 @@ export default function AgentDetailPage() {
   };
 
   // ── Section registry ─────────────────────────────────────────────────────────
+
+  // The Access section IS the editor (no read-only table, no modal); a `fill` section
+  // so AgentAccess/AccessEditor owns its own scrolling. Closes over `proposed` so a
+  // request-access deep link surfaces as a pending diff.
+  const AccessSectionBody = useCallback(
+    ({ agentId: id }: { agentId: string }) => <AgentAccess agentId={id} proposed={proposed} />,
+    [proposed],
+  );
 
   const sections: AgentSection[] = [
     {
