@@ -32,7 +32,7 @@ set -euo pipefail
 # ── Config (override via env) ────────────────────────────────────────────────────
 PROJECT="${PROJECT:-project-bd87157a-f6fd-4d44-830}"
 INSTANCE="${INSTANCE:-waddling-main}"
-HYPERDRIVE_ID="${HYPERDRIVE_ID:-7e4d9fdb2407458780268e8a529a2c80}"
+HYPERDRIVE_ID="${HYPERDRIVE_ID:-8a86652d8cbb439c911033f8d29dd573}"
 CF_CA_CERT_ID="${CF_CA_CERT_ID:-24dd5caf-275a-4f84-bb05-79f6830f1a6d}"   # server CA (unchanged here)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTROL_API_DIR="${REPO_ROOT}/apps/control-api"
@@ -105,6 +105,22 @@ if [ -n "${DELETE_OLD:-}" ]; then
   gcloud sql ssl client-certs delete "$DELETE_OLD" \
     --instance="$INSTANCE" --project="$PROJECT" --quiet
   echo "  ✓ old cert '$DELETE_OLD' deleted"
+  # GOTCHA: deleting the old cert can poison Hyperdrive's DATA-PLANE connection pool —
+  # /probe/db starts returning an opaque "Internal error." even though `hyperdrive update`
+  # validation passes and direct libpq works. A config update does NOT flush it. Remedy:
+  # recreate the Hyperdrive config fresh against the same origin + cert objects and repoint
+  # the binding (apps/control-api/wrangler.jsonc) + redeploy. Re-check now:
+  echo "  → re-checking /probe/db after old-cert deletion …"
+  sleep 4
+  if curl -s --max-time 25 "$API_BASE/probe/db" | grep -q '"ok":true'; then
+    echo "  ✓ Hyperdrive data-plane healthy after retire"
+  else
+    echo "  ⚠ /probe/db now failing — Hyperdrive data-plane likely poisoned. Recreate the config:"
+    echo "    wrangler hyperdrive create waddling-cloudsql-2 --origin-host $PGHOST --origin-port 5432 \\"
+    echo "      --database $PGDATABASE --origin-user $PGUSER --origin-password <pw> \\"
+    echo "      --ca-certificate-id $CF_CA_CERT_ID --mtls-certificate-id $NEW_MTLS_ID --sslmode verify-ca --caching-disabled"
+    echo "    then set the new id in apps/control-api/wrangler.jsonc and \`wrangler deploy\`."
+  fi
 else
   echo "  (skipped) old cert left ACTIVE as a fallback. After warm gateways roll onto the"
   echo "  new cert (~10m), retire it:  DELETE_OLD=<old-cn> infra/gcp/rotate-mtls.sh   — or:"

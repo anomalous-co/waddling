@@ -150,12 +150,22 @@ stay off stdout/argv where possible (gcloud `--prompt-for-password` / `read -s`;
 - Server-CA rotation: `verify-ca` clients must **trust the new CA before** the server cuts
   over — op 5 distributes an old+new bundle first, so verification passes on both sides of
   the cutover, with `server-ca-certs rollback` as the escape hatch.
+- **Poisoned Hyperdrive data-plane after a cert rotation.** Rotating the client cert and
+  then deleting the old one can leave Hyperdrive's data-plane connection pool stuck:
+  `/probe/db` returns an opaque **`"Internal error."`** on every query even though
+  `wrangler hyperdrive update` validation passes and direct libpq with the same
+  cert/password/origin works. A config update does NOT flush it. **Remedy: recreate the
+  Hyperdrive config fresh** (`wrangler hyperdrive create … --ca-certificate-id …
+  --mtls-certificate-id … --sslmode verify-ca --caching-disabled`), set the new id in
+  `apps/control-api/wrangler.jsonc`, and `wrangler deploy`. (This is why the live config id
+  changed from `7e4d9fdb…` to `8a86652d…`.) `rotate-mtls.sh` re-checks `/probe/db` after the
+  old-cert deletion and prints the recreate command if it goes stale.
 
 ## Inventory (resource references — not secrets)
 
 | | |
 |---|---|
-| Hyperdrive config id | `7e4d9fdb2407458780268e8a529a2c80` (→ `waddling_control`, mTLS, verify-ca) |
+| Hyperdrive config id | `8a86652d8cbb439c911033f8d29dd573` (→ `waddling_control`, mTLS, verify-ca, caching disabled) |
 | CF CA-cert id (server CA) | `24dd5caf-275a-4f84-bb05-79f6830f1a6d` |
 | CF mTLS-cert id (current client cert) | `1c4a49cd-3131-40e8-a5a3-0eabcfbeb99b` |
 | Control/admin role | `waddling_app` |

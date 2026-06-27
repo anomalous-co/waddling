@@ -29,7 +29,7 @@ set -euo pipefail
 # ── Config (override via env) ────────────────────────────────────────────────────
 PROJECT="${PROJECT:-project-bd87157a-f6fd-4d44-830}"
 INSTANCE="${INSTANCE:-waddling-main}"
-HYPERDRIVE_ID="${HYPERDRIVE_ID:-7e4d9fdb2407458780268e8a529a2c80}"
+HYPERDRIVE_ID="${HYPERDRIVE_ID:-8a86652d8cbb439c911033f8d29dd573}"
 DB_USER="${DB_USER:-waddling_app}"
 DB_NAME="${DB_NAME:-waddling_control}"
 DB_HOST="${DB_HOST:-34.168.85.164}"
