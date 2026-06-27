@@ -49,6 +49,12 @@ interface Env {
   R2_REGION: string;
   R2_HOST: string;
   WADDLING_ENV: string;
+  // Shared Cloud SQL mTLS material (PEM contents) for the gateway image's postgres-catalog
+  // ATTACH. Set via `wrangler secret put` on this worker; injected into the gateway/quackboard
+  // container's per-process env (NOT the workspace). Absent ⇒ local-file/demo catalogs only.
+  GW_PG_SSLCERT_PEM?: string;
+  GW_PG_SSLKEY_PEM?: string;
+  GW_PG_SSLROOTCERT_PEM?: string;
 }
 
 // ── ports / ids ────────────────────────────────────────────────────────────────
@@ -209,11 +215,18 @@ interface GatewayBoot {
 }
 
 /** Translate a GatewayBoot descriptor into the entrypoint's per-process env. Only set keys
- *  that are present — the entrypoint supplies sane defaults and the selftest fallback. */
-function bootEnvFromConfig(boot?: GatewayBoot): Record<string, string> | undefined {
+ *  that are present — the entrypoint supplies sane defaults and the selftest fallback.
+ *  `workerEnv` carries the shared Cloud SQL mTLS PEM secrets (constant per deployment), merged
+ *  in for the gateway image; the entrypoint materializes them to files for the catalog ATTACH. */
+function bootEnvFromConfig(boot: GatewayBoot | undefined, workerEnv: Env): Record<string, string> | undefined {
   if (!boot) return undefined;
   const env: Record<string, string> = {};
   const set = (k: string, v: unknown) => { if (v !== undefined && v !== null && v !== '') env[k] = String(v); };
+  // Shared mTLS material for the postgres catalog (Cloud SQL). Harmless for quackboard (no
+  // catalog ATTACH); never reaches WorkspaceSandbox (different boot command).
+  set('GW_PG_SSLCERT_PEM', workerEnv.GW_PG_SSLCERT_PEM);
+  set('GW_PG_SSLKEY_PEM', workerEnv.GW_PG_SSLKEY_PEM);
+  set('GW_PG_SSLROOTCERT_PEM', workerEnv.GW_PG_SSLROOTCERT_PEM);
   set('GW_SERVER_TOKEN', boot.serverToken);
   if (boot.quackboard) {
     // No lake: boot birdshot + serve quack against the restored .duckdb file.
@@ -356,7 +369,7 @@ async function ensureQuackboard(env: Env, orgId: string, boot: GatewayBoot): Pro
       const get = await mintPresigned(env, "GET", boot.r2Key);
       await qb.exec(`curl -fsS -o ${QB_DB_PATH} ${shq(get)} || rm -f ${QB_DB_PATH}`);
     }
-    await qb.startProcess(BOOT_CMD, { cwd: GW_DIR, env: bootEnvFromConfig(boot) });
+    await qb.startProcess(BOOT_CMD, { cwd: GW_DIR, env: bootEnvFromConfig(boot, env) });
   }
   const start = Date.now();
   let lastErr = "";
@@ -1092,7 +1105,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     const { endpointId, snapshot, auth, lakeCatalog, gatewayBoot } = body;
     if (!endpointId || !snapshot) return Response.json({ error: "missing endpointId/snapshot" }, { status: 400 });
     const r = await getPool(env, endpointId).applySnapshot(endpointId, {
-      snapshot, auth, lakeCatalog, bootEnv: bootEnvFromConfig(gatewayBoot as GatewayBoot | undefined),
+      snapshot, auth, lakeCatalog, bootEnv: bootEnvFromConfig(gatewayBoot as GatewayBoot | undefined, env),
     });
     return Response.json({ ok: true, version: r.version }, { status: r.status });
   }
@@ -1374,7 +1387,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     const { endpointId, gatewayBoot, days, limit } = body;
     if (!endpointId || !gatewayBoot) return Response.json({ error: "missing endpointId/gatewayBoot" }, { status: 400 });
     const gw = getSandbox(env.GATEWAY, replicaDoId(endpointId, 0), { sleepAfter: GATEWAY_SLEEP_AFTER }) as unknown as GatewayHandle;
-    await ensureGateway(gw, bootEnvFromConfig(gatewayBoot as GatewayBoot));
+    await ensureGateway(gw, bootEnvFromConfig(gatewayBoot as GatewayBoot, env));
     const r = await gwFwd(gw, "/ctrl/load-hn", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ days, limit }),

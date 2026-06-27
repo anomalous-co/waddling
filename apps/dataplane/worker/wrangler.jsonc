@@ -25,12 +25,12 @@
   // (/selftest is consequently only reachable once a bound worker proxies to it.)
   "workers_dev": false,
 
-  // Two container classes, reusing the proven images by Dockerfile path (gateway =
+  // Two container classes, building the canonical container images under apps/dataplane (gateway =
   // DuckDB+quack+birdshot; workspace = DuckDB, NO birdshot).
   "containers": [
     {
       "class_name": "GatewayDO",
-      "image": "../../cf-stagec-gw-probe/container/Dockerfile",
+      "image": "../gateway/Dockerfile",
       "instance_type": "standard-2",
       // Concurrent RUNNING gateway containers, one per active endpoint (DO key
       // gw:<endpointId>). Idle/sleeping endpoints free their slot and don't count;
@@ -42,7 +42,7 @@
     },
     {
       "class_name": "WorkspaceSandbox",
-      "image": "../../cf-stagec-ws-probe/container/Dockerfile",
+      "image": "../workspace/Dockerfile",
       "instance_type": "standard-1",
       // Concurrent RUNNING workspace containers, one per (workspace, agent) live
       // session. Kept equal to the gateway cap so workspaces don't become the tighter
@@ -55,7 +55,7 @@
       // QUACKBOARD=1 so the entrypoint serves the restored .duckdb file directly with no
       // lake. One RUNNING container per active org (DO key qb:<orgId>); idle orgs sleep.
       "class_name": "QuackboardDO",
-      "image": "../../cf-stagec-gw-probe/container/Dockerfile",
+      "image": "../gateway/Dockerfile",
       "instance_type": "standard-2",
       "max_instances": 50
     }

@@ -3,7 +3,7 @@
 #
 # WHY THIS EXISTS (the pain this scripts away):
 #   `wrangler deploy` builds the GatewayDO/WorkspaceSandbox/QuackboardDO container
-#   images from Dockerfiles (apps/cf-stagec-gw-probe/container/, ...-ws-probe/).
+#   images from Dockerfiles (apps/dataplane/gateway/, apps/dataplane/workspace/).
 #   The build is driven by local Docker/BuildKit. BuildKit CONTENT-ADDRESSES the
 #   `COPY gateway/gateway-src/` + `COPY gateway/entrypoint.mjs` layers, so when a
 #   source file in the build context changes, the layer hash SHOULD change and bust
@@ -20,9 +20,9 @@
 #   update the container app spec (triggering a rollout). This script does that.
 #
 # WHEN TO USE:
-#   - Any change to files under apps/cf-stagec-gw-probe/container/  (gateway image:
+#   - Any change to files under apps/dataplane/gateway/  (gateway image:
 #       gateway-src/*.ts, entrypoint.mjs, Dockerfile, birdshot binary)
-#   - Any change to files under apps/cf-stagec-ws-probe/container/  (workspace image)
+#   - Any change to files under apps/dataplane/workspace/  (workspace image)
 #   - When a `pnpm deploy` "succeeds" but the new container behavior isn't live
 #     (symptom: running container returns 404 for a route you just added).
 #

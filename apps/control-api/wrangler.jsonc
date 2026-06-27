@@ -31,8 +31,12 @@
   "triggers": {
     "crons": ["*/5 * * * *"]
   },
-  // Control-plane database: PlanetScale Postgres reached through Hyperdrive
-  // (port 5432, caching disabled). The Worker reads env.HYPERDRIVE.connectionString.
+  // Control-plane database: GCP Cloud SQL Postgres (instance waddling-main, db
+  // waddling_control) reached through Hyperdrive on port 5432. The instance requires
+  // mTLS client certs (TRUSTED_CLIENT_CERTIFICATE_REQUIRED) over a public IP; the
+  // client cert + CA are attached to this Hyperdrive config (sslmode=verify-ca), since
+  // workerd's own outbound TLS cannot present a client cert. The Worker just reads
+  // env.HYPERDRIVE.connectionString.
   // Production origin: api.getwaddling.com (custom domain on the getwaddling.com
   // zone). Same registrable domain as the UI's app.getwaddling.com, so the session
   // cookie is first-party same-site (Domain=.getwaddling.com, SameSite=Lax) — the
@@ -45,7 +49,7 @@
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
-      "id": "cbd2434e2b3043fa914156943178a856"
+      "id": "7e4d9fdb2407458780268e8a529a2c80"
     }
   ],
   // Public-ish user avatar storage. Uploaded by POST /api/cp/account/avatar and
@@ -131,12 +135,13 @@
     "STRIPE_PRICE_CREDIT_10": "price_1TlgZWDNZoqvxQqozUuYB4Co",
     "STRIPE_PRICE_CREDIT_25": "price_1TlgZXDNZoqvxQqokMAhJEPa",
     "STRIPE_PRICE_CREDIT_100": "price_1TlgZXDNZoqvxQqoLH4ZcQ4Y",
-    // Neon per-org managed Postgres catalog. The API key is a Worker secret:
-    // `wrangler secret put NEON_API_KEY`. Until it is set, getNeonClient() returns null and
-    // /api/cp/catalog 503s (managed-postgres catalog disabled) — safe to deploy unconfigured.
-    // NEON_REGION_ID / NEON_PG_VERSION are optional (Neon picks defaults when unset).
-    "NEON_REGION_ID": "aws-us-east-1",
-    "NEON_PG_VERSION": "17",
+    // GCP Cloud SQL per-org managed Postgres catalog. PG_HOST/PG_PORT are the shared
+    // instance's public host + port; provisionOrgDatabase uses them to mint each org's
+    // sealed DSN for the gateway. control-api reaches the DB only via Hyperdrive (above),
+    // so it needs no cert material here. Unset PG_HOST ⇒ /api/cp/catalog 503s (managed
+    // catalog disabled) — safe to deploy unconfigured.
+    "PG_HOST": "34.168.85.164",
+    "PG_PORT": "5432",
     // (GATEWAY_INTERNAL_URL removed: the gateway now lives in the waddling-dataplane
     // worker's GatewayDO, reached over the DATAPLANE service binding — see services.)
     // Deployment posture. MUST be "production": the endpoints/:id/provision dev

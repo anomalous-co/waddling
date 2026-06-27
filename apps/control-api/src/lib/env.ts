@@ -48,9 +48,6 @@ export interface Env {
 
   // ── Worker secret (set via `wrangler secret put`, NOT in vars) ───────────
   BETTER_AUTH_SECRET: string;
-  // Neon API key (account-scoped) for per-org managed Postgres catalog provisioning.
-  // Unset ⇒ the managed-postgres catalog path is disabled (getNeonClient → null).
-  NEON_API_KEY?: string;
   // R2 faucet (per-org lake bucket provisioning + scoped temp creds). The account-scoped
   // R2 API token VALUE (Cloudflare API Bearer); its Access Key ID is the parent below.
   // Unset ⇒ the R2 faucet is disabled (getR2Faucet → null).
@@ -117,12 +114,13 @@ export interface Env {
   STRIPE_PRICE_CREDIT_25: string;
   STRIPE_PRICE_CREDIT_100: string;
 
-  // ── Neon (per-org managed Postgres catalog) — non-secret vars ────────────
-  // The cloud region id (e.g. 'aws-us-east-1') new org catalog projects are created in, and
-  // the Postgres major version. Both optional: unset ⇒ Neon picks defaults. The API key is a
-  // Worker secret above.
-  NEON_REGION_ID?: string;
-  NEON_PG_VERSION?: string;
+  // ── GCP Cloud SQL (shared per-org Postgres catalog) — non-secret vars ─────
+  // The shared Cloud SQL instance's public host (IP) + port. control-api reaches the instance
+  // only through Hyperdrive (which carries the mTLS client cert), but provisionOrgDatabase
+  // needs the host/port to build each org's sealed DSN for the gateway. Unset PG_HOST ⇒ the
+  // managed-postgres catalog path is disabled (cloudSqlConfigured → false).
+  PG_HOST?: string;
+  PG_PORT?: string;
 
   // ── R2 faucet (per-org lake bucket) — non-secret ─────────────────────────
   // The parent R2 Access Key ID (the account-scoped token's S3 key id) to scope temp

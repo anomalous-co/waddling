@@ -1,11 +1,11 @@
 /**
- * /api/cp/catalog — per-org managed Postgres catalog (Neon) lifecycle.
+ * /api/cp/catalog — per-org managed Postgres catalog (GCP Cloud SQL) lifecycle.
  *
- * Each org gets ONE Neon project whose database is the DuckLake metadata catalog the gateway
- * ATTACHes via `ducklake:postgres:<dsn>`. Provisioning is synchronous (createProject returns
- * the DSN), so this is a provision + status surface over lib/catalog-provision:
+ * Each org gets ONE database inside the shared Cloud SQL instance; it is the DuckLake metadata
+ * catalog the gateway ATTACHes via `ducklake:postgres:<dsn>`. Provisioning completes in-request
+ * (plain SQL over Hyperdrive), so this is a provision + status surface over lib/catalog-provision:
  *
- *   POST /          → provision (idempotent): create the org's Neon project if absent, seal
+ *   POST /          → provision (idempotent): create the org's database + role if absent, seal
  *                     the DSN, return 'ready' status.
  *   GET  /          → status, return the current state. Poll this.
  *
@@ -18,7 +18,7 @@ import { resolveCaller, handle, ok, err } from '../lib/cp-shared';
 import {
   provisionOrgCatalog,
   reconcileOrgCatalog,
-  getNeonClient,
+  cloudSqlReady,
   getOrgCatalogDsn,
 } from '../lib/catalog-provision';
 
@@ -35,12 +35,12 @@ async function orgSlug(orgId: string): Promise<string | null> {
 catalog.post('/', (c) =>
   handle(c, async () => {
     const caller = await resolveCaller(c);
-    if (!getNeonClient(c.env)) {
+    if (!cloudSqlReady(c.env)) {
       return err(
         c,
-        'neon_not_configured',
+        'cloudsql_not_configured',
         503,
-        'Managed Postgres catalog is not configured (NEON_API_KEY). Set the Neon API key to enable.',
+        'Managed Postgres catalog is not configured (PG_HOST). Set the Cloud SQL host to enable.',
       );
     }
     const slug = await orgSlug(caller.orgId);

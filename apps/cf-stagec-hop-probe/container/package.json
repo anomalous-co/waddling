@@ -1,7 +1,0 @@
-{
-  "name": "cf-stagec-hop-probe-container",
-  "version": "0.0.1",
-  "private": true,
-  "type": "module",
-  "description": "Workspace sidecar container for the Stage C hop probe. Uses only curl from the sandbox base — no DuckDB dependency."
-}
