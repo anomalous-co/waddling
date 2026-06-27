@@ -49,7 +49,7 @@
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
-      "id": "7e4d9fdb2407458780268e8a529a2c80"
+      "id": "8a86652d8cbb439c911033f8d29dd573"
     }
   ],
   // Public-ish user avatar storage. Uploaded by POST /api/cp/account/avatar and
