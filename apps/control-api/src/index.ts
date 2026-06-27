@@ -26,6 +26,7 @@ import { buildAuth, runMigrations, runInAuthScope } from "./lib/auth";
 import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
 import { initDataplane } from "./lib/gateway-client";
+import { drainGatewayDispatch } from "./lib/gateway-dispatch";
 import { resolveCaller, AuthError } from "./lib/cp-shared";
 import { handleMcp } from "./mcp/server";
 import type { LoopbackResult } from "./mcp/tools";
@@ -640,6 +641,20 @@ async function scheduled(
   ctx: ExecutionContext,
 ): Promise<void> {
   await runInDbScope(ctx, env.HYPERDRIVE.connectionString, async () => {
+    try {
+      // Retry/reconcile backstop for the durable control→gateway dispatch outbox
+      // (migration 020). Edits enqueue + attempt an immediate waitUntil delivery; this
+      // tick re-drives anything that failed (gateway was down/raced) until it lands.
+      // initCrypto too: recompileAndPush → resolveGatewayBoot seals/opens the per-endpoint
+      // boot secrets, and the scheduled context has no request middleware to init the
+      // per-isolate crypto singleton (the request path does this at index.ts top).
+      initCrypto(env.WADDLING_SECRET_KEY ?? env.BETTER_AUTH_SECRET);
+      initDataplane(env.DATAPLANE);
+      const { delivered, failed } = await drainGatewayDispatch(env);
+      if (delivered > 0 || failed > 0) console.log(`[cron] dispatch drain: ${delivered} delivered, ${failed} failed`);
+    } catch (e) {
+      console.log(`[cron] drainGatewayDispatch failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
     try {
       const n = await sweepExpiredSessions();
       if (n > 0) console.log(`[cron] swept + debited ${n} session(s)`);

@@ -17,7 +17,7 @@ import { z } from 'zod';
 import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
-import { recompileAndPush } from '../lib/gateway-push';
+import { recompileAndEnqueue } from '../lib/gateway-dispatch';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err } from '../lib/cp-shared';
 
 // Full capability taxonomy — matches the migration 010 CHECK constraint exactly.
@@ -213,9 +213,10 @@ delegations.post('/', (c) =>
       ],
     );
 
-    // Push the recompiled policy. When datalakeId is NULL (all-lakes scope),
-    // recompileAndPush skips the push (best-effort; next connect/recompile picks up).
-    const compiled = await recompileAndPush(c, input.datalakeId ?? null);
+    // Enqueue the recompiled policy for delivery. When datalakeId is NULL (all-lakes
+    // scope) there's no single gateway to reach — compile-only; the next per-endpoint
+    // connect/recompile picks it up.
+    const compiled = await recompileAndEnqueue(c, input.datalakeId ?? null);
 
     return ok(
       c,
@@ -250,7 +251,7 @@ delegations.delete('/:id', (c) =>
 
     await query(`DELETE FROM waddling.delegation WHERE id = $1`, [id]);
 
-    const compiled = await recompileAndPush(c, row.datalake_id);
+    const compiled = await recompileAndEnqueue(c, row.datalake_id);
 
     return ok(c, { success: true, delegationId: id, compiledGrants: compiled.snapshot });
   }),
