@@ -11,7 +11,7 @@ Dynamic agent access-control for DuckDB. Agents connect their DuckDB instances t
 ## Architecture
 
 Three-plane architecture:
-- **Control plane**: Next.js app (`apps/waddling`) + Postgres 16 (Cloud SQL on GCP)
+- **Control plane**: Next.js app (`apps/waddling`) + Postgres 18 (Cloud SQL on GCP — see "Managed Postgres" below)
 - **Data plane**: DuckDB gateway + birdshot extension (Rivet actor on Cloud Run)
 - **Agent plane**: customer's DuckDB instance, connects via `ATTACH 'quack:...'`
 
@@ -65,6 +65,15 @@ LOAD birdshot;
 - `infra/gcp/deploy-actor.sh` — build + push + deploy the Rivet gateway actor to Cloud Run
 - `birdshot/.github/workflows/build-birdshot.yml` — cross-platform CI + R2 upload
 - `infra/r2/setup-r2.sh` — R2 bucket creation + CORS
+
+## Managed Postgres (GCP Cloud SQL)
+
+Control-plane DB + every per-org DuckLake catalog live in ONE shared Cloud SQL instance
+(`waddling-main`, Postgres 18), database-per-org tenancy, reached over mTLS. control-api
+goes through Hyperdrive; gateway containers do direct libpq mTLS (PEMs base64'd through the
+startProcess env channel — raw PEM gets indented + corrupted). **Rotate certs/passwords
+with `infra/gcp/credops.sh` — don't hand-run gcloud/wrangler.** Full architecture + runbook:
+`docs/gcp-cloud-sql.md`.
 
 ## Local dev
 
