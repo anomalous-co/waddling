@@ -111,6 +111,10 @@ op_retire_old_cert() {
   warn "until it cold-boots. Confirm warm replicas have rolled (idle ~10m) — do NOT .destroy() them."
   confirm "Delete client cert '${cn}' now?" || { warn "cancelled"; return; }
   gcloud sql ssl client-certs delete "$cn" "${SQLA[@]}" --quiet && ok "deleted '$cn'"
+  # Deleting a cert can poison Hyperdrive's data-plane (opaque "Internal error." on every
+  # query even though validation passes). Re-check, and point at the recreate remedy (op 6).
+  say "  re-checking Hyperdrive data-plane after delete…"
+  verify_hyperdrive || warn "Hyperdrive likely poisoned — run option 6 (Recreate Hyperdrive config) to recover."
 }
 
 # ── 3) Rotate DB password (dual-password, zero-downtime) ──────────────────────────
@@ -212,6 +216,44 @@ op_rotate_server_ca() {
   warn "Roll warm gateways (idle ~10m) so they re-read the new rootcert; then you may trim the bundle to new-only."
 }
 
+# ── 6) Recreate the Hyperdrive config (recover a poisoned data-plane) ─────────────
+# After a client-cert rotation + old-cert deletion, the Hyperdrive config can get stuck
+# returning opaque "Internal error." on every query while `hyperdrive update` validation
+# passes and direct libpq works — its data-plane connection pool is poisoned and an update
+# does NOT flush it. The fix is to recreate the config fresh (same origin + cert objects),
+# repoint apps/control-api/wrangler.jsonc, and redeploy.
+op_recreate_hyperdrive() {
+  say "${B}[6] Recreate Hyperdrive config${X} — recover a poisoned data-plane (new id → wrangler.jsonc → deploy)"
+  local ca mtls; ca="$(hd_field ca_certificate_id)"; mtls="$(hd_field mtls_certificate_id)"
+  [ -n "$ca" ] && [ -n "$mtls" ] || die "could not read current CA/mTLS cert ids from $HYPERDRIVE_ID"
+  say "  reusing cert objects: ca=$ca mtls=$mtls"
+  local pw p2; read -r -s -p "  ${DB_USER} DB password (not stored — paste it): " pw; echo
+  read -r -s -p "  confirm: " p2; echo
+  [ -n "$pw" ] && [ "$pw" = "$p2" ] || die "empty or mismatch"
+  confirm "Create a fresh Hyperdrive config against ${DB_HOST}/${DB_NAME} and repoint+deploy control-api?" || { warn "cancelled"; pw=; return; }
+  local name="waddling-cloudsql-$(date +%Y%m%d-%H%M%S)"
+  local out id
+  out="$(cd "$CONTROL_API_DIR" && npx wrangler hyperdrive create "$name" \
+    --origin-host "$DB_HOST" --origin-port "$DB_PORT" --database "$DB_NAME" --origin-user "$DB_USER" \
+    --origin-password "$pw" --ca-certificate-id "$ca" --mtls-certificate-id "$mtls" \
+    --sslmode verify-ca --caching-disabled 2>&1)"; pw=
+  id="$(printf '%s\n' "$out" | grep -oE '[0-9a-f]{32}' | head -1)"
+  [ -n "$id" ] || { printf '%s\n' "$out"; die "could not parse new Hyperdrive id (create may have failed)"; }
+  ok "new Hyperdrive config: $id"
+  # Repoint the binding + this script's default, then deploy.
+  sed -i '' "s/${HYPERDRIVE_ID}/${id}/g" "$CONTROL_API_DIR/wrangler.jsonc" "${BASH_SOURCE[0]}"
+  ok "wrangler.jsonc + credops.sh repointed ${HYPERDRIVE_ID} → ${id}"
+  HYPERDRIVE_ID="$id"
+  if confirm "Deploy control-api now?"; then
+    ( cd "$CONTROL_API_DIR" && npx wrangler deploy >/dev/null ) && ok "deployed"
+    verify_hyperdrive && ok "recovered — /probe/db green on the fresh config" \
+      || warn "still failing — check the origin/cert/password"
+  else
+    warn "not deployed. Run: (cd apps/control-api && npx wrangler deploy)"
+  fi
+  warn "The OLD config ($HYPERDRIVE_ID is now the new one) is abandoned; delete it later with: wrangler hyperdrive delete <old-id>"
+}
+
 # ── Menu ─────────────────────────────────────────────────────────────────────────
 run_one() {
   case "$1" in
@@ -220,6 +262,7 @@ run_one() {
     3) op_rotate_password ;;
     4) op_repush_gw_secrets ;;
     5) op_rotate_server_ca ;;
+    6) op_recreate_hyperdrive ;;
     *) warn "unknown option: $1" ;;
   esac
 }
@@ -230,11 +273,12 @@ while true; do
   show_state
   say "  1) Rotate client cert        4) Re-push gateway PEM secrets"
   say "  2) Retire an old client cert 5) Rotate server CA"
-  say "  3) Rotate DB password        q) quit"
+  say "  3) Rotate DB password        6) Recreate Hyperdrive (recover poisoned data-plane)"
+  say "                               q) quit"
   read -r -p "select> " choice
   case "$choice" in
-    [1-5]) say ""; run_one "$choice"; say ""; read -r -p "  ${D}press enter to return to the menu${X}" _ ;;
+    [1-6]) say ""; run_one "$choice"; say ""; read -r -p "  ${D}press enter to return to the menu${X}" _ ;;
     q|Q|"") say "bye."; exit 0 ;;
-    *) warn "pick 1-5 or q" ;;
+    *) warn "pick 1-6 or q" ;;
   esac
 done
