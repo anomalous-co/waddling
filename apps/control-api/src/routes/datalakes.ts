@@ -238,7 +238,16 @@ datalakes.post('/', (c) =>
           );
         }
 
-        return row.rows[0]!;
+        // Activate immediately (provisioning → running). The gateway is now a lazy-boot
+        // dynamic pool (it boots on the first connect's snapshot push and scales back to
+        // zero when idle), and the managed catalog was provisioned synchronously above —
+        // so there is no async Stage-D step left for 'provisioning' to gate on. The dev
+        // /provision stand-in that used to flip this is 403 in production, and onboarding
+        // does the same one-line activation for its demo lake; without this, a lake created
+        // via "+ new datalake" sits in 'provisioning' forever. connect re-checks catalog
+        // readiness, so this is safe even if the best-effort provisionOrgCatalog above hiccupped.
+        await q(`UPDATE waddling.datalake SET status = 'running', updated_at = now() WHERE id = $1`, [datalakeId]);
+        return { id: datalakeId, status: 'running' as const };
       });
 
       // Provisioning funnel: a new endpoint/datalake was created. Server-side,
