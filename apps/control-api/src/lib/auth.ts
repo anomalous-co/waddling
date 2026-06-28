@@ -1,19 +1,18 @@
 /**
- * Better Auth server instance — workerd factory
- * (ported from apps/waddling/src/lib/auth.ts).
+ * Better Auth server instance — module-level singleton.
  *
- * The original built the betterAuth instance at MODULE LOAD, reading env eagerly
- * (`new Stripe(getStripeSecretKey())`, `new Pool({connectionString: getDatabaseUrl()})`,
- * `secret: getBetterAuthSecret()`). That is impossible on workerd: env arrives
- * per-request, not at import. So construction moves into `buildAuth(env)`.
+ * On Node/Cloud Run: call initAuth(env) at startup before serving; buildAuth()
+ * then returns the singleton unconditionally.
+ * On CF workerd: the `*` middleware calls initAuth(c.env) on the first request;
+ * subsequent requests reuse the same instance (idempotent).
  *
- * Construction is non-trivial (it opens a pg.Pool that Better Auth owns), so a
- * fresh instance per request would leak connections. We cache ONE instance per
- * isolate, keyed on the auth secret — if a redeploy changes the secret the cache
- * rebuilds. This mirrors how the original got a single module-level instance.
+ * The singleton pattern replaces the per-request pool + AsyncLocalStorage approach
+ * that was required on CF to avoid the 1101 connection-reuse bug. A module-level
+ * Pool persists for the process lifetime; Hyperdrive (CF) and pg Pool (Node) both
+ * support this correctly.
  *
- * Plugins (unchanged from the original): jwt (RS256/2048, plaintext private JWK),
- * organization, apiKey (`sk_agent_`), admin, mcp, stripe.
+ * Plugins (unchanged): jwt (RS256/2048), organization, apiKey (sk_agent_), admin,
+ * mcp (OAuth 2.1 / consent), stripe.
  */
 import { betterAuth } from 'better-auth';
 import { jwt, organization, admin, mcp } from 'better-auth/plugins';
@@ -21,7 +20,6 @@ import { apiKey } from '@better-auth/api-key';
 import { stripe } from '@better-auth/stripe';
 import { Pool } from 'pg';
 import Stripe from 'stripe';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Env } from './env';
 import { makePostHog } from './posthog';
 import { resetTierCreditsForOrg, currentBillingPeriod } from './credits';
@@ -36,13 +34,6 @@ import { queryOne } from './db';
 import { fulfillCreditPackEvent } from './credit-packs';
 import { captureCheckoutCompletedEvent } from './funnel-stripe';
 
-/**
- * Shape the @better-auth/stripe plugin wants: `{ name, priceId }`. The free plan
- * has no Stripe price and is omitted. So is `enterprise` — it is sales-led
- * (contact-us, no self-serve price). The self-serve paid tiers are `pro` and the
- * uncapped `scale`. Inlined from the original lib/plans.ts — full plan/entitlement
- * table is not needed for auth construction.
- */
 function stripePlans(env: Env): { name: string; priceId: string }[] {
   return [
     { name: 'pro', priceId: env.STRIPE_PRICE_PRO },
@@ -50,36 +41,23 @@ function stripePlans(env: Env): { name: string; priceId: string }[] {
   ].filter((p) => p.priceId);
 }
 
+// Module-level executionCtx is always undefined; posthog waitUntil fire-and-forgets.
+function authExecutionCtx(): { waitUntil(p: Promise<unknown>): void } | undefined {
+  return undefined;
+}
+
 function construct(env: Env, pool: Pool) {
-  // Stripe MUST use the fetch HTTP client on workerd — the default Node http
-  // client relies on `node:http`, which is not available in the Workers runtime.
-  // A placeholder key constructs fine; Stripe only validates on a real request.
   const stripeClientInstance = new Stripe(env.STRIPE_SECRET_KEY, {
     httpClient: Stripe.createFetchHttpClient(),
   });
-  // Real Stripe config vs the Stage-B placeholders (all contain "placeholder"). Gates
-  // the plugin's external-call side-effects so they never hang auth/org flows when
-  // billing isn't set up yet. Flips to true automatically when real keys are deployed.
   const stripeConfigured = !!env.STRIPE_SECRET_KEY && !/placeholder/i.test(env.STRIPE_SECRET_KEY);
 
-  // Cross-origin browser support for the split UI/API deployment. The dashboard
-  // runs on WEB_ORIGIN and calls this API cross-origin with credentials, so:
-  //   • WEB_ORIGIN must be a trustedOrigin (Better Auth rejects unknown origins);
-  //   • the session cookie needs SameSite=None;Secure to ride a cross-SITE request,
-  //     OR a Domain=.parent cookie to stay first-party same-site across subdomains.
-  // When COOKIE_DOMAIN is set (UI+API are subdomains of one registrable domain),
-  // use a Domain cookie + SameSite=Lax (first-party, works in every browser incl.
-  // Safari). Without it, fall back to SameSite=None;Secure (cross-site third-party
-  // cookie — needed for distinct sites, but blocked by Safari/ITP). Unset WEB_ORIGIN
-  // ⇒ host-only Lax cookie (single-origin / service-binding SSR), the original shape.
   const webOrigins = (env.WEB_ORIGIN ?? '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
   const cookieDomain = env.COOKIE_DOMAIN?.trim() || undefined;
   const crossOrigin = webOrigins.length > 0;
-  // The UI render-plane origin (app.getwaddling.com) the OAuth/MCP sign-in + consent
-  // pages live on. Falls back to the API origin for single-origin local dev.
   const uiOrigin = webOrigins[0] ?? env.BETTER_AUTH_URL;
 
   return betterAuth({
@@ -96,16 +74,9 @@ function construct(env: Env, pool: Pool) {
             : { sameSite: 'none', secure: true },
         }
       : undefined,
-    // Better Auth owns this Pool (separate from db.ts's pool against the same
-    // Hyperdrive binding). Built fresh PER REQUEST and closed after (see buildAuth) —
-    // a Pool cached across requests makes Better Auth's Kysely connection wrapper hang
-    // on workerd (the runtime cancels a request whose code awaits I/O on a connection
-    // owned by a prior request → opaque 1101). Per-request is Better Auth's own
-    // documented Cloudflare pattern. Cap at 5; Hyperdrive pools server-side.
     database: pool,
     emailAndPassword: {
       enabled: true,
-      // ANO-56 decision: a new account must verify its email before it can be used.
       requireEmailVerification: true,
       sendResetPassword: async ({
         user,
@@ -117,8 +88,6 @@ function construct(env: Env, pool: Pool) {
         await sendEmail(env, { email: user.email, name: user.name }, resetPasswordEmail(url, user.name));
       },
     },
-    // Verification mail is sent on sign-up; the account stays unusable until verified
-    // (requireEmailVerification above), then auto-signs-in on confirm.
     emailVerification: {
       sendOnSignUp: true,
       autoSignInAfterVerification: true,
@@ -132,12 +101,6 @@ function construct(env: Env, pool: Pool) {
         await sendEmail(env, { email: user.email, name: user.name }, verificationEmail(url, user.name));
       },
     },
-
-    // PostHog funnel hooks. posthog-node is Node-only and does not bundle/run on
-    // workerd, so capture goes over PostHog's HTTP ingestion endpoint instead (see
-    // lib/posthog.ts). This is the AUTHORITATIVE, non-spoofable `signup_completed`;
-    // the browser SDK only calls identify() to stitch the anonymous → identified
-    // person. A thrown hook would fail the operation, hence the try/catch.
     databaseHooks: {
       user: {
         create: {
@@ -155,16 +118,13 @@ function construct(env: Env, pool: Pool) {
         },
       },
     },
-
     plugins: [
       jwt({
         jwks: {
           keyPairConfig: { alg: 'RS256', modulusLength: 2048 },
-          // Plaintext private JWK → jose can import it to mint session JWTs.
           disablePrivateKeyEncryption: true,
         },
         jwt: {
-          // Identity-only token; roles resolved live from the snapshot.
           definePayload: ({ user }: { user: { id: string } }) => ({ id: user.id }),
           expirationTime: '15m',
         },
@@ -172,9 +132,6 @@ function construct(env: Env, pool: Pool) {
       organization({
         allowUserToCreateOrganization: true,
         creatorRole: 'owner',
-        // Member-invite email (unblocks ANO-79). Fires when an invite is created via
-        // Better Auth's organization API; the manual /settings/members route sends its
-        // own invite mail with the same template + accept URL.
         sendInvitationEmail: async (data: {
           id: string;
           email: string;
@@ -208,13 +165,6 @@ function construct(env: Env, pool: Pool) {
             } catch {
               // swallow — telemetry must never break org creation.
             }
-            // Seed the prepaid ledger with this period's tier allotment (free ⇒ $5). This
-            // IS the new-org starter: resetTierCreditsForOrg uses the period-keyed idempotency
-            // (`tier_reset:<org>:<YYYY-MM>`), so the monthly cron tick in the same month is a
-            // no-op — the org gets one allotment now, not a starter grant PLUS a reset.
-            // Swallow errors so a seed failure never fails sign-up — but LOG loudly: a missing
-            // seed means no balance row, and hasCredit() fails open, so the org would get
-            // unlimited free service invisibly until the next cron reset reconciles it.
             try {
               await resetTierCreditsForOrg(
                 args.organization.id,
@@ -232,12 +182,6 @@ function construct(env: Env, pool: Pool) {
       apiKey({
         defaultPrefix: 'sk_agent_',
         enableMetadata: true,
-        // Rate limiting DISABLED: on workerd the per-verify rate-limit counter UPDATEs
-        // (consumeRemaining/consumeRateLimit on the apikey row) hang the request → the
-        // runtime cancels it as "hung" (1101). Every agent query authenticates via an
-        // sk_agent_ key, so this blocked the whole data path. Re-enable once the
-        // rate-limit write path is proven non-hanging on Hyperdrive (or move rate
-        // limiting to a gateway/edge layer).
         rateLimit: {
           enabled: false,
           maxRequests: 10000,
@@ -245,39 +189,16 @@ function construct(env: Env, pool: Pool) {
         },
       }),
       admin({ defaultRole: 'user', adminRoles: ['admin'] }),
-      // MCP / OAuth provider (delegated mode). Turns this Better Auth instance
-      // into the OAuth 2.1 authorization server Claude Desktop/Code drive:
-      // dynamic client registration, PKCE authorize/token, discovery metadata,
-      // all under /api/auth/*. Adds the oauthApplication / oauthAccessToken /
-      // oauthConsent tables (created by getMigrations).
-      //
-      // loginPage + consentPage are ABSOLUTE to the UI origin: Better Auth resolves
-      // them against baseURL (the API origin), but the dashboard sign-in + the agent
-      // approval screen live on the render plane (app.getwaddling.com). The mcp plugin
-      // redirects an unauthenticated authorize to loginPage with the full OAuth query,
-      // and (when prompt=consent — forced by the shim in index.ts) to consentPage with
-      // consent_code/client_id/scope. uiOrigin falls back to BETTER_AUTH_URL for
-      // single-origin local dev.
       mcp({
         loginPage: `${uiOrigin}/sign-in`,
-        // loginPage is repeated here only to satisfy OIDCOptions' type (the mcp plugin
-        // overrides it with the top-level value); consentPage is the field we need.
         oidcConfig: { loginPage: `${uiOrigin}/sign-in`, consentPage: `${uiOrigin}/oauth/consent` },
       }),
       stripe({
         stripeClient: stripeClientInstance,
         stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET,
-        // Credit-pack fulfillment: onEvent fires AFTER signature verification + the
-        // plugin's own handling, is awaited, and a throw returns non-2xx → Stripe retries
-        // (so the ledger's idempotency is a live safety net). Runs in the request's DB
-        // scope, so grantCredits works. See lib/credit-packs.fulfillCreditPackEvent.
         onEvent: async (event) => {
           await fulfillCreditPackEvent(event);
-          // Conversion funnel: emit checkout_completed for a settled subscription
-          // Checkout (no-op for credit-pack/payment events). Best-effort, never throws.
           await captureCheckoutCompletedEvent(env, event, authExecutionCtx());
-          // Dunning: a failed subscription payment → notify the customer. sendEmail never
-          // throws, so this can't turn a dunning email into a Stripe webhook retry.
           if (event.type === 'invoice.payment_failed') {
             const inv = event.data.object as {
               customer_email?: string | null;
@@ -292,24 +213,10 @@ function construct(env: Env, pool: Pool) {
             }
           }
         },
-        // Stripe's customer/subscription side-effects make external Stripe API calls
-        // during auth + org-create flows. With PLACEHOLDER keys those calls don't
-        // return cleanly and hang the request (the org-create timeout we hit). Better
-        // Auth treats these as OPT-IN, so gate them on real Stripe config: when keys
-        // are placeholders, construct the plugin (so the billing surface still exists)
-        // but disable the side-effecting hooks. Flips on automatically once real keys
-        // are set. Both casings are set because the option was renamed across versions
-        // (createCustomerOnSignUp in current @better-auth/stripe) — the inactive one is
-        // ignored, and either way it is false while unconfigured.
         createCustomerOnSignup: stripeConfigured,
         createCustomerOnSignUp: stripeConfigured,
         subscription: {
           enabled: stripeConfigured,
-          // Subscriptions bound to organization — referenceId = org id. The plugin only
-          // honors a non-self referenceId when this authorizes it: the acting user must be
-          // an owner/admin of that org. Reads the member row in the request's DB scope
-          // (same path the org-create / credit hooks use). Without this, an org-scoped
-          // upgrade is rejected and billing can't bind to the org.
           authorizeReference: async ({ user, referenceId }: { user: { id: string }; referenceId: string }) => {
             try {
               const row = await queryOne<{ role: string }>(
@@ -330,74 +237,39 @@ function construct(env: Env, pool: Pool) {
 
 export type Auth = ReturnType<typeof construct>;
 
-/**
- * Per-REQUEST Better Auth instance, scoped via AsyncLocalStorage so every
- * `buildAuth(c.env)` call site stays unchanged while each request gets its own
- * instance + pg.Pool. This is mandatory on workerd: a Better Auth instance cached
- * across requests reuses a Kysely connection bound to an earlier request's I/O
- * context, and the runtime then cancels the new request as "hung" (the opaque
- * 1101 that broke org-create / agent-create). Matches Better Auth's official
- * Cloudflare example (createAuth(c.env) per request). The pool is created lazily
- * (only when a request actually touches auth) and closed after the response by
- * runInAuthScope, so non-auth requests pay nothing and nothing leaks.
- */
-interface AuthSlot {
-  auth?: Auth;
-  pool?: Pool;
-  // Request executionCtx, stashed so database/organization hooks can fire
-  // fire-and-forget PostHog captures via waitUntil (the hooks only close over
-  // `env`, not the Hono context).
-  exCtx?: { waitUntil(p: Promise<unknown>): void };
-}
-const authScope = new AsyncLocalStorage<AuthSlot>();
+let _auth: Auth | undefined;
+let _authPool: Pool | undefined;
 
-/** The current request's executionCtx, for telemetry waitUntil inside auth hooks. */
-function authExecutionCtx(): { waitUntil(p: Promise<unknown>): void } | undefined {
-  return authScope.getStore()?.exCtx;
+/** Initialize the module-level auth singleton. Idempotent — first call wins. */
+export function initAuth(env: Env): void {
+  if (_auth !== undefined) return;
+  const connStr = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL ?? '';
+  _authPool = new Pool({ connectionString: connStr, max: 10 });
+  _auth = construct(env, _authPool);
 }
 
-export function buildAuth(env: Env): Auth {
-  const slot = authScope.getStore();
-  if (slot) {
-    if (!slot.auth) {
-      const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
-      slot.auth = construct(env, pool);
-      slot.pool = pool;
-    }
-    return slot.auth;
+/** Return the initialized auth singleton. Throws if initAuth has not run. */
+export function buildAuth(_env?: Env): Auth {
+  if (!_auth) {
+    throw new Error(
+      'auth not initialized — call initAuth(env) before buildAuth()',
+    );
   }
-  // Outside a request scope (rare — e.g. an out-of-band migration). Construct a
-  // throwaway; its pool isn't tracked for cleanup, so only use off the request path.
-  const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
-  return construct(env, pool);
+  return _auth;
 }
 
-/**
- * Run `next` inside a fresh per-request auth scope and close any Better Auth pool it
- * opened, after the response (via waitUntil). Wrap the whole request with this so every
- * buildAuth() call within it shares ONE instance + pool, torn down when the request ends.
- */
+/** Passthrough for backward compat — no per-request scope needed with singleton pool. */
 export async function runInAuthScope(
-  executionCtx: { waitUntil(p: Promise<unknown>): void } | undefined,
+  _executionCtx: unknown,
   next: () => Promise<void>,
 ): Promise<void> {
-  const slot: AuthSlot = { exCtx: executionCtx };
-  await authScope.run(slot, next);
-  if (slot.pool) {
-    const pool = slot.pool;
-    const closing = pool.end().catch(() => {});
-    if (executionCtx) executionCtx.waitUntil(closing);
-    else await closing;
-  }
+  await next();
 }
 
-/**
- * Bootstrap Better Auth's own schema (auth.* tables + plugin tables). Idempotent.
- * Not called by request handlers — exposed so a probe/admin route can bootstrap a
- * fresh database. DDL flows through Hyperdrive (it proxies the wire protocol).
- */
+/** Bootstrap Better Auth's own schema. Idempotent. */
 export async function runMigrations(env: Env): Promise<void> {
+  initAuth(env);
   const { getMigrations } = await import('better-auth/db/migration');
-  const { runMigrations: run } = await getMigrations(buildAuth(env).options);
+  const { runMigrations: run } = await getMigrations(buildAuth().options);
   await run();
 }

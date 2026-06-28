@@ -1,31 +1,12 @@
 /**
- * Gateway control-channel HTTP client
- * (ported from apps/waddling/src/lib/gateway-client.ts, W1 → W3 contract).
+ * Gateway control-channel HTTP client — dual-transport.
  *
- * The per-org DuckDB gateway (`packages/gateway`, W3) exposes a control port that
- * the control plane drives:
+ * CF deploy: `initDataplane(fetcher)` wires the DATAPLANE service binding; send()
+ * routes through `fetcher.fetch('https://dataplane/gw/...')`.
  *
- *   POST /gw/snapshot     — atomic birdshot policy snapshot (reset→set_auth→grants→constraints→commit)
- *   POST /gw/revoke        — birdshot_revoke (instant denylist)
- *   POST /gw/describe      — introspect lake columns/types (control plane filters to grants)
- *   GET  /gw/status        — birdshot_status() + DuckLake snapshot lag
- *
- * There is NO agent data path on the control channel. Column/row/window ACLs are
- * carried in the snapshot (`roleConstraints`) and enforced by birdshot's bind-walk;
- * the old POST /gw/constraints + /gw/query proxy were retired (the trusted-conn
- * bypass). Agent SQL reaches the lake only via the birdshot-gated quack path.
- *
- * W3 implements the server side to THESE EXACT request/response shapes. Types are
- * defined locally (re-using ./types where a shared shape exists) because they are a
- * control-channel wire contract, not a domain model.
- *
- * Transport: the gateway now lives in the waddling-dataplane Worker's GatewayDO,
- * which is service-binding-only (no public route). So this client transports every
- * call through the DATAPLANE service binding (a Fetcher), initialized per-isolate
- * from env by middleware (see initDataplane). The data plane exposes /gw/snapshot,
- * /gw/status, /gw/revoke; it has NO /gw/describe (catalog introspection needs a real
- * per-endpoint lake — Stage D), so `describe` throws a structured GatewayError and
- * its one caller degrades to an empty catalog. `fetch` is workerd-native.
+ * Node/Cloud Run: `initDataplane(url)` sets a base URL; send() issues plain HTTP
+ * requests to `<baseUrl>/ctrl/...` (path prefix rewrite /gw/ → /ctrl/). Google
+ * Cloud Run identity tokens are added automatically for https:// URLs.
  */
 import type { BirdshotSnapshot } from './types';
 
@@ -33,26 +14,12 @@ import type { BirdshotSnapshot } from './types';
 
 export interface SnapshotRequest {
   datalakeId: string;
-  /** birdshot auth config (RS256). */
   auth: { issuer: string; audience: string; mode: 'rs256'; jwks: BirdshotJwk[] };
   snapshot: BirdshotSnapshot;
-  /**
-   * Catalog name birdshot resolves agent table refs against (birdshot_set_lake_catalog).
-   * Real lake ⇒ the lake ATTACH alias (e.g. 'lake'); the offline demo ⇒ 'memory'.
-   * Omitted ⇒ the data plane defaults to 'memory' (the demo).
-   */
   lakeCatalog?: string;
-  /**
-   * Per-endpoint gateway boot config (real lake). The data plane injects this as the
-   * gateway container's per-process env on a COLD boot, so the gateway ATTACHes the
-   * endpoint's real DuckLake (its own METADATA_SCHEMA in the org's Postgres catalog +
-   * s3:// data) instead of the offline demo. Omitted ⇒ the demo seed. This carries lake
-   * credentials to the TRUSTED gateway only — never to the locked workspace.
-   */
   gatewayBoot?: GatewayBoot;
 }
 
-/** Per-endpoint gateway boot descriptor (mirrors the data plane's GatewayBoot). */
 export interface GatewayBoot {
   serverToken?: string;
   catalogDsn?: string;
@@ -65,11 +32,6 @@ export interface GatewayBoot {
     endpoint?: string; keyId?: string; secret?: string; sessionToken?: string;
     region?: string; useSsl?: boolean; urlStyle?: 'path' | 'vhost';
   };
-  /**
-   * Quackboard endpoint: boot birdshot + serve quack but do NOT ATTACH any DuckLake — the
-   * served database IS the durable store. `r2Key` is the object key under which the data
-   * plane restores/persists the single .duckdb file. No catalogDsn/catalogFile/s3.
-   */
   quackboard?: boolean;
   r2Key?: string;
 }
@@ -85,7 +47,6 @@ export interface RevokeRequest {
   kind: 'user' | 'jti' | 'session';
   id: string;
   reason: string;
-  /** Microseconds-from-now until the revocation expires; 0/undefined ⇒ forever. */
   expiresUs?: number;
 }
 
@@ -96,16 +57,12 @@ export interface GatewayAck {
   snapshotVersion?: string;
 }
 
-/** A table's columns/types as introspected by the gateway (/gw/describe). */
 export interface GatewayTableInfo {
   schema: string;
   table: string;
   columns: { name: string; type: string; nullable?: boolean }[];
 }
 
-// Full, UNFILTERED lake catalog (admin authoring picker). Names + types only — no
-// row data. Grouped schema → table → column. Scoped to the lake ATTACH catalog by
-// the gateway, so demo/system schemas never appear.
 export interface GatewayCatalogColumn {
   name: string;
   type: string;
@@ -123,8 +80,6 @@ export interface GatewayCatalog {
   schemas: GatewayCatalogSchema[];
 }
 
-// Pool runtime status from the dataplane GatewayPoolDO (derived without waking a sleeping
-// pool). Replaces the old per-gateway birdshot counts.
 export interface GatewayStatus {
   state: 'running' | 'asleep' | 'unconfigured';
   replicas: number;
@@ -141,20 +96,52 @@ export class GatewayError extends Error {
   }
 }
 
+// ── Google Cloud Run identity-token helper ─────────────────────────────────────
+
+// Cached on first successful init; null after a failed init (running locally without creds).
+let _idTokenClient:
+  | { getRequestHeaders(url: string): Promise<Record<string, string>> }
+  | null
+  | undefined;
+
+async function getCloudRunAuthHeaders(
+  audience: string,
+  url: string,
+): Promise<Record<string, string>> {
+  if (_idTokenClient === null) return {};
+  if (_idTokenClient === undefined) {
+    try {
+      const { GoogleAuth } = await import('google-auth-library');
+      const auth = new GoogleAuth();
+      _idTokenClient = await auth.getIdTokenClient(audience);
+    } catch {
+      _idTokenClient = null;
+      return {};
+    }
+  }
+  try {
+    return await _idTokenClient.getRequestHeaders(url);
+  } catch {
+    return {};
+  }
+}
+
 // ── Client ───────────────────────────────────────────────────────────────────
 
 export interface GatewayClientOptions {
-  /** Service binding to the waddling-dataplane Worker (env.DATAPLANE). */
-  fetcher: Fetcher;
+  fetcher?: Fetcher;
+  baseUrl?: string;
   timeoutMs?: number;
 }
 
 export class GatewayClient {
-  private readonly fetcher: Fetcher;
+  private readonly fetcher: Fetcher | undefined;
+  private readonly baseUrl: string | undefined;
   private readonly timeoutMs: number;
 
   constructor(opts: GatewayClientOptions) {
     this.fetcher = opts.fetcher;
+    this.baseUrl = opts.baseUrl;
     this.timeoutMs = opts.timeoutMs ?? 10_000;
   }
 
@@ -167,14 +154,35 @@ export class GatewayClient {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs ?? this.timeoutMs);
     try {
-      // The data plane is private (service-binding-only); the binding IS the trust
-      // boundary, so no bearer token is sent. The host is ignored by the binding.
-      const res = await this.fetcher.fetch(`https://dataplane${path}`, {
-        method,
-        headers: { 'content-type': 'application/json' },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: ctrl.signal,
-      });
+      let res: Response;
+      if (this.baseUrl !== undefined) {
+        // Node/Cloud Run HTTP path: rewrite /gw/ → /ctrl/
+        const ctrlPath = path.replace('/gw/', '/ctrl/');
+        const url = `${this.baseUrl}${ctrlPath}`;
+        const headers: Record<string, string> = { 'content-type': 'application/json' };
+        if (url.startsWith('https://')) {
+          const authHeaders = await getCloudRunAuthHeaders(this.baseUrl, url);
+          Object.assign(headers, authHeaders);
+        }
+        res = await fetch(url, {
+          method,
+          headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: ctrl.signal,
+        });
+      } else {
+        const f = this.fetcher;
+        if (!f) {
+          throw new GatewayError('gateway not initialized — call initDataplane before gatewayClientFor', 0);
+        }
+        // CF service-binding path: host is ignored by the binding.
+        res = await f.fetch(`https://dataplane${path}`, {
+          method,
+          headers: { 'content-type': 'application/json' },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: ctrl.signal,
+        });
+      }
       if (!res.ok) {
         const detail = await res.text().catch(() => '');
         throw new GatewayError(
@@ -194,28 +202,11 @@ export class GatewayClient {
     }
   }
 
-  /** Push a birdshot ACL snapshot + RS256 JWKS to the per-endpoint GatewayDO. The
-   *  data plane boots `gw:<datalakeId>` if cold and applies the snapshot (a full
-   *  reset → set_auth → grants → commit), so callers MUST push the endpoint's WHOLE
-   *  compiled policy (all agents), not a single agent's — see sessions/acl. */
   pushSnapshot(req: SnapshotRequest): Promise<GatewayAck> {
-    // WIRE CONTRACT: the deployed dataplane reads `endpointId` (value = the datalake id).
-    // Keep the internal field `datalakeId`, remap to `endpointId` on the wire.
     const { datalakeId, ...rest } = req;
-    // pushSnapshot can trigger a COLD gateway boot (image provision + DuckDB init + lake
-    // ATTACH). Even with extensions pre-baked that exceeds the default 10s, so a too-short
-    // timeout aborts mid-boot AND the abort kills the in-flight boot → it never warms (a
-    // vicious cycle). Give the boot room to finish in one connect.
     return this.send<GatewayAck>('POST', '/gw/snapshot', { endpointId: datalakeId, ...rest }, 45_000);
   }
 
-  /**
-   * Introspect columns/types for granted tables. NOT available on the data-plane
-   * gateway — catalog introspection needs the real per-endpoint DuckLake (Stage D),
-   * and the GatewayDO image attaches only a demo lake. Throws a structured
-   * GatewayError(501); the one caller (endpoints describe) degrades to an empty
-   * catalog rather than failing the editor.
-   */
   describe(
     _tables?: { schema: string; table: string }[],
   ): Promise<{ tables: GatewayTableInfo[] }> {
@@ -224,79 +215,49 @@ export class GatewayClient {
     );
   }
 
-  /**
-   * Fetch the FULL lake catalog (every schema/table/column the owner may grant),
-   * UNFILTERED by grants — for the admin ACL authoring picker. Distinct from the
-   * agent-facing grant-scoped `describe`. May trigger a cold gateway boot
-   * (boot-on-demand when no cached snapshot), so it carries the longer timeout.
-   * Names + types only; never row data.
-   */
   catalog(datalakeId: string): Promise<GatewayCatalog> {
-    // WIRE CONTRACT: dataplane reads `endpointId` (= datalake id).
     return this.send<GatewayCatalog>('POST', '/gw/catalog', { endpointId: datalakeId }, 45_000);
   }
 
   revoke(req: RevokeRequest): Promise<GatewayAck> {
-    // WIRE CONTRACT: dataplane reads `endpointId` (= datalake id) — remap on the wire.
     const { datalakeId, ...rest } = req;
     return this.send<GatewayAck>('POST', '/gw/revoke', { endpointId: datalakeId, ...rest });
   }
 
   status(datalakeId: string): Promise<GatewayStatus> {
-    // WIRE CONTRACT: dataplane query param is `endpointId` (= datalake id).
     return this.send<GatewayStatus>(
       'GET',
       `/gw/status?endpointId=${encodeURIComponent(datalakeId)}`,
     );
   }
 
-  /** Tear down a datalake's gateway pool + any abandoned legacy static gateway DO. */
   teardownGateways(datalakeId: string): Promise<{ ok: boolean; legacyDestroyed?: boolean; destroyed?: number }> {
     return this.send('POST', '/gw/teardown-legacy', { endpointId: datalakeId });
   }
 
-  /**
-   * Drain the per-endpoint gateway's birdshot audit log. Returns the authorize /
-   * authenticate records logged on the quack/workspace path since the last drain
-   * (DESTRUCTIVE — each record once). Cold gateway ⇒ empty. control-api persists
-   * these as `source='gateway'` audit rows so queries show in the dashboard.
-   */
   drainAudit(datalakeId: string): Promise<{ records: GatewayAuditRecord[]; count: number }> {
     return this.send<{ records: GatewayAuditRecord[]; count: number }>(
       'POST',
       '/gw/audit-drain',
-      { endpointId: datalakeId }, // WIRE CONTRACT: dataplane reads `endpointId` (= datalake id)
+      { endpointId: datalakeId },
     );
   }
 
-  // ── per-replica lifecycle (Step 3) ──────────────────────────────────────────────
-  // The client half of the /gw/replica/:n/{op} + /gw/replicas contract. Used by the
-  // Internal MCP admin tools (Step 6) and the dashboard (Step 8). Each takes the
-  // datalake id (remapped to `endpointId` on the wire, matching the other /gw routes).
-
-  /** Force-boot + arm replica n with the current snapshot (creates the slot if missing). */
   wakeReplica(datalakeId: string, n: number): Promise<{ replicaKey: string; appliedVersion: number }> {
     return this.send('POST', `/gw/replica/${n}/wake`, { endpointId: datalakeId });
   }
-  /** Stop replica n's container but keep its slot (next access cold-boots + re-arms). */
   sleepReplica(datalakeId: string, n: number): Promise<{ ok: boolean }> {
     return this.send('POST', `/gw/replica/${n}/sleep`, { endpointId: datalakeId });
   }
-  /** Destroy replica n's container AND remove its slot from the pool (scale down). */
   destroyReplica(datalakeId: string, n: number): Promise<{ ok: boolean }> {
     return this.send('POST', `/gw/replica/${n}/destroy`, { endpointId: datalakeId });
   }
-  /** Force re-apply the director's CACHED snapshot to replica n (warm or cold). */
   rearmReplica(datalakeId: string, n: number): Promise<{ ok: boolean; appliedVersion: number }> {
     return this.send('POST', `/gw/replica/${n}/rearm`, { endpointId: datalakeId });
   }
-  /** Re-apply the replica CONTAINER's own last-cached snapshot (no control-plane round
-   *  trip). Recovers a hot replica with a corrupted in-memory birdshot policy. 409 if
-   *  the container has never received a snapshot (cold boot). `force` defaults true. */
   reapplyReplica(datalakeId: string, n: number, force = true): Promise<{ ok: boolean; reapplied: boolean; grants?: number; reason?: string }> {
     return this.send('POST', `/gw/replica/${n}/reapply`, { endpointId: datalakeId, force });
   }
-  /** Per-replica detail (index, appliedVersion, current, lastActiveAt, inFlight, warm). */
   replicaStatus(datalakeId: string): Promise<{
     version: number;
     replicas: Array<{ index: number; appliedVersion: number; current: boolean; lastActiveAt: number; inFlight: number; warm: boolean }>;
@@ -304,67 +265,47 @@ export class GatewayClient {
     return this.send('GET', `/gw/replicas?endpointId=${encodeURIComponent(datalakeId)}`);
   }
 
-  // ── pool-director reset (Step 4) ───────────────────────────────────────────────
-  /** Drop the cached snapshot + zero currentVersion (fail-closed until the next push). */
   resetPool(datalakeId: string): Promise<{ ok: boolean; clearedReplicas: number }> {
     return this.send('POST', '/gw/pool/reset', { endpointId: datalakeId });
   }
-  /** Keep the cache but mark every replica stale so the next pick re-applies it. */
   clearSnapshot(datalakeId: string): Promise<{ ok: boolean; markedStale: number; version: number }> {
     return this.send('POST', '/gw/pool/clear-snapshot', { endpointId: datalakeId });
   }
 }
 
-/** One drained birdshot audit record (free-text fields already b64-decoded by the gateway). */
 export interface GatewayAuditRecord {
-  /** birdshot NowUs() — epoch MICROSECONDS. */
   tsUs: number;
-  /** 'authorize' | 'authenticate'. */
   event: string;
-  /** quack per-connection session id (NOT the control-plane jti). */
   sid: string;
-  /** JWT `sub` — 'agent:<agentId>'. */
   user: string;
-  /** 'allow' | 'deny' | ''. */
   decision: string;
   reason: string;
   query: string;
 }
 
-/**
- * Per-isolate DATAPLANE service-binding singleton + throwing getter (mirrors db.ts's
- * pool pattern). A middleware calls `initDataplane(env.DATAPLANE)` once before any
- * handler, and `gatewayClientFor` reads it via the getter — keeping that function's
- * signature unchanged from the original (callers still pass the endpoint row).
- */
-let _dataplane: Fetcher | undefined;
+// ── Module-level singleton transport ─────────────────────────────────────────
 
-/** Idempotent per-isolate DATAPLANE binding initializer. First call wins. */
-export function initDataplane(fetcher: Fetcher): void {
-  if (_dataplane === undefined) {
-    _dataplane = fetcher;
+let _fetcher: Fetcher | undefined;
+let _baseUrl: string | undefined;
+
+/**
+ * Initialize the gateway transport. Idempotent — first call wins.
+ *
+ * Pass a URL string for Node/Cloud Run (HTTP transport to /ctrl/* paths).
+ * Pass a Fetcher for CF workerd (service-binding transport to /gw/* paths).
+ */
+export function initDataplane(input: Fetcher | string): void {
+  if (_fetcher !== undefined || _baseUrl !== undefined) return;
+  if (typeof input === 'string') {
+    if (input) _baseUrl = input.replace(/\/$/, '');
+  } else {
+    _fetcher = input;
   }
 }
 
-function getDataplane(): Fetcher {
-  if (_dataplane === undefined) {
-    throw new Error(
-      'DATAPLANE binding not initialized — initDataplane(env.DATAPLANE) must run before gatewayClientFor',
-    );
-  }
-  return _dataplane;
-}
-
-/**
- * Build a gateway control-channel client. The `endpoint` row is accepted for
- * call-site compatibility (and to make the per-endpoint intent legible) but its
- * fields are no longer used for transport: every endpoint's control channel is
- * routed through the single DATAPLANE binding, and the GatewayDO is keyed per
- * endpoint INSIDE the data plane by the `datalakeId` carried in each request body.
- */
 export function gatewayClientFor(_endpoint?: {
   server_token: string;
   ctrl_port?: number | null;
 }): GatewayClient {
-  return new GatewayClient({ fetcher: getDataplane() });
+  return new GatewayClient({ fetcher: _fetcher, baseUrl: _baseUrl });
 }

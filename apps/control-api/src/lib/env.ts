@@ -34,7 +34,10 @@ export interface SendEmailBinding {
 
 export interface Env {
   // ── Bindings ────────────────────────────────────────────────────────────
-  HYPERDRIVE: Hyperdrive;
+  // Optional on Node/Cloud Run — provided by CF Hyperdrive in CF deploy.
+  HYPERDRIVE?: Hyperdrive;
+  // Direct Postgres connection string (Node/Cloud Run path). Fallback when HYPERDRIVE absent.
+  DATABASE_URL?: string;
   MASTER_KEY: SecretBinding;
   R2_ACCESS_KEY_ID: SecretBinding;
   R2_SECRET_ACCESS_KEY: SecretBinding;
@@ -48,6 +51,9 @@ export interface Env {
 
   // ── Worker secret (set via `wrangler secret put`, NOT in vars) ───────────
   BETTER_AUTH_SECRET: string;
+  // Neon API key (account-scoped) for per-org managed Postgres catalog provisioning.
+  // Unset ⇒ the managed-postgres catalog path is disabled (getNeonClient → null).
+  NEON_API_KEY?: string;
   // R2 faucet (per-org lake bucket provisioning + scoped temp creds). The account-scoped
   // R2 API token VALUE (Cloudflare API Bearer); its Access Key ID is the parent below.
   // Unset ⇒ the R2 faucet is disabled (getR2Faucet → null).
@@ -114,13 +120,12 @@ export interface Env {
   STRIPE_PRICE_CREDIT_25: string;
   STRIPE_PRICE_CREDIT_100: string;
 
-  // ── GCP Cloud SQL (shared per-org Postgres catalog) — non-secret vars ─────
-  // The shared Cloud SQL instance's public host (IP) + port. control-api reaches the instance
-  // only through Hyperdrive (which carries the mTLS client cert), but provisionOrgDatabase
-  // needs the host/port to build each org's sealed DSN for the gateway. Unset PG_HOST ⇒ the
-  // managed-postgres catalog path is disabled (cloudSqlConfigured → false).
-  PG_HOST?: string;
-  PG_PORT?: string;
+  // ── Neon (per-org managed Postgres catalog) — non-secret vars ────────────
+  // The cloud region id (e.g. 'aws-us-east-1') new org catalog projects are created in, and
+  // the Postgres major version. Both optional: unset ⇒ Neon picks defaults. The API key is a
+  // Worker secret above.
+  NEON_REGION_ID?: string;
+  NEON_PG_VERSION?: string;
 
   // ── R2 faucet (per-org lake bucket) — non-secret ─────────────────────────
   // The parent R2 Access Key ID (the account-scoped token's S3 key id) to scope temp
@@ -133,19 +138,21 @@ export interface Env {
   R2_BUCKET: string;
   R2_REGION: string;
 
-  // ── Data plane (service binding) ─────────────────────────────────────────
-  // The waddling-dataplane Worker (apps/dataplane): one private worker hosting the
-  // GatewayDO + WorkspaceSandbox Container DOs. It is service-binding-only (no
-  // public route), so the control plane reaches it ONLY through this Fetcher:
-  //   • gateway control channel — POST /gw/snapshot, GET /gw/status, POST /gw/revoke
-  //     (lib/gateway-client transports through here);
-  //   • workspace lifecycle — POST /configure (connect) + POST /query (the revived
-  //     /:id/query forwarder). Agent SQL still reaches the lake only via the
-  //     workspace sidecar's birdshot-gated quack ATTACH — never a trusted conn.
+  // ── Data plane ─────────────────────────────────────────────────────────────
+  // CF deploy: the waddling-dataplane Worker service binding (Fetcher).
+  // Node/Cloud Run: a stub Fetcher is provided by server.ts; real gateway traffic
+  // goes through GATEWAY_BASE_URL instead (via lib/gateway-client HTTP transport).
   DATAPLANE: Fetcher;
 
-  // Legacy: base URL of the EXISTING Rivet/GCP DuckDB gateway's control port. The
-  // gateway now lives in the DATAPLANE worker's GatewayDO, so gateway-client no
-  // longer reads this. Kept OPTIONAL so an old wrangler var doesn't break typing.
+  // Base URL of the GCP Cloud Run gateway service (Node/Cloud Run path).
+  // When set, gateway-client sends /ctrl/* HTTP requests here instead of using the
+  // DATAPLANE service binding. Unset on CF (service binding handles routing).
+  GATEWAY_BASE_URL?: string;
+
+  // Legacy: kept so an old wrangler var doesn't break typing.
   GATEWAY_INTERNAL_URL?: string;
+
+  // SendGrid API key (Node/Cloud Run transactional email path). When set, email.ts
+  // sends via SendGrid HTTP before falling back to the CF EMAIL binding.
+  SENDGRID_API_KEY?: string;
 }

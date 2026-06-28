@@ -8,13 +8,17 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "build:node": "esbuild src/server.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/server.js",
+    "start": "node dist/server.js"
   },
   "dependencies": {
     "@better-auth/api-key": "1.6.19",
     "@better-auth/stripe": "1.6.19",
     "aws4fetch": "^1.0.20",
     "better-auth": "1.6.19",
+    "google-auth-library": "^9",
+    "@hono/node-server": "^1",
     "hono": "^4",
     "jose": "^6",
     "pg": "^8",
@@ -22,8 +26,9 @@
     "zod": "^4"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4",
+    "@types/node": "^22",
     "@types/pg": "^8",
+    "esbuild": "^0.25",
     "typescript": "^5",
     "wrangler": "^4.101.0"
   }

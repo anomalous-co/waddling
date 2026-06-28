@@ -18,6 +18,13 @@ export interface SessionGrant {
     columns?: string[];
     rowLimit?: number;
   }[];
+  /**
+   * Non-read/write catalog capabilities the agent holds on this lake
+   * (create/drop/alter/detach). Surfaced so an agent connected to an EMPTY lake —
+   * which has no read/write tables to list — still knows it can bootstrap tables.
+   * Omitted when empty.
+   */
+  capabilities?: ('create' | 'drop' | 'alter' | 'detach')[];
 }
 
 // A workspace HANDLE — what connect returns in the Cloudflare data-plane model. The

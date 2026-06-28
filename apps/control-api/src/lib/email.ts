@@ -27,6 +27,45 @@ export async function sendEmail(
   content: EmailContent,
   replyTo: string = REPLY_TO,
 ): Promise<boolean> {
+  // SendGrid HTTP path (Node/Cloud Run): takes priority over the CF EMAIL binding.
+  if (env.SENDGRID_API_KEY) {
+    const toList = Array.isArray(to) ? to : [to];
+    const toAddrs = toList.map((a) => (typeof a === 'string' ? { email: a } : a));
+    const sgBody = {
+      personalizations: [{ to: toAddrs }],
+      from: FROM,
+      reply_to: { email: replyTo },
+      subject: content.subject,
+      content: [
+        { type: 'text/html', value: content.html },
+        { type: 'text/plain', value: content.text },
+      ],
+    };
+    try {
+      const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${env.SENDGRID_API_KEY}`,
+        },
+        body: JSON.stringify(sgBody),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        console.log(
+          `[email] sendgrid ${res.status} "${content.subject}": ${detail.slice(0, 200)}`,
+        );
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.log(
+        `[email] sendgrid threw "${content.subject}": ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return false;
+    }
+  }
+
   if (!env.EMAIL) {
     console.log(`[email] EMAIL binding unset — skipped "${content.subject}"`);
     return false;

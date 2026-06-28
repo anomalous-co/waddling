@@ -28,6 +28,7 @@ import { recompileAndPush } from './gateway-push';
 import { compileEndpointPolicy } from './effective-policy';
 import type { CompileResult } from './policy-compiler';
 import { gatewayClientFor, initDataplane } from './gateway-client';
+import { refreshCatalog, type CatalogEndpoint } from './catalog-cache';
 import type { Env } from './env';
 
 /**
@@ -56,6 +57,72 @@ export async function recompileAndEnqueue(
   await enqueueSnapshotDispatch(datalakeId);
   kickDispatch(c, datalakeId);
   return compiled;
+}
+
+/**
+ * Pull the live catalog from the gateway and, IF it changed, enqueue a durable recompile+
+ * push (so any covering read/write WILDCARD grant folds in the new/removed/renamed table —
+ * the "future tables are auto-covered" promise the authoring UI makes for "whole schema /
+ * entire lake" grants). The DURABLE variant of gateway-push.ts `refreshCatalogAndRecompile`:
+ * a changed catalog goes through the outbox (enqueue + kick) instead of a direct best-effort
+ * push, so a failed push is retried by the drain rather than silently lost — the cached
+ * content_hash is already advanced, so a direct push that failed would never re-fire until
+ * the NEXT content change.
+ *
+ * Best-effort: never throws into the caller (cron tick / waitUntil / awaited loopback). The
+ * gateway must already be warm — callers status-gate (or run on the just-woken connect path)
+ * so this never cold-boots a sleeping gateway.
+ */
+export async function refreshCatalogAndEnqueue(
+  c: { env: Env; executionCtx?: ExecutionContext },
+  datalakeId: string,
+  endpoint: CatalogEndpoint,
+): Promise<{ changed: boolean }> {
+  try {
+    const r = await refreshCatalog(endpoint);
+    if (r?.changed) {
+      await enqueueSnapshotDispatch(datalakeId);
+      kickDispatch(c, datalakeId);
+      return { changed: true };
+    }
+  } catch {
+    /* best-effort: the next tick / connect picks up the fresh catalog anyway */
+  }
+  return { changed: false };
+}
+
+/**
+ * Periodic backstop for tables created/dropped/renamed OUT-OF-BAND (not via governed ETL):
+ * for every running datalake whose gateway is currently WARM, pull the live catalog and
+ * enqueue a recompile when it changed. Gated on `/gw/status` (which derives state WITHOUT
+ * waking the pool) so a sleeping gateway is never cold-booted — an asleep gateway has no
+ * held session to serve stale grants to, and its next connect refreshes the catalog anyway.
+ *
+ * Runs in the caller's DB scope; assumes initDataplane already ran (the cron does it). Pass
+ * a context WITHOUT executionCtx so kickDispatch is a no-op here — the cron's own drain pass
+ * (which runs right after this) delivers the freshly-enqueued snapshots in the same tick.
+ */
+export async function refreshWarmCatalogs(
+  env: Env,
+): Promise<{ scanned: number; warm: number; changed: number }> {
+  const { rows } = await query<CatalogEndpoint>(
+    `SELECT id, org_id, status, server_token
+       FROM waddling.datalake WHERE status = 'running'`,
+  );
+  let warm = 0;
+  let changed = 0;
+  for (const ep of rows) {
+    try {
+      const st = await gatewayClientFor(ep).status(ep.id); // no wake
+      if (st.state !== 'running') continue;
+      warm++;
+      const r = await refreshCatalogAndEnqueue({ env }, ep.id, ep);
+      if (r.changed) changed++;
+    } catch {
+      /* best-effort per datalake; keep scanning the rest */
+    }
+  }
+  return { scanned: rows.length, warm, changed };
 }
 
 /** Backoff: first retry ~15s, doubling, capped at the 5m cron cadence. */

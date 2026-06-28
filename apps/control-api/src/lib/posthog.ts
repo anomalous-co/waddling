@@ -44,7 +44,7 @@ const DEFAULT_HOST = 'https://us.i.posthog.com';
  * Build a PostHog client bound to this request's env + executionCtx. Returns a
  * no-op when POSTHOG_KEY is unset, so call sites stay unconditional.
  */
-export function makePostHog(env: Env, executionCtx: ExecutionCtx): PostHogClient {
+export function makePostHog(env: Env, executionCtx?: ExecutionCtx): PostHogClient {
   const token = env.POSTHOG_KEY?.trim();
   if (!token) return NOOP;
 
