@@ -1,0 +1,10 @@
+# Runs test/smoke.mjs on linux/amd64 with the real birdshot binary (the only arch we have).
+# Build context = the gateway-cloudrun dir:  docker build -f test/Dockerfile.smoke .
+FROM node:24-slim
+WORKDIR /p
+RUN npm install --no-audit --no-fund @duckdb/node-api@1.5.3-r.3 jose@^5.9.6
+COPY birdshot/birdshot.duckdb_extension.gz ./birdshot.duckdb_extension.gz
+RUN gunzip -f ./birdshot.duckdb_extension.gz && test -s ./birdshot.duckdb_extension
+ENV BIRDSHOT_EXTENSION_PATH=/p/birdshot.duckdb_extension
+COPY test/smoke.mjs ./smoke.mjs
+CMD ["node", "smoke.mjs"]
