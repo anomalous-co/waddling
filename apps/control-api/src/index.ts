@@ -565,6 +565,13 @@ app.get("/", (c) =>
   ),
 );
 
+// SECURITY: /probe/* are diagnostic scaffolding (db/secret/jwks/gw-push/migrate/cols/…) that expose
+// internals + run privileged operations. Once control-api is fronted by the public LB
+// (api.getwaddling.com), these must NOT be reachable. Gate ALL of them behind ENABLE_PROBES — unset
+// in production ⇒ 404. Registered before the routes so the guard runs first (Hono middleware order).
+app.use("/probe", async (c, next) => (process.env.ENABLE_PROBES === "1" ? next() : c.text("not found", 404)));
+app.use("/probe/*", async (c, next) => (process.env.ENABLE_PROBES === "1" ? next() : c.text("not found", 404)));
+
 app.get("/probe/db", async (c) => c.json(await probeDb(c.env)));
 app.get("/probe/secret", async (c) => c.json(await probeSecret(c.env)));
 app.get("/probe/r2", async (c) => c.json(await probeR2(c.env)));
