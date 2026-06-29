@@ -120,29 +120,6 @@ waddling_admin_revoke_agent({
         </div>
       </section>
 
-      {/* Use cases — the persona lakes */}
-      <section className="border-t border-border">
-        <div className="mx-auto max-w-6xl px-6 py-20">
-          <div className="mb-12 text-center">
-            <h2 className="mb-3 font-mono text-xl font-semibold">use cases</h2>
-            <p className="mx-auto max-w-xl text-muted-foreground">
-              Every team putting agents on their lakehouse — and the one agent
-              you would rather keep on a short leash. Same ducks, different hats.
-            </p>
-          </div>
-          <PersonaRows invite={false} />
-          <div className="mt-10 text-center">
-            <Link
-              href="/customers"
-              className="font-mono text-sm text-emerald-600 transition-colors hover:text-emerald-500 dark:text-emerald-400 dark:hover:text-emerald-300"
-            >
-              see who waddling is for →
-            </Link>
-          </div>
-        </div>
-      </section>
-
-      {/* How it works — code */}
       <section className="border-t border-border">
         <div className="mx-auto max-w-6xl px-6 py-20">
           <h2 className="mb-4 font-mono text-xl font-semibold">

@@ -320,13 +320,26 @@ const server = createServer((req, res) => {
             // pure private-scratch reads, stay entirely here — behavior unchanged).
             return await runReader(sql);
           } catch (e) {
-            // Only multi-table lake reads reach here: Form A can't carry them (quack
-            // throws "Multiple streaming scans" before birdshot runs). Retry the SAME
-            // statement via Form B so it runs server-side and joins work. Scoped to the
-            // already-failed set, and only when a lake is attached — so single-table and
-            // workspace-scratch queries never change paths. A statement that also touches
-            // private workspace tables can't go server-side and surfaces its own error.
-            if (lakeProxy && lakeToken && /streaming scan/i.test(String(e?.message ?? e))) {
+            // Form A runs against THIS session's quack ATTACH, whose view of the gateway's
+            // catalog is cached at ATTACH time. Two cases fail Form A but succeed server-side
+            // via Form B (quack_query ships the whole statement to the gateway, whose catalog
+            // is current):
+            //   1. Multi-table lake reads — quack throws "Multiple streaming scans" before
+            //      birdshot runs (Form A opens one streaming cursor per table).
+            //   2. A lake table CREATED AFTER this session attached — the client's cached
+            //      remote catalog doesn't know it yet, so Form A throws a catalog
+            //      "… does not exist" error even though the gateway has the table. (Verified:
+            //      data for already-known tables is always fresh over quack, so this stale
+            //      catalog is the ONLY staleness and it ALWAYS surfaces as a hard catalog
+            //      error — never silently-wrong rows — so an error-triggered fallback is
+            //      sufficient and safe.)
+            // Scoped to lake reads (a `lake.` ref) with a lake attached, so workspace-scratch
+            // queries never change paths; a genuinely missing table just re-errors server-side.
+            const msg = String(e?.message ?? e);
+            const needsServerSide =
+              /streaming scan/i.test(msg) ||
+              (/does not exist|catalog error/i.test(msg) && /\blake\b/i.test(sql));
+            if (lakeProxy && lakeToken && needsServerSide) {
               return await runReader(formB(sql));
             }
             throw e;
