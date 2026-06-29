@@ -59,7 +59,14 @@ function serviceNameFromHost(hostHeader) {
   return m[1]; // "gw-<slug>" | "ws-<slug>"
 }
 
+// Cloud Run service URLs are deterministic per project: https://<service>-<hash>.<region>.run.app,
+// where <hash> is derived from the project NUMBER and is therefore CONSTANT across all services in
+// the project. So when RUN_URL_SUFFIX is set (e.g. "-ampdswzubq-uw.a.run.app") we construct the URL
+// directly — no Cloud Run Admin API call, hence no run.viewer on the router SA. Falls back to the
+// Admin API lookup (requires run.viewer) when the suffix is not configured.
+const RUN_URL_SUFFIX = process.env.RUN_URL_SUFFIX ?? "";
 async function resolveServiceUrl(serviceName) {
+  if (RUN_URL_SUFFIX) return `https://${serviceName}${RUN_URL_SUFFIX}`;
   const cached = urlCache.get(serviceName);
   const now = Date.now();
   if (cached && cached.exp > now) return cached.url;

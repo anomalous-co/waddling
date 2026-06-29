@@ -10,6 +10,7 @@ IMG="us-west1-docker.pkg.dev/${PROJECT}/waddling/provisioner:${TAG}"
 GATEWAY_IMAGE="us-west1-docker.pkg.dev/${PROJECT}/waddling/gateway:bringup-f78a111-cacerts"
 GATEWAY_SA="gateway-run@${PROJECT}.iam.gserviceaccount.com"
 CONTROL_API_SA="control-api-run@${PROJECT}.iam.gserviceaccount.com"
+ROUTER_SA="waddling-router@${PROJECT}.iam.gserviceaccount.com"
 
 docker build --platform=linux/amd64 --provenance=false --sbom=false -t "$IMG" .
 docker push "$IMG"
@@ -17,7 +18,7 @@ docker push "$IMG"
 gcloud run deploy provisioner --project="$PROJECT" --region="$REGION" --image="$IMG" \
   --service-account="provisioner-run@${PROJECT}.iam.gserviceaccount.com" \
   --no-allow-unauthenticated \
-  --set-env-vars="GCP_PROJECT=${PROJECT},GCP_REGION=${REGION},GATEWAY_IMAGE=${GATEWAY_IMAGE},GATEWAY_SA=${GATEWAY_SA},CONTROL_API_SA=${CONTROL_API_SA},CLOUDSQL_INSTANCE=${PROJECT}:${REGION}:waddling-main" \
+  --set-env-vars="GCP_PROJECT=${PROJECT},GCP_REGION=${REGION},GATEWAY_IMAGE=${GATEWAY_IMAGE},GATEWAY_SA=${GATEWAY_SA},CONTROL_API_SA=${CONTROL_API_SA},ROUTER_SA=${ROUTER_SA},CLOUDSQL_INSTANCE=${PROJECT}:${REGION}:waddling-main" \
   --cpu=1 --memory=512Mi --min-instances=0 --max-instances=2 --timeout=300
 
 # Let control-api call the provisioner.

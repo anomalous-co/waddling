@@ -16,7 +16,8 @@ const REGION = process.env.GCP_REGION ?? "us-west1";
 const GATEWAY_IMAGE = process.env.GATEWAY_IMAGE; // the gateway container image to run per datalake
 const GATEWAY_SA = process.env.GATEWAY_SA;       // runtime SA the gateways RUN AS (gateway-run@)
 const CLOUDSQL_INSTANCE = process.env.CLOUDSQL_INSTANCE ?? `${PROJECT}:${REGION}:waddling-main`;
-const CONTROL_API_SA = process.env.CONTROL_API_SA; // granted run.invoker on each gateway
+const CONTROL_API_SA = process.env.CONTROL_API_SA; // granted run.invoker on each gateway (control path)
+const ROUTER_SA = process.env.ROUTER_SA;           // granted run.invoker on each gateway (quack data path)
 // Shared mTLS PEM secrets (Secret Manager names) every gateway references for its libpq client cert.
 const PEM_SECRETS = {
   GW_PG_SSLCERT_PEM_B64: process.env.SEC_SSLCERT ?? "gw-pg-sslcert-pem-b64",
@@ -102,10 +103,12 @@ async function provision(slug, envMap, secretEnvMap) {
   if (got.status !== 200) throw new Error(`describe ${service} ${got.status}: ${JSON.stringify(got.data).slice(0, 200)}`);
   const url = got.data.uri;
 
-  // Grant control-api run.invoker so it can push /ctrl/snapshot to this private gateway.
-  if (CONTROL_API_SA) {
+  // Grant run.invoker on this private gateway to control-api (pushes /ctrl/snapshot — control path)
+  // and to the public router (forwards quack POST /quack with a minted id token — data path).
+  const invokers = [CONTROL_API_SA, ROUTER_SA].filter(Boolean).map((sa) => `serviceAccount:${sa}`);
+  if (invokers.length) {
     const pol = await api("POST", `${API}/${svcPath}:setIamPolicy`, {
-      policy: { bindings: [{ role: "roles/run.invoker", members: [`serviceAccount:${CONTROL_API_SA}`] }] },
+      policy: { bindings: [{ role: "roles/run.invoker", members: invokers }] },
     });
     if (pol.status >= 400) log(`WARN setIamPolicy ${pol.status}: ${JSON.stringify(pol.data).slice(0, 200)}`);
   }
