@@ -66,6 +66,28 @@ export async function sendEmail(
     }
   }
 
+  // CF email bridge (Node/Cloud Run "keep CF email"): POST to the bridge Worker that holds the
+  // Cloudflare send_email binding. This is how transactional mail still goes through Cloudflare
+  // after the GCP cutover; it takes priority over the (Node-absent) EMAIL binding below.
+  if (env.CF_EMAIL_BRIDGE_URL && env.CF_EMAIL_BRIDGE_TOKEN) {
+    try {
+      const res = await fetch(`${env.CF_EMAIL_BRIDGE_URL.replace(/\/$/, '')}/send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${env.CF_EMAIL_BRIDGE_TOKEN}` },
+        body: JSON.stringify({ to, from: FROM, replyTo, subject: content.subject, html: content.html, text: content.text }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        console.log(`[email] bridge ${res.status} "${content.subject}": ${detail.slice(0, 200)}`);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.log(`[email] bridge threw "${content.subject}": ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
+  }
+
   if (!env.EMAIL) {
     console.log(`[email] EMAIL binding unset — skipped "${content.subject}"`);
     return false;

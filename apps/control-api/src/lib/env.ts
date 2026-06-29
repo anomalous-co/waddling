@@ -161,6 +161,12 @@ export interface Env {
   // sends via SendGrid HTTP before falling back to the CF EMAIL binding.
   SENDGRID_API_KEY?: string;
 
+  // CF email bridge (Node/Cloud Run): URL + shared secret of the tiny Cloudflare Worker that holds
+  // the send_email binding. When both are set, email.ts delivers transactional mail through it
+  // (keeping Cloudflare Email Sending after the GCP cutover). Unset ⇒ falls through to EMAIL/no-op.
+  CF_EMAIL_BRIDGE_URL?: string;
+  CF_EMAIL_BRIDGE_TOKEN?: string;
+
   // Shared Cloud SQL instance coordinates for per-org catalog provisioning (cloudsql.ts).
   // PG_HOST is the instance host the GATEWAY dials over mTLS for the org's DuckLake catalog
   // (the Cloud SQL public IP); it is baked into the DSN minted by provisionOrgDatabase, never

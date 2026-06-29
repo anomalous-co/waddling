@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "waddling-email-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "observability": { "enabled": true },
+  // Cloudflare Email Sending — the same binding the old control-api Worker used. Sender locked to
+  // noreply@getwaddling.com; remote:true so it delivers for real. Requires the domain onboarded +
+  // Email Sending enabled on the account (already true from the prior setup).
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_sender_addresses": ["noreply@getwaddling.com"]
+    }
+  ]
+  // BRIDGE_SECRET is set out of band: `wrangler secret put BRIDGE_SECRET`.
+}

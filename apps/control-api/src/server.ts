@@ -102,6 +102,9 @@ const config: Env = {
   PG_PORT: process.env.PG_PORT,
 
   PROVISIONER_URL: process.env.PROVISIONER_URL,
+
+  CF_EMAIL_BRIDGE_URL: process.env.CF_EMAIL_BRIDGE_URL,
+  CF_EMAIL_BRIDGE_TOKEN: process.env.CF_EMAIL_BRIDGE_TOKEN,
 };
 
 startupInit(config);
