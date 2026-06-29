@@ -10,7 +10,7 @@
 // reported as JSON, never thrown, so a single failing piece does not take down
 // the whole probe surface.
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { AwsClient } from "aws4fetch";
 import { Pool } from "pg";
@@ -159,13 +159,20 @@ app.get("/.well-known/oauth-authorization-server", (c) =>
 
 // OAuth Protected Resource Metadata (RFC 9728) — points clients at the auth server.
 // `resource` MUST equal MCP_RESOURCE_URL (the audience cp-shared binds tokens to).
-app.get("/.well-known/oauth-protected-resource", (c) =>
+//
+// Served at BOTH the apex and the RFC 9728 path-suffixed location for the resource.
+// MCP_RESOURCE_URL has a path (`…/mcp`), so the spec-canonical metadata URL inserts
+// `/.well-known/oauth-protected-resource` between host and path →
+// `<origin>/.well-known/oauth-protected-resource/mcp`. The 401 challenge below
+// advertises that exact URL; the apex route stays for clients that probe the root.
+const protectedResourceMetadata = (c: Context<{ Bindings: Env }>) =>
   c.json({
     resource: c.env.MCP_RESOURCE_URL,
     authorization_servers: [c.env.BETTER_AUTH_URL],
     bearer_methods_supported: ["header"],
-  }),
-);
+  });
+app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
+app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
 
 app.on(["GET", "POST", "DELETE"], "/mcp", async (c) => {
   // Gate: authenticate the caller (both API-key and delegated-OAuth paths). org is
@@ -176,8 +183,13 @@ app.on(["GET", "POST", "DELETE"], "/mcp", async (c) => {
     if (e instanceof AuthError) {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (e.status === 401) {
-        headers["WWW-Authenticate"] =
-          `Bearer resource_metadata="${c.env.MCP_RESOURCE_URL}/.well-known/oauth-protected-resource"`;
+        // RFC 9728: metadata URL inserts the well-known path between host and the
+        // resource's path. MCP_RESOURCE_URL = `<origin>/mcp` ⇒
+        // `<origin>/.well-known/oauth-protected-resource/mcp` (NOT `<origin>/mcp/.well-known/…`,
+        // which 404s — the route lives under the well-known prefix, not under /mcp).
+        const ru = new URL(c.env.MCP_RESOURCE_URL);
+        const metadataUrl = `${ru.origin}/.well-known/oauth-protected-resource${ru.pathname}`;
+        headers["WWW-Authenticate"] = `Bearer resource_metadata="${metadataUrl}"`;
       }
       return new Response(JSON.stringify({ error: e.code, reason: e.message }), { status: e.status, headers });
     }
@@ -208,7 +220,15 @@ app.on(["GET", "POST", "DELETE"], "/mcp", async (c) => {
     return { ok: res.ok, status: res.status, data };
   };
 
-  return handleMcp(c.req.raw, { loopback });
+  // appUrl bases the dashboard deep-links some tools emit (e.g. the agent access
+  // "propose" URL). It must be the UI origin, not this API origin — prefer WEB_ORIGIN
+  // (app.getwaddling.com), then APP_URL, then the API base as a last resort.
+  const appUrl = (
+    c.env.WEB_ORIGIN?.split(",")[0]?.trim() ||
+    c.env.APP_URL ||
+    c.env.BETTER_AUTH_URL
+  ).replace(/\/+$/, "");
+  return handleMcp(c.req.raw, { loopback, appUrl });
 });
 
 // ─── /probe/db ──────────────────────────────────────────────────────────────
