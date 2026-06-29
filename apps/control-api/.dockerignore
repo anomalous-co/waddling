@@ -1,0 +1,7 @@
+# The image runs `npm install` for linux/amd64 inside the build, then `COPY . .`.
+# Excluding the local (host-arch) node_modules + build outputs keeps that linux
+# install intact and the build context small.
+node_modules
+dist
+*.log
+.dev.vars

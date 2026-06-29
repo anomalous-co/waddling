@@ -19,8 +19,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ChevronRight, ChevronDown, Plus, X, RefreshCw, AlertCircle,
-  Database, Layers, Table2, Globe, PanelLeftClose, PanelLeft,
-  ArrowDownToLine, Download, Upload, Link2, Package, PackageOpen, Pencil, Check,
+  Database, Layers, Table2, Globe,
+  ArrowDownToLine, Upload, Link2, Package, PackageOpen, Pencil, Check, LayersPlus,
 } from 'lucide-react';
 import { fetchCp } from '@/components/dashboard/fetch';
 import { Button } from '@/components/ui/button';
@@ -35,6 +35,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
 import {
   CATALOG_CAPABILITIES,
@@ -51,7 +52,7 @@ const EXTENSION_CAPS: PolicyCapability[] = ['install', 'load'];
 
 const POLICY_ICON: Record<PolicyCapability, typeof Database> = {
   read_source: ArrowDownToLine,
-  copy_from: Download,
+  copy_from: LayersPlus,
   copy_to: Upload,
   attach: Link2,
   install: Package,
@@ -85,10 +86,22 @@ interface AccessEditorProps {
   onChange: (m: AccessModel) => void;
   /** Pin to one lake (agent detail). Otherwise the user picks which lake's tree to edit. */
   fixedDatalakeId?: string;
+  /**
+   * Lake to open on initially (not pinned — the user can still switch). Used when a
+   * request-access proposal targets a specific lake, so the operator lands on the tree
+   * the pending grants belong to instead of an arbitrary default.
+   */
+  defaultDatalakeId?: string;
+  /**
+   * Show only the Catalog section (lake→schema→table grants). Used by the OAuth consent
+   * screen, where access maps to delegation rows — and delegations can only represent
+   * catalog capabilities, not the pattern-based Sources/Extensions policies.
+   */
+  catalogOnly?: boolean;
 }
 
-export function AccessEditor({ datalakes, value, onChange, fixedDatalakeId }: AccessEditorProps) {
-  const [datalakeId, setDatalakeId] = useState<string>(fixedDatalakeId ?? datalakes[0]?.id ?? '');
+export function AccessEditor({ datalakes, value, onChange, fixedDatalakeId, defaultDatalakeId, catalogOnly }: AccessEditorProps) {
+  const [datalakeId, setDatalakeId] = useState<string>(fixedDatalakeId ?? defaultDatalakeId ?? datalakes[0]?.id ?? '');
   const [catalog, setCatalog] = useState<CatalogResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -96,8 +109,6 @@ export function AccessEditor({ datalakes, value, onChange, fixedDatalakeId }: Ac
   const [openPolicies, setOpenPolicies] = useState<Set<PolicyCapability>>(new Set());
   const [extraSchema, setExtraSchema] = useState('');
   const [section, setSection] = useState<Section>('catalog');
-  const [navOpen, setNavOpen] = useState(true); // inline nav collapse (md+)
-  const [navSheetOpen, setNavSheetOpen] = useState(false); // slide-over nav (small screens)
   // policy-pattern entry state: a trailing empty "draft" per capability, and which
   // saved pattern (if any) is being edited in place.
   const [drafts, setDrafts] = useState<Partial<Record<PolicyCapability, string>>>({});
@@ -118,6 +129,21 @@ export function AccessEditor({ datalakes, value, onChange, fixedDatalakeId }: Ac
   }, []);
 
   useEffect(() => { void loadCatalog(datalakeId); }, [datalakeId, loadCatalog]);
+
+  // Keep the selected lake valid as `datalakes` loads. The useState initializer above runs
+  // ONCE — on surfaces where datalakes arrive async (e.g. the OAuth consent page) it sees an
+  // empty list and pins datalakeId='', which would then stamp grants with no lake (a FK
+  // violation when those map to delegation rows). Snap to the default/first lake once the
+  // options arrive or the current id is no longer valid.
+  useEffect(() => {
+    if (fixedDatalakeId) return;
+    if (datalakeId && datalakes.some((d) => d.id === datalakeId)) return;
+    const next =
+      defaultDatalakeId && datalakes.some((d) => d.id === defaultDatalakeId)
+        ? defaultDatalakeId
+        : datalakes[0]?.id ?? '';
+    if (next && next !== datalakeId) setDatalakeId(next);
+  }, [datalakes, fixedDatalakeId, defaultDatalakeId, datalakeId]);
 
   // ── model accessors (scoped to the selected lake) ─────────────────────────────
   const capsFor = useCallback(
@@ -292,28 +318,7 @@ export function AccessEditor({ datalakes, value, onChange, fixedDatalakeId }: Ac
     );
   };
 
-  const navButtons = (onPick?: () => void) =>
-    SECTIONS.map((s) => {
-      const Icon = s.icon;
-      const active = section === s.id;
-      return (
-        <button
-          key={s.id}
-          type="button"
-          onClick={() => { setSection(s.id); onPick?.(); }}
-          className={cn(
-            'flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors',
-            active ? 'bg-muted font-medium text-foreground' : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground',
-          )}
-        >
-          <Icon className="size-4" />
-          <span className="flex-1">{s.label}</span>
-          {sectionCount[s.id] > 0 && (
-            <span className="rounded bg-primary/15 px-1.5 text-xs text-primary">{sectionCount[s.id]}</span>
-          )}
-        </button>
-      );
-    });
+  const visibleSections = catalogOnly ? SECTIONS.filter((s) => s.id === 'catalog') : SECTIONS;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
@@ -329,32 +334,32 @@ export function AccessEditor({ datalakes, value, onChange, fixedDatalakeId }: Ac
         </div>
       )}
 
-      <div className="relative flex min-h-0 flex-1">
-        {/* settings-style left section nav — inline on md+, a slide-over on small screens */}
-        {navOpen ? (
-          <nav className="hidden w-44 shrink-0 flex-col gap-0.5 border-r pr-2 md:flex">
-            <div className="flex items-center justify-between px-1 pb-1">
-              <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Sections</span>
-              <Button type="button" size="icon" variant="ghost" className="size-6" onClick={() => setNavOpen(false)} aria-label="Collapse sections">
-                <PanelLeftClose className="size-3.5" />
-              </Button>
-            </div>
-            {navButtons()}
-          </nav>
-        ) : (
-          <Button type="button" size="icon" variant="ghost" className="mr-2 hidden size-7 self-start md:flex" onClick={() => setNavOpen(true)} aria-label="Open sections">
-            <PanelLeft className="size-4" />
-          </Button>
+      <Tabs
+        value={section}
+        onValueChange={(v) => setSection(v as Section)}
+        className="flex min-h-0 flex-1 flex-col gap-3"
+      >
+        {/* settings-style left section selection group — the shared Tabs primitive.
+            Hidden in catalogOnly mode, where there's only the one section. */}
+        {!catalogOnly && (
+          <TabsList className="h-fit w-fit">
+            {visibleSections.map((s) => {
+              const Icon = s.icon;
+              return (
+                <TabsTrigger key={s.id} value={s.id} className="w-full justify-start gap-2">
+                  <Icon className="size-4" />
+                  <span className="flex-1 text-left">{s.label}</span>
+                  {sectionCount[s.id] > 0 && (
+                    <span className="rounded bg-primary/15 px-1.5 text-xs text-primary">{sectionCount[s.id]}</span>
+                  )}
+                </TabsTrigger>
+              );
+            })}
+          </TabsList>
         )}
 
-        {/* content (active section) */}
-        <div className="flex min-h-0 flex-1 flex-col md:pl-3">
-          {/* small-screen section switcher → opens the in-modal sheet */}
-          <Button type="button" size="sm" variant="outline" className="mb-2 self-start md:hidden" onClick={() => setNavSheetOpen(true)}>
-            <PanelLeft className="size-3.5" /> {SECTIONS.find((s) => s.id === section)?.label}
-          </Button>
+        <TabsContent value="catalog" className="flex min-h-0 flex-col">
           <ScrollArea type="auto" className="min-h-0 flex-1 pr-2">
-          {section === 'catalog' && (
             <div className="flex flex-col">
               <div className="flex items-center justify-between border-b pb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                 <span>Resource</span><span>Capabilities</span>
@@ -395,46 +400,37 @@ export function AccessEditor({ datalakes, value, onChange, fixedDatalakeId }: Ac
                 </Button>
               </div>
             </div>
-          )}
-
-          {section === 'sources' && (
-            <div className="flex flex-col">
-              <p className="pb-2 text-xs text-muted-foreground">
-                External read/write sources &amp; ATTACH targets — authorizes egress (e.g.
-                <span className="font-mono"> read_parquet</span>/<span className="font-mono">read_json</span>) per pattern.
-              </p>
-              {SOURCE_CAPS.map(renderPolicyCap)}
-            </div>
-          )}
-
-          {section === 'extensions' && (
-            <div className="flex flex-col">
-              <p className="pb-2 text-xs text-muted-foreground">
-                DuckDB extensions this agent may <span className="font-mono">INSTALL</span> /
-                <span className="font-mono"> LOAD</span>, by name.
-              </p>
-              {EXTENSION_CAPS.map(renderPolicyCap)}
-            </div>
-          )}
           </ScrollArea>
-        </div>
+        </TabsContent>
 
-        {/* small-screen slide-over nav, contained INSIDE the modal */}
-        {navSheetOpen && (
-          <div className="absolute inset-0 z-20 md:hidden">
-            <div className="absolute inset-0 bg-black/20" onClick={() => setNavSheetOpen(false)} />
-            <nav className="absolute inset-y-0 left-0 flex w-48 flex-col gap-0.5 border-r bg-popover p-2 shadow-lg">
-              <div className="flex items-center justify-between px-1 pb-1">
-                <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Sections</span>
-                <Button type="button" size="icon" variant="ghost" className="size-6" onClick={() => setNavSheetOpen(false)} aria-label="Close sections">
-                  <X className="size-3.5" />
-                </Button>
+        {!catalogOnly && (
+          <TabsContent value="sources" className="flex min-h-0 flex-col">
+            <ScrollArea type="auto" className="min-h-0 flex-1 pr-2">
+              <div className="flex flex-col">
+                <p className="pb-2 text-xs text-muted-foreground">
+                  External read/write sources &amp; ATTACH targets — authorizes egress (e.g.
+                  <span className="font-mono"> read_parquet</span>/<span className="font-mono">read_json</span>) per pattern.
+                </p>
+                {SOURCE_CAPS.map(renderPolicyCap)}
               </div>
-              {navButtons(() => setNavSheetOpen(false))}
-            </nav>
-          </div>
+            </ScrollArea>
+          </TabsContent>
         )}
-      </div>
+
+        {!catalogOnly && (
+          <TabsContent value="extensions" className="flex min-h-0 flex-col">
+            <ScrollArea type="auto" className="min-h-0 flex-1 pr-2">
+              <div className="flex flex-col">
+                <p className="pb-2 text-xs text-muted-foreground">
+                  DuckDB extensions this agent may <span className="font-mono">INSTALL</span> /
+                  <span className="font-mono"> LOAD</span>, by name.
+                </p>
+                {EXTENSION_CAPS.map(renderPolicyCap)}
+              </div>
+            </ScrollArea>
+          </TabsContent>
+        )}
+      </Tabs>
     </div>
   );
 }

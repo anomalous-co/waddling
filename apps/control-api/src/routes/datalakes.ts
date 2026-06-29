@@ -26,6 +26,7 @@ import { compileEndpointPolicy } from '../lib/effective-policy';
 import { policyVersionFor, grantVersionFor, authVersionFor, bumpPolicyVersion } from '../lib/policy-version';
 import { loadSigningKey } from '../lib/session-jwt';
 import { provisionOrgCatalog } from '../lib/catalog-provision';
+import { provisionGateway, type ProvisionableDatalake } from '../lib/provisioner';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import type { DescribeResult, TableInfo, DatalakeStatus, DatalakeSummary, DatalakeDetail, DatalakeRuntime } from '../lib/types';
 
@@ -238,8 +239,38 @@ datalakes.post('/', (c) =>
           );
         }
 
-        return row.rows[0]!;
+        // Activate immediately (provisioning → running). The gateway is now a lazy-boot
+        // dynamic pool (it boots on the first connect's snapshot push and scales back to
+        // zero when idle), and the managed catalog was provisioned synchronously above —
+        // so there is no async Stage-D step left for 'provisioning' to gate on. The dev
+        // /provision stand-in that used to flip this is 403 in production, and onboarding
+        // does the same one-line activation for its demo lake; without this, a lake created
+        // via "+ new datalake" sits in 'provisioning' forever. connect re-checks catalog
+        // readiness, so this is safe even if the best-effort provisionOrgCatalog above hiccupped.
+        await q(`UPDATE waddling.datalake SET status = 'running', updated_at = now() WHERE id = $1`, [datalakeId]);
+        return { id: datalakeId, status: 'running' as const };
       });
+
+      // Deploy this datalake's OWN private Cloud Run gateway (gw-<slug>, max=1) via the provisioner
+      // and record its URL, so control-api targets it for snapshot pushes / revocations. Runs after
+      // the row commits (the deploy is ~30-60s and needs the catalog ready). Best-effort: on failure
+      // the datalake is still 'running' and POST /:id/provision re-attempts; connect fails clearly
+      // until the gateway exists. Unset PROVISIONER_URL ⇒ legacy single-gateway (GATEWAY_BASE_URL).
+      if (c.env.PROVISIONER_URL) {
+        try {
+          const dlRow = await queryOne<ProvisionableDatalake>(
+            `SELECT id, org_id, slug, server_token, catalog_schema, catalog_mode, encrypted
+               FROM waddling.datalake WHERE id = $1`,
+            [created.id],
+          );
+          if (dlRow) {
+            const { url } = await provisionGateway(c.env, dlRow);
+            await query(`UPDATE waddling.datalake SET gateway_url = $1 WHERE id = $2`, [url, created.id]);
+          }
+        } catch (e) {
+          console.log(`[datalake create] gateway provisioning failed for ${created.id}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
 
       // Provisioning funnel: a new endpoint/datalake was created. Server-side,
       // fire-and-forget via waitUntil; no-op when POSTHOG_KEY is unset.
@@ -275,6 +306,7 @@ interface EndpointRow {
   server_token: string;
   data_path: string;
   region: string;
+  gateway_url: string | null;
 }
 
 const PatchSchema = z.object({
@@ -284,7 +316,7 @@ const PatchSchema = z.object({
 
 async function loadOwned(id: string, orgId: string): Promise<EndpointRow | null> {
   const ep = await queryOne<EndpointRow>(
-    `SELECT id, org_id, name, slug, status, server_token, data_path, region
+    `SELECT id, org_id, name, slug, status, server_token, data_path, region, gateway_url
        FROM waddling.datalake WHERE id = $1`,
     [id],
   );
@@ -655,6 +687,7 @@ interface DescribeEndpointRow {
   org_id: string;
   status: string;
   server_token: string;
+  gateway_url: string | null;
 }
 
 datalakes.get('/:id/describe', (c) =>
@@ -673,7 +706,7 @@ datalakes.get('/:id/describe', (c) =>
     }
 
     const endpoint = await queryOne<DescribeEndpointRow>(
-      `SELECT id, org_id, status, server_token
+      `SELECT id, org_id, status, server_token, gateway_url
          FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
@@ -764,7 +797,7 @@ datalakes.get('/:id/catalog', (c) =>
     const caller = await resolveCaller(c);
     const datalakeId = c.req.param('id');
     const endpoint = await queryOne<DescribeEndpointRow>(
-      `SELECT id, org_id, status, server_token FROM waddling.datalake WHERE id = $1`,
+      `SELECT id, org_id, status, server_token, gateway_url FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
     if (!endpoint) return err(c, 'datalake_not_found', 404);
@@ -791,7 +824,7 @@ datalakes.post('/:id/catalog/refresh', (c) =>
     const caller = await resolveCaller(c);
     const datalakeId = c.req.param('id');
     const endpoint = await queryOne<DescribeEndpointRow>(
-      `SELECT id, org_id, status, server_token FROM waddling.datalake WHERE id = $1`,
+      `SELECT id, org_id, status, server_token, gateway_url FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
     if (!endpoint) return err(c, 'datalake_not_found', 404);
@@ -807,54 +840,87 @@ datalakes.post('/:id/catalog/refresh', (c) =>
   }),
 );
 
-// ── /api/cp/endpoints/:id/provision — LOCAL/DEV provisioning stand-in ────────────
+// ── POST /api/cp/endpoints/:id/provision — (re)activate a lake ───────────────────
 //
-// Production endpoint boot (the gateway container/port pool/DNS) is the Stage D
-// deployment workstream and is intentionally NOT built here. This route closes the
-// local UX loop: it resolves the endpoint's stored credentials through
-// getDatalakeGatewayConfig (proving the encrypted BYO storage creds + managed
-// catalog decrypt into a valid gateway config), then marks the endpoint `running`
-// with a localhost gateway address so the dashboard provisioning poll completes. It
-// does NOT call the gateway and does NOT start a real gateway process.
+// The supported API path to (re)activate a lake WITHOUT a direct DB write. New lakes
+// activate automatically at create (the POST handler above), so this is the recovery
+// path for a lake that ended up not 'running' — a legacy lake created before auto-
+// activation, one left in 'error'/'stopped', or one whose managed catalog needs a
+// re-provision. Idempotent: safe to call on an already-running lake.
 //
-// SECURITY NOTE: the original gated this on getNodeEnv()==='production' (default
-// 'development' ⇒ ENABLED). workerd has no NODE_ENV, so the guard reads
-// c.env.WADDLING_ENV; preserving the original default means the route is OPEN
-// unless WADDLING_ENV is explicitly 'production'. Set WADDLING_ENV=production in
-// the deployed Worker so this dev stand-in can never flip prod endpoints green.
+// It does NOT boot a gateway — the gateway is a lazy-boot dynamic pool that boots on
+// the first connect's snapshot push and scales back to zero. Activation just (a)
+// ensures the managed org catalog exists (idempotent re-provision), (b) proves the
+// stored creds decrypt into a valid gateway config, then (c) flips the lifecycle
+// status to 'running' so connect/agent-tooling stop gating on it. Connect re-checks
+// catalog readiness, so a transient catalog hiccup self-heals on the next connect.
+//
+// (Formerly a dev-only stand-in hard-403'd in production — which is why a lake created
+// via the UI sat in 'provisioning' forever. The gateway is lazy-boot now, so flipping
+// the status IS the correct activation; no Stage-D boot to wait on.)
 
 datalakes.post('/:id/provision', (c) =>
   handle(c, async () => {
-    if (c.env.WADDLING_ENV === 'production') {
-      return err(c, 'not_available', 403, 'Dev provisioning is disabled in production (Stage D owns boot)');
-    }
     const caller = await resolveCaller(c);
     const id = c.req.param('id');
 
-    const owned = await queryOne<{ org_id: string; status: string }>(
-      `SELECT org_id, status FROM waddling.datalake WHERE id = $1`,
+    const owned = await queryOne<{ org_id: string; status: string; catalog_mode: string | null }>(
+      `SELECT org_id, status, catalog_mode FROM waddling.datalake WHERE id = $1`,
       [id],
     );
     if (!owned) return err(c, 'endpoint_not_found', 404);
     assertOrg(caller, owned.org_id);
 
-    // Resolve + validate stored credentials (decrypts BYO storage / catalog).
+    // (a) Ensure the managed org catalog exists (idempotent — returns the existing 'ready'
+    // row, or re-provisions a missing/errored one). Best-effort: connect re-checks anyway.
+    let catalogState: string | undefined;
+    if (owned.catalog_mode === 'managed-postgres') {
+      const slugRow = await queryOne<{ slug: string }>(`SELECT slug FROM "organization" WHERE id = $1`, [owned.org_id]);
+      try {
+        catalogState = (await provisionOrgCatalog(c.env, owned.org_id, slugRow?.slug ?? owned.org_id)).state;
+      } catch {
+        // leave catalogState undefined; connect re-checks readiness via getOrgCatalogDsn
+      }
+    }
+
+    // (b) Resolve + validate stored credentials (decrypts BYO storage / catalog).
     const cfg = await getDatalakeGatewayConfig(id);
     if (!cfg) return err(c, 'endpoint_not_found', 404);
     if (!cfg.localData && cfg.s3?.provider === 'config' && !cfg.s3.secret) {
       return err(c, 'missing_storage_secret', 422, 'Object-store credentials did not resolve');
     }
 
+    // (c) Flip the lifecycle status to running (idempotent).
     await query(
       `UPDATE waddling.datalake SET status = 'running', updated_at = now() WHERE id = $1`,
       [id],
     );
 
-    // Echo the resolved config WITHOUT secrets, so a developer can confirm the
-    // credential plumbing without exposing keys to the browser. The gateway is now a
-    // dynamic pool (no fixed host:port) — provisioning just flips the lifecycle status.
+    // (d) Ensure this datalake's own private gateway is deployed (idempotent create-or-update via
+    // the provisioner). This is the recovery for a datalake whose create-time provision failed or
+    // a legacy row with no gateway_url. Best-effort: connect re-checks and the next call retries.
+    if (c.env.PROVISIONER_URL) {
+      try {
+        const dlRow = await queryOne<ProvisionableDatalake>(
+          `SELECT id, org_id, slug, server_token, catalog_schema, catalog_mode, encrypted
+             FROM waddling.datalake WHERE id = $1`,
+          [id],
+        );
+        if (dlRow) {
+          const { url } = await provisionGateway(c.env, dlRow);
+          await query(`UPDATE waddling.datalake SET gateway_url = $1 WHERE id = $2`, [url, id]);
+        }
+      } catch (e) {
+        console.log(`[datalake provision] gateway (re)provision failed for ${id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    // Echo the resolved config WITHOUT secrets, so the dashboard can confirm the
+    // credential plumbing without exposing keys to the browser. The gateway is a
+    // dynamic pool (no fixed host:port) — activation just flips the lifecycle status.
     return ok(c, {
       status: 'running',
+      catalogState,
       resolved: {
         dataPath: cfg.ducklakeDataPath,
         localData: cfg.localData,

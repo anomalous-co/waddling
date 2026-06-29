@@ -33,16 +33,16 @@
   // Two render-plane routes read the session at the server (the dashboard layout
   // gate + /link). They no longer open an in-process DB / Better Auth instance;
   // src/lib/control-api-server.ts forwards the inbound Cookie to the control-api
-  // auth plane. It PREFERS this CONTROL_API service binding (worker-to-worker, no
-  // public hop, domain-independent) and falls back to NEXT_PUBLIC_CONTROL_API_URL
-  // when the binding is absent (single-origin local dev). So this worker needs NO
-  // Hyperdrive / DB binding of its own.
-  "services": [
-    { "binding": "CONTROL_API", "service": "waddling-control-api" }
-  ]
+  // auth plane over the PUBLIC NEXT_PUBLIC_CONTROL_API_URL origin.
+  //
+  // No CONTROL_API service binding: the control-api now runs on GCP Cloud Run
+  // (api.getwaddling.com), not a Cloudflare Worker, so a worker-to-worker binding
+  // can't reach it. Binding it to the old CF control-api made the SSR session
+  // gate read a stale backend that doesn't hold GCP-issued sessions — so a freshly
+  // verified user bounced to /sign-in instead of landing on /onboarding. The public
+  // fallback forwards the inbound .getwaddling.com cookie to GCP, which is authoritative.
 
   // Build-time (NOT wrangler vars — NEXT_PUBLIC_* is inlined by `next build`):
   //   NEXT_PUBLIC_CONTROL_API_URL = https://api.<zone>   (the control-api origin;
-  //   browser bundle for /api/cp/* + /api/auth/*, and the SSR helper's fallback
-  //   when the CONTROL_API service binding is unavailable).
+  //   browser bundle for /api/cp/* + /api/auth/*, and the SSR helper's transport).
 }

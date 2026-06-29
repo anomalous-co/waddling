@@ -10,22 +10,23 @@
 // reported as JSON, never thrown, so a single failing piece does not take down
 // the whole probe surface.
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { AwsClient } from "aws4fetch";
 import { Pool } from "pg";
 import type { Env } from "./lib/env";
-import { runInDbScope, query } from "./lib/db";
+import { query, initPool } from "./lib/db";
 import {
   sweepExpiredSessions,
   resetAllTierCredits,
   currentBillingPeriod,
   reconcileDebits,
 } from "./lib/credits";
-import { buildAuth, runMigrations, runInAuthScope } from "./lib/auth";
+import { buildAuth, runMigrations, initAuth } from "./lib/auth";
 import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
-import { initDataplane } from "./lib/gateway-client";
+import { initDataplane, gatewayClientFor } from "./lib/gateway-client";
+import { drainGatewayDispatch, refreshWarmCatalogs } from "./lib/gateway-dispatch";
 import { resolveCaller, AuthError } from "./lib/cp-shared";
 import { handleMcp } from "./mcp/server";
 import type { LoopbackResult } from "./mcp/tools";
@@ -107,14 +108,15 @@ app.use(
 );
 
 app.use("*", async (c, next) => {
+  // Initialize module-level singletons (idempotent — first call wins).
+  // On Node the server.ts startup already did this; on CF the first request does it.
   initCrypto(c.env.WADDLING_SECRET_KEY ?? c.env.BETTER_AUTH_SECRET);
-  initDataplane(c.env.DATAPLANE);
-  // Per-request DB + Better Auth scopes: each request opens its OWN pool(s), closed after
-  // the response. Hyperdrive pools server-side, so caching a pool across requests is both
-  // redundant and unsafe on workerd (a connection bound to a prior request hangs → 1101).
-  let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
-  try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
-  await runInDbScope(exCtx, c.env.HYPERDRIVE.connectionString, () => runInAuthScope(exCtx, next));
+  if (c.env.HYPERDRIVE) initPool(c.env.HYPERDRIVE.connectionString);
+  initAuth(c.env);
+  // Prefer GATEWAY_BASE_URL (Node/Cloud Run HTTP) over DATAPLANE service binding (CF).
+  if (c.env.GATEWAY_BASE_URL) initDataplane(c.env.GATEWAY_BASE_URL);
+  else initDataplane(c.env.DATAPLANE);
+  await next();
 });
 
 // ─── Better Auth ──────────────────────────────────────────────────────────────
@@ -157,13 +159,20 @@ app.get("/.well-known/oauth-authorization-server", (c) =>
 
 // OAuth Protected Resource Metadata (RFC 9728) — points clients at the auth server.
 // `resource` MUST equal MCP_RESOURCE_URL (the audience cp-shared binds tokens to).
-app.get("/.well-known/oauth-protected-resource", (c) =>
+//
+// Served at BOTH the apex and the RFC 9728 path-suffixed location for the resource.
+// MCP_RESOURCE_URL has a path (`…/mcp`), so the spec-canonical metadata URL inserts
+// `/.well-known/oauth-protected-resource` between host and path →
+// `<origin>/.well-known/oauth-protected-resource/mcp`. The 401 challenge below
+// advertises that exact URL; the apex route stays for clients that probe the root.
+const protectedResourceMetadata = (c: Context<{ Bindings: Env }>) =>
   c.json({
     resource: c.env.MCP_RESOURCE_URL,
     authorization_servers: [c.env.BETTER_AUTH_URL],
     bearer_methods_supported: ["header"],
-  }),
-);
+  });
+app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
+app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
 
 app.on(["GET", "POST", "DELETE"], "/mcp", async (c) => {
   // Gate: authenticate the caller (both API-key and delegated-OAuth paths). org is
@@ -174,8 +183,13 @@ app.on(["GET", "POST", "DELETE"], "/mcp", async (c) => {
     if (e instanceof AuthError) {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (e.status === 401) {
-        headers["WWW-Authenticate"] =
-          `Bearer resource_metadata="${c.env.MCP_RESOURCE_URL}/.well-known/oauth-protected-resource"`;
+        // RFC 9728: metadata URL inserts the well-known path between host and the
+        // resource's path. MCP_RESOURCE_URL = `<origin>/mcp` ⇒
+        // `<origin>/.well-known/oauth-protected-resource/mcp` (NOT `<origin>/mcp/.well-known/…`,
+        // which 404s — the route lives under the well-known prefix, not under /mcp).
+        const ru = new URL(c.env.MCP_RESOURCE_URL);
+        const metadataUrl = `${ru.origin}/.well-known/oauth-protected-resource${ru.pathname}`;
+        headers["WWW-Authenticate"] = `Bearer resource_metadata="${metadataUrl}"`;
       }
       return new Response(JSON.stringify({ error: e.code, reason: e.message }), { status: e.status, headers });
     }
@@ -206,15 +220,26 @@ app.on(["GET", "POST", "DELETE"], "/mcp", async (c) => {
     return { ok: res.ok, status: res.status, data };
   };
 
-  return handleMcp(c.req.raw, { loopback });
+  // appUrl bases the dashboard deep-links some tools emit (e.g. the agent access
+  // "propose" URL). It must be the UI origin, not this API origin — prefer WEB_ORIGIN
+  // (app.getwaddling.com), then APP_URL, then the API base as a last resort.
+  const appUrl = (
+    c.env.WEB_ORIGIN?.split(",")[0]?.trim() ||
+    c.env.APP_URL ||
+    c.env.BETTER_AUTH_URL
+  ).replace(/\/+$/, "");
+  return handleMcp(c.req.raw, { loopback, appUrl });
 });
 
 // ─── /probe/db ──────────────────────────────────────────────────────────────
-// Opens a pg Pool against the Hyperdrive connection string and runs two trivial
-// queries. NOTE: local `wrangler dev` bypasses the real Hyperdrive proxy, so the
-// authoritative result is from the DEPLOYED Worker.
+// Opens a pg Pool against the Hyperdrive (CF) or DATABASE_URL (Node) connection
+// string and runs two trivial queries.
 async function probeDb(env: Env) {
-  const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
+  const connStr = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL;
+  if (!connStr) {
+    return { ok: false, error: 'Postgres not configured (no HYPERDRIVE or DATABASE_URL)' };
+  }
+  const pool = new Pool({ connectionString: connStr, max: 5 });
   try {
     const one = await pool.query("SELECT 1 AS one");
     const version = await pool.query("SELECT version()");
@@ -560,6 +585,13 @@ app.get("/", (c) =>
   ),
 );
 
+// SECURITY: /probe/* are diagnostic scaffolding (db/secret/jwks/gw-push/migrate/cols/…) that expose
+// internals + run privileged operations. Once control-api is fronted by the public LB
+// (api.getwaddling.com), these must NOT be reachable. Gate ALL of them behind ENABLE_PROBES — unset
+// in production ⇒ 404. Registered before the routes so the guard runs first (Hono middleware order).
+app.use("/probe", async (c, next) => (process.env.ENABLE_PROBES === "1" ? next() : c.text("not found", 404)));
+app.use("/probe/*", async (c, next) => (process.env.ENABLE_PROBES === "1" ? next() : c.text("not found", 404)));
+
 app.get("/probe/db", async (c) => c.json(await probeDb(c.env)));
 app.get("/probe/secret", async (c) => c.json(await probeSecret(c.env)));
 app.get("/probe/r2", async (c) => c.json(await probeR2(c.env)));
@@ -568,6 +600,22 @@ app.get("/probe/jwks", async (c) => c.json(await probeJwks(c.env)));
 app.get("/probe/auth", async (c) => c.json(await probeAuth(c.env)));
 app.get("/probe/caller", async (c) => c.json(await probeCaller(c.env)));
 app.get("/probe/migrate", async (c) => c.json(await probeMigrate(c.env)));
+// Proves the DEPLOYED control-api drives the live gateway: gatewayClientFor().pushSnapshot
+// mints a Google identity token for GATEWAY_BASE_URL and POSTs /ctrl/snapshot. A {ok:true}
+// ack means the SA identity-token → private gateway path works end-to-end on Cloud Run.
+app.get("/probe/gw-push", async (c) => {
+  try {
+    const ack = await gatewayClientFor().pushSnapshot({
+      datalakeId: "probe",
+      auth: { issuer: "probe-iss", audience: "gw:probe", mode: "rs256", jwks: [] },
+      snapshot: { userRoles: [{ userId: "agent:probe", role: "r1" }], roleGrants: [{ role: "r1", tableRef: "main.probe_t", action: "read" }] },
+      lakeCatalog: "lake",
+    });
+    return c.json({ ok: true, ack });
+  } catch (e) {
+    return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
 
 // Temporary diagnostic: does the dataplane's R2 cred reach a per-org bucket? Forwards to
 // the private dataplane /r2probe. Remove with the rest of /probe/* scaffolding.
@@ -628,41 +676,78 @@ app.get("/probe", async (c) => {
   });
 });
 
-// Scheduled (cron) handler — the prepaid-credit driver. Each tick (1) closes abandoned-
-// but-active sessions past TTL and debits every closed-but-unbilled session's wall-clock
-// (the dominant COGS), and (2) resets each org's monthly tier-credit allotment for the
-// current period (idempotent per period, so all but the month's first tick is near-zero
-// work). Runs in its own per-invocation DB scope (no ambient pool on workerd). Cadence is
-// set by the cron trigger in wrangler.jsonc.
+/** Initialize module-level singletons from a pre-built config. Call at Node server startup
+ *  before serving; on CF the `*` middleware handles this lazily on the first request. */
+export function startupInit(config: Env): void {
+  initCrypto(config.WADDLING_SECRET_KEY ?? config.BETTER_AUTH_SECRET);
+  const connStr = config.HYPERDRIVE?.connectionString ?? config.DATABASE_URL ?? '';
+  initPool(connStr);
+  initAuth(config);
+  if (config.GATEWAY_BASE_URL) initDataplane(config.GATEWAY_BASE_URL);
+  else initDataplane(config.DATAPLANE);
+}
+
+/**
+ * Scheduled (cron) handler — the prepaid-credit driver. Exported so the Node server
+ * can call it on a timer. The CF scheduled() wrapper below calls it too.
+ *
+ * Each tick: (1) sweeps expired sessions + debits wall-clock COGS, (2) resets monthly
+ * tier-credit allotments (idempotent per period), (3) reconciles billed debits for drift.
+ */
+export async function scheduledHandler(env: Env): Promise<void> {
+  const connStr = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL ?? '';
+  initPool(connStr);
+  initAuth(env);
+  // Per-isolate singletons for the gateway-reaching cron blocks (no request middleware here):
+  // initCrypto so recompile→resolveGatewayBoot can seal/open per-endpoint boot secrets;
+  // initDataplane so the catalog refresh + dispatch drain reach the gateway (URL on Node).
+  initCrypto(env.WADDLING_SECRET_KEY ?? env.BETTER_AUTH_SECRET);
+  if (env.GATEWAY_BASE_URL) initDataplane(env.GATEWAY_BASE_URL);
+  else initDataplane(env.DATAPLANE);
+  try {
+    // Out-of-band catalog refresh: pull the live catalog from each WARM gateway (status-gated,
+    // never cold-boots a sleeping pool) and enqueue a recompile on change so wildcard grants fold
+    // the new shape in. Runs before the drain so its enqueued snapshots deliver this same tick.
+    const { warm, changed } = await refreshWarmCatalogs(env);
+    if (changed > 0) console.log(`[cron] catalog refresh: ${changed}/${warm} warm datalake(s) changed → recompile enqueued`);
+  } catch (e) {
+    console.log(`[cron] refreshWarmCatalogs failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    // Retry/reconcile backstop for the durable control→gateway dispatch outbox (migration 020).
+    const { delivered, failed } = await drainGatewayDispatch(env);
+    if (delivered > 0 || failed > 0) console.log(`[cron] dispatch drain: ${delivered} delivered, ${failed} failed`);
+  } catch (e) {
+    console.log(`[cron] drainGatewayDispatch failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    const n = await sweepExpiredSessions();
+    if (n > 0) console.log(`[cron] swept + debited ${n} session(s)`);
+  } catch (e) {
+    console.log(`[cron] sweepExpiredSessions failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    const reset = await resetAllTierCredits(currentBillingPeriod());
+    if (reset > 0) console.log(`[cron] reset tier credit for ${reset} org(s)`);
+  } catch (e) {
+    console.log(`[cron] resetAllTierCredits failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    const { checked, drift } = await reconcileDebits();
+    if (drift.length > 0) {
+      console.log(`[cron] reconcile: DRIFT on ${drift.length}/${checked} billed session(s) — review needed`);
+    }
+  } catch (e) {
+    console.log(`[cron] reconcileDebits failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 async function scheduled(
   _event: ScheduledController,
   env: Env,
-  ctx: ExecutionContext,
+  _ctx: ExecutionContext,
 ): Promise<void> {
-  await runInDbScope(ctx, env.HYPERDRIVE.connectionString, async () => {
-    try {
-      const n = await sweepExpiredSessions();
-      if (n > 0) console.log(`[cron] swept + debited ${n} session(s)`);
-    } catch (e) {
-      console.log(`[cron] sweepExpiredSessions failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    try {
-      const reset = await resetAllTierCredits(currentBillingPeriod());
-      if (reset > 0) console.log(`[cron] reset tier credit for ${reset} org(s)`);
-    } catch (e) {
-      console.log(`[cron] resetAllTierCredits failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    try {
-      // Metering integrity (ANO-67): re-derive billed session debits from source and
-      // flag any drift vs the ledger. Read-only; never auto-corrects.
-      const { checked, drift } = await reconcileDebits();
-      if (drift.length > 0) {
-        console.log(`[cron] reconcile: DRIFT on ${drift.length}/${checked} billed session(s) — review needed`);
-      }
-    } catch (e) {
-      console.log(`[cron] reconcileDebits failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  });
+  await scheduledHandler(env);
 }
 
 // Exported for in-process loopback (onboarding seed dispatches /sessions+/etl on the same

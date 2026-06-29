@@ -34,7 +34,10 @@ export interface SendEmailBinding {
 
 export interface Env {
   // ── Bindings ────────────────────────────────────────────────────────────
-  HYPERDRIVE: Hyperdrive;
+  // Optional on Node/Cloud Run — provided by CF Hyperdrive in CF deploy.
+  HYPERDRIVE?: Hyperdrive;
+  // Direct Postgres connection string (Node/Cloud Run path). Fallback when HYPERDRIVE absent.
+  DATABASE_URL?: string;
   MASTER_KEY: SecretBinding;
   R2_ACCESS_KEY_ID: SecretBinding;
   R2_SECRET_ACCESS_KEY: SecretBinding;
@@ -135,19 +138,40 @@ export interface Env {
   R2_BUCKET: string;
   R2_REGION: string;
 
-  // ── Data plane (service binding) ─────────────────────────────────────────
-  // The waddling-dataplane Worker (apps/dataplane): one private worker hosting the
-  // GatewayDO + WorkspaceSandbox Container DOs. It is service-binding-only (no
-  // public route), so the control plane reaches it ONLY through this Fetcher:
-  //   • gateway control channel — POST /gw/snapshot, GET /gw/status, POST /gw/revoke
-  //     (lib/gateway-client transports through here);
-  //   • workspace lifecycle — POST /configure (connect) + POST /query (the revived
-  //     /:id/query forwarder). Agent SQL still reaches the lake only via the
-  //     workspace sidecar's birdshot-gated quack ATTACH — never a trusted conn.
+  // ── Data plane ─────────────────────────────────────────────────────────────
+  // CF deploy: the waddling-dataplane Worker service binding (Fetcher).
+  // Node/Cloud Run: a stub Fetcher is provided by server.ts; real gateway traffic
+  // goes through GATEWAY_BASE_URL instead (via lib/gateway-client HTTP transport).
   DATAPLANE: Fetcher;
 
-  // Legacy: base URL of the EXISTING Rivet/GCP DuckDB gateway's control port. The
-  // gateway now lives in the DATAPLANE worker's GatewayDO, so gateway-client no
-  // longer reads this. Kept OPTIONAL so an old wrangler var doesn't break typing.
+  // Base URL of the GCP Cloud Run gateway service (Node/Cloud Run path).
+  // When set, gateway-client sends /ctrl/* HTTP requests here instead of using the
+  // DATAPLANE service binding. Unset on CF (service binding handles routing).
+  GATEWAY_BASE_URL?: string;
+
+  // Legacy: kept so an old wrangler var doesn't break typing.
   GATEWAY_INTERNAL_URL?: string;
+
+  // Gateway provisioner service URL (Node/Cloud Run). control-api POSTs /provision here over OIDC
+  // to deploy a per-datalake private gateway at create. Unset ⇒ no per-endpoint provisioning
+  // (datalakes fall back to the single GATEWAY_BASE_URL bring-up gateway).
+  PROVISIONER_URL?: string;
+
+  // SendGrid API key (Node/Cloud Run transactional email path). When set, email.ts
+  // sends via SendGrid HTTP before falling back to the CF EMAIL binding.
+  SENDGRID_API_KEY?: string;
+
+  // CF email bridge (Node/Cloud Run): URL + shared secret of the tiny Cloudflare Worker that holds
+  // the send_email binding. When both are set, email.ts delivers transactional mail through it
+  // (keeping Cloudflare Email Sending after the GCP cutover). Unset ⇒ falls through to EMAIL/no-op.
+  CF_EMAIL_BRIDGE_URL?: string;
+  CF_EMAIL_BRIDGE_TOKEN?: string;
+
+  // Shared Cloud SQL instance coordinates for per-org catalog provisioning (cloudsql.ts).
+  // PG_HOST is the instance host the GATEWAY dials over mTLS for the org's DuckLake catalog
+  // (the Cloud SQL public IP); it is baked into the DSN minted by provisionOrgDatabase, never
+  // used by control-api itself (control-api reaches Cloud SQL via its own unix socket).
+  // Unset ⇒ cloudSqlConfigured() is false and managed-catalog provisioning degrades.
+  PG_HOST?: string;
+  PG_PORT?: string;
 }

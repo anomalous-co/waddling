@@ -61,7 +61,8 @@ import { hasCredit, debitQueryFloor } from '../lib/credits';
 import { makePostHog } from '../lib/posthog';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import { loadSigningKey, mintLakeToken, SESSION_TTL_SECONDS as SESSION_TTL_SECONDS_IMPORT } from '../lib/session-jwt';
-import { refreshCatalogAndRecompile } from '../lib/gateway-push';
+import { refreshCatalog } from '../lib/catalog-cache';
+import { refreshCatalogAndEnqueue } from '../lib/gateway-dispatch';
 import type { ConnectResult, QueryResult } from '../lib/types';
 import {
   resolveCaller,
@@ -204,6 +205,7 @@ interface EndpointRow {
   org_id: string;
   status: string;
   server_token: string;
+  gateway_url: string | null;
 }
 
 interface SessionListRow {
@@ -278,7 +280,7 @@ sessions.post('/', (c) =>
     const requestedAgentId = connectBody.agentId;
 
     const endpoint = await queryOne<EndpointRow>(
-      `SELECT id, org_id, status, server_token
+      `SELECT id, org_id, status, server_token, gateway_url
          FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
@@ -399,9 +401,28 @@ sessions.post('/', (c) =>
     // and calls compilePolicy — so delegated and autonomous-owned agents get derived
     // grants without requiring direct subject_kind='agent' rows.
     const now = new Date();
+    // Refresh the cached lake catalog BEFORE compiling so wildcard grants ("whole schema /
+    // entire lake", incl. future tables) expand against the CURRENT table set. The gateway is
+    // about to be woken + pushed to below, so this reuses the same warm replica (one cold boot,
+    // not two). Best-effort: if the gateway is momentarily unreachable refreshCatalog returns
+    // null and compileEndpointPolicy falls back to the cached catalog (no regression). This is
+    // the keystone that makes a freshly-created agent's grants work on its first connect, and
+    // lets every reconnect / JWT renewal pick up out-of-band table changes.
+    await refreshCatalog(endpoint).catch(() => null);
     const compiled = await compileEndpointPolicy(datalakeId, now);
     const granted = grantsForAgent(compiled, agentId);
-    if (granted.tables.length === 0) {
+    // `granted.tables` counts only read/write tables. An agent whose only grants are
+    // catalog DDL caps (create/drop/alter/detach) has ZERO read/write tables but is a
+    // legitimately-grantable principal — and MUST be able to connect to BOOTSTRAP an
+    // empty lake (create the first tables). On an empty lake every wildcard read/write
+    // grant expands to nothing (compilePolicy ∘ expandBindWalkWildcards), so a
+    // create-capable agent would otherwise be locked out with no way to create the
+    // table that would let it in — a chicken-and-egg. `activeAgentIds` is the set of
+    // agents with ≥1 compiled ALLOW grant (read/write OR DDL), so gate on THAT: only
+    // refuse when the agent has no effective grant of any kind. The snapshot pushed
+    // below carries the create grant, so birdshot authorizes the agent's CREATE.
+    const hasAnyGrant = compiled.activeAgentIds.includes(agentId);
+    if (granted.tables.length === 0 && !hasAnyGrant) {
       // Distinguish the two zero-grant cases so the agent gets a meaningful message:
       //  - "no user grants on this lake"    → the owner has no subject_kind='user'
       //    grants on this datalake at all; the agent can't have any either.
@@ -716,7 +737,7 @@ async function killSessionCore(
   if (sess.org_id !== callerOrgId) return { found: false, notFound: true };
 
   const endpoint = await queryOne<EndpointRow>(
-    `SELECT id, org_id, status, server_token
+    `SELECT id, org_id, status, server_token, gateway_url
        FROM waddling.datalake WHERE id = $1`,
     [sess.datalake_id],
   );
@@ -1137,16 +1158,15 @@ sessions.post('/:id/etl', (c) =>
       }
       return err(c, 'etl_failed', 500, j.error ?? 'governed load failed');
     }
-    // Change-tracked catalog refresh: an ETL statement may CREATE/DROP a lake table,
-    // so the gateway is warm right now — re-pull + upsert the cached catalog so the
-    // authoring picker (and any covering wildcard grant) sees the new shape. Post-
-    // response, best-effort; never adds latency or fails the call.
-    // Change-tracked catalog refresh: an ETL may CREATE/DROP a lake table. Awaited
-    // (not waitUntil) because c.executionCtx is absent on the MCP-loopback path, so
-    // waitUntil silently no-ops; ETL is not latency-critical and the gateway is warm
-    // now. refreshCatalogAndRecompile is internally best-effort (never throws), so it
-    // can't fail the ETL response.
-    await refreshCatalogAndRecompile(c, sess.datalake_id, {
+    // Change-tracked catalog refresh: an ETL statement may CREATE/DROP a lake table, so the
+    // gateway is warm right now — re-pull + upsert the cached catalog so the authoring picker
+    // (and any covering wildcard grant) sees the new shape. Routes a changed catalog through
+    // the DURABLE dispatch outbox (enqueue + retry on the cron drain) rather than a direct
+    // best-effort push, so a dropped recompile push is retried instead of silently lost.
+    // Awaited (not waitUntil) because c.executionCtx is absent on the MCP-loopback path, so
+    // waitUntil silently no-ops; ETL is not latency-critical. Internally best-effort (never
+    // throws), so it can't fail the ETL response.
+    await refreshCatalogAndEnqueue(c, sess.datalake_id, {
       id: sess.datalake_id,
       org_id: sess.org_id,
       status: 'running',

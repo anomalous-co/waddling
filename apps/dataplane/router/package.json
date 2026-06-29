@@ -1,0 +1,16 @@
+{
+  "name": "waddling-router",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Public quack router: the single internet-facing ingress that fronts the private Cloud Run gateways. Routes by host, mints a Google identity token for the target, and stream-forwards the quack wire protocol. No auth of its own — birdshot inside the private gateway is the auth boundary.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "google-auth-library": "^9.15.0"
+  }
+}

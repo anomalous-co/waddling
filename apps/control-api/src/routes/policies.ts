@@ -19,7 +19,7 @@ import { z } from 'zod';
 import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
-import { recompileAndPush } from '../lib/gateway-push';
+import { recompileAndEnqueue } from '../lib/gateway-dispatch';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err } from '../lib/cp-shared';
 
 // policy_kind ← capability family. Each kind implies which capabilities are valid.
@@ -175,7 +175,7 @@ policies.post('/', (c) =>
     // touch every endpoint; recompiling all of them on one insert is deferred —
     // the next per-endpoint connect/recompile picks it up.
     const compiled = input.datalakeId
-      ? await recompileAndPush(c, input.datalakeId)
+      ? await recompileAndEnqueue(c, input.datalakeId)
       : null;
 
     await query(
@@ -209,7 +209,7 @@ policies.delete('/:id', (c) =>
 
     await query(`DELETE FROM waddling.acl_policy WHERE id = $1`, [id]);
     const compiled = row.datalake_id
-      ? await recompileAndPush(c, row.datalake_id)
+      ? await recompileAndEnqueue(c, row.datalake_id)
       : null;
 
     await query(

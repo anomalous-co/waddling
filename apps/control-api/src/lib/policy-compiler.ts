@@ -526,14 +526,24 @@ export function grantsForAgent(
     }
   >();
 
+  // Non-read/write catalog capabilities (create/drop/alter/detach) the agent holds.
+  // Not table "verbs" — they ride wildcard refs and target new/named objects — but
+  // surfaced separately so an agent on an EMPTY lake (no read/write tables to list)
+  // still learns it can bootstrap tables.
+  const ddlCaps = new Set<'create' | 'drop' | 'alter' | 'detach'>();
   for (const g of result.snapshot.roleGrants) {
     if (g.role !== role) continue;
     const [schema, table] = g.tableRef.split('.');
     const key = g.tableRef;
     // SessionGrant.verbs is read/write only (the human-facing view). Catalog
     // capabilities (create/drop/alter/detach) are real grants but not surfaced as
-    // a table "verb" here; skip them so the view stays read/write.
-    if (g.action !== 'read' && g.action !== 'write') continue;
+    // a table "verb" here; collect them into `capabilities` instead.
+    if (g.action !== 'read' && g.action !== 'write') {
+      if (g.action === 'create' || g.action === 'drop' || g.action === 'alter' || g.action === 'detach') {
+        ddlCaps.add(g.action);
+      }
+      continue;
+    }
     const e = byTable.get(key) ?? { schema, table, verbs: new Set() };
     e.verbs.add(g.action);
     byTable.set(key, e);
@@ -555,5 +565,6 @@ export function grantsForAgent(
       columns: e.columns,
       rowLimit: e.rowLimit,
     })),
+    capabilities: ddlCaps.size > 0 ? [...ddlCaps] : undefined,
   };
 }

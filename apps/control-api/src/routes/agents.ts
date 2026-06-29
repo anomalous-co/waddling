@@ -15,12 +15,16 @@ import { z } from 'zod';
 import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import { getEntitlements } from '../lib/entitlements';
-import { gatewayClientFor } from '../lib/gateway-client';
 import type { Env } from '../lib/env';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err, AuthError } from '../lib/cp-shared';
 import { makePostHog } from '../lib/posthog';
 import { buildAuth } from '../lib/auth';
-import { recompileAndPush } from '../lib/gateway-push';
+import {
+  recompileAndEnqueue,
+  enqueueRevokeDispatch,
+  enqueueSnapshotDispatch,
+  kickDispatch,
+} from '../lib/gateway-dispatch';
 import type { AgentSummary } from '../lib/types';
 
 const CAPABILITY_VALUES = [
@@ -228,7 +232,7 @@ agents.post('/', (c) =>
           datalakeIds.add(g.datalakeId);
           grantedScope.push({ datalakeId: g.datalakeId, capability: g.capability, schema: g.schema, table: g.table });
         }
-        for (const dlId of datalakeIds) await recompileAndPush(c, dlId);
+        for (const dlId of datalakeIds) await recompileAndEnqueue(c, dlId);
       }
 
       // agent + key: additive fields for the dashboard (backward-compatible with
@@ -390,38 +394,39 @@ agents.delete('/:id', (c) =>
       // empty body is fine → defaults
     }
 
-    // Push birdshot_revoke to every running endpoint in the org (the agent could
-    // hold sessions on any of them).
-    const endpoints = await query<{
-      id: string;
-      server_token: string;
-    }>(
-      `SELECT id, server_token FROM waddling.datalake
-        WHERE org_id = $1 AND status = 'running'`,
-      [agent.org_id],
-    );
-    const expiresUs = body.expiresSeconds ? body.expiresSeconds * 1_000_000 : undefined;
-    for (const ep of endpoints.rows) {
-      try {
-        await gatewayClientFor(ep).revoke({
-          datalakeId: ep.id,
-          kind: 'user',
-          id: `agent:${id}`,
-          reason: body.reason,
-          expiresUs,
-        });
-      } catch {
-        // best effort per endpoint
-      }
-    }
-
-    // Mark agent revoked + kill live sessions.
+    // Durable gate FIRST: flip status='revoked' (resolveCaller blocks any reconnect with
+    // this agent's key — restart-safe, the real backstop) and kill live sessions. Doing
+    // this before the recompile below is what makes compileEndpointPolicy (which filters
+    // status='active') drop the agent's grants from the re-pushed snapshot.
     await query(`UPDATE waddling.agent SET status = 'revoked' WHERE id = $1`, [id]);
     const killed = await query(
       `UPDATE waddling.agent_session SET status='revoked', ended_at=now()
         WHERE agent_id = $1 AND status = 'active' RETURNING id`,
       [id],
     );
+
+    // Durably revoke on every running endpoint (the agent could hold a warm session on
+    // any). Two enqueues per endpoint, both retried via the outbox until they land:
+    //   • revoke  — instant in-memory denylist on warm replicas (covers the live session
+    //               until its 15-min JWT expires; a cold/restarted replica is safe by the
+    //               fresh-connect + status gate, so it needs no denylist replay).
+    //   • snapshot — recompile drops the now-revoked agent's grants from the director's
+    //               durable cache, so a cold-boot doesn't re-arm stale grants.
+    const endpoints = await query<{ id: string }>(
+      `SELECT id FROM waddling.datalake WHERE org_id = $1 AND status = 'running'`,
+      [agent.org_id],
+    );
+    const expiresUs = body.expiresSeconds ? body.expiresSeconds * 1_000_000 : undefined;
+    for (const ep of endpoints.rows) {
+      await enqueueRevokeDispatch(ep.id, {
+        kind: 'user',
+        id: `agent:${id}`,
+        reason: body.reason,
+        expiresUs,
+      });
+      await enqueueSnapshotDispatch(ep.id);
+      kickDispatch(c, ep.id);
+    }
     await query(
       `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, decision, reason, actor)
        VALUES ($1,'control-plane','revoke',$2,'deny',$3,$4)`,

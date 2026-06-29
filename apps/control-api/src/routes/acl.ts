@@ -26,7 +26,7 @@ import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
 import { requirePlan, UpgradeRequiredError } from '../lib/entitlements';
-import { recompileAndPush } from '../lib/gateway-push';
+import { recompileAndEnqueue } from '../lib/gateway-dispatch';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err } from '../lib/cp-shared';
 
 // ── Routes ───────────────────────────────────────────────────────────────────────
@@ -229,7 +229,7 @@ acl.post('/', (c) =>
       ],
     );
 
-    const compiled = await recompileAndPush(c, input.datalakeId);
+    const compiled = await recompileAndEnqueue(c, input.datalakeId);
 
     await query(
       `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, datalake_id, decision, actor)
@@ -335,7 +335,7 @@ acl.patch('/:id', (c) =>
       params,
     );
 
-    const compiled = await recompileAndPush(c, rule.datalake_id);
+    const compiled = await recompileAndEnqueue(c, rule.datalake_id);
 
     await query(
       `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, datalake_id, decision, actor)
@@ -363,7 +363,7 @@ acl.delete('/:id', (c) =>
     assertOrg(caller, rule.org_id);
 
     await query(`DELETE FROM waddling.acl_rule WHERE id = $1`, [id]);
-    const compiled = await recompileAndPush(c, rule.datalake_id);
+    const compiled = await recompileAndEnqueue(c, rule.datalake_id);
 
     await query(
       `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, datalake_id, decision, actor)

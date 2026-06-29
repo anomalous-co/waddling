@@ -1,0 +1,21 @@
+{
+  "name": "waddling-gateway-cloudrun",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "GCP Cloud Run DuckDB gateway: quack_serve + birdshot + forwarder. External agents ATTACH 'quack:<host>:443' to dial in; the forwarder proxies the quack wire protocol to the loopback listener and hosts the birdshot control channel + governed write path. Bundled to plain JS with esbuild at image build (entrypoint.mjs imports the TypeScript gateway-src/), run as `node entrypoint.js`.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "esbuild entrypoint.mjs --bundle --platform=node --format=esm --packages=external --outfile=entrypoint.js",
+    "start": "node entrypoint.js",
+    "smoke": "bash test/run-smoke.sh"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.5.3-r.3"
+  },
+  "devDependencies": {
+    "jose": "^6.2.3"
+  }
+}
