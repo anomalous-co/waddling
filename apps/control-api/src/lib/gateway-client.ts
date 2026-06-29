@@ -98,29 +98,32 @@ export class GatewayError extends Error {
 
 // ── Google Cloud Run identity-token helper ─────────────────────────────────────
 
-// Cached on first successful init; null after a failed init (running locally without creds).
-let _idTokenClient:
-  | { getRequestHeaders(url: string): Promise<Record<string, string>> }
-  | null
-  | undefined;
+// Identity-token clients cached PER AUDIENCE. Per-endpoint gateways each have their own URL
+// (= audience), so a single shared client would mint a token for the wrong audience and the
+// target gateway would 403. null value = a failed init for that audience (local, no creds).
+const _idTokenClients = new Map<
+  string,
+  { getRequestHeaders(url: string): Promise<Record<string, string>> } | null
+>();
 
 async function getCloudRunAuthHeaders(
   audience: string,
   url: string,
 ): Promise<Record<string, string>> {
-  if (_idTokenClient === null) return {};
-  if (_idTokenClient === undefined) {
+  let client = _idTokenClients.get(audience);
+  if (client === undefined) {
     try {
       const { GoogleAuth } = await import('google-auth-library');
       const auth = new GoogleAuth();
-      _idTokenClient = await auth.getIdTokenClient(audience);
+      client = await auth.getIdTokenClient(audience);
     } catch {
-      _idTokenClient = null;
-      return {};
+      client = null;
     }
+    _idTokenClients.set(audience, client ?? null);
   }
+  if (!client) return {};
   try {
-    return await _idTokenClient.getRequestHeaders(url);
+    return await client.getRequestHeaders(url);
   } catch {
     return {};
   }
@@ -303,9 +306,15 @@ export function initDataplane(input: Fetcher | string): void {
   }
 }
 
+// Resolve the gateway for a given datalake. Per-endpoint gateways carry their own Cloud Run
+// URL (datalake.gateway_url, set by the provisioner at create); when present it is the target
+// (and its own identity-token audience). Falls back to the module GATEWAY_BASE_URL (single-
+// gateway bring-up) or the CF service binding for legacy/unprovisioned endpoints.
 export function gatewayClientFor(_endpoint?: {
-  server_token: string;
+  server_token?: string;
   ctrl_port?: number | null;
+  gateway_url?: string | null;
 }): GatewayClient {
-  return new GatewayClient({ fetcher: _fetcher, baseUrl: _baseUrl });
+  const baseUrl = _endpoint?.gateway_url || _baseUrl;
+  return new GatewayClient({ fetcher: _fetcher, baseUrl });
 }

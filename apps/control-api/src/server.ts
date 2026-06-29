@@ -100,6 +100,8 @@ const config: Env = {
 
   PG_HOST: process.env.PG_HOST,
   PG_PORT: process.env.PG_PORT,
+
+  PROVISIONER_URL: process.env.PROVISIONER_URL,
 };
 
 startupInit(config);

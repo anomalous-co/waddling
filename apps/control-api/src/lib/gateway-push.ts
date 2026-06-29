@@ -25,6 +25,7 @@ interface EndpointRow {
   org_id: string;
   status: string;
   server_token: string;
+  gateway_url: string | null;
 }
 
 /** Newest non-expired jwks row → birdshot public JWK (kid/n/e), or null. */
@@ -84,7 +85,7 @@ export async function recompileAndPush(
   }
 
   const endpoint = await queryOne<EndpointRow>(
-    `SELECT id, org_id, status, server_token
+    `SELECT id, org_id, status, server_token, gateway_url
        FROM waddling.datalake WHERE id = $1`,
     [datalakeId],
   );

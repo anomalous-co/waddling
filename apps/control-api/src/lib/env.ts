@@ -152,6 +152,11 @@ export interface Env {
   // Legacy: kept so an old wrangler var doesn't break typing.
   GATEWAY_INTERNAL_URL?: string;
 
+  // Gateway provisioner service URL (Node/Cloud Run). control-api POSTs /provision here over OIDC
+  // to deploy a per-datalake private gateway at create. Unset ⇒ no per-endpoint provisioning
+  // (datalakes fall back to the single GATEWAY_BASE_URL bring-up gateway).
+  PROVISIONER_URL?: string;
+
   // SendGrid API key (Node/Cloud Run transactional email path). When set, email.ts
   // sends via SendGrid HTTP before falling back to the CF EMAIL binding.
   SENDGRID_API_KEY?: string;

@@ -205,6 +205,7 @@ interface EndpointRow {
   org_id: string;
   status: string;
   server_token: string;
+  gateway_url: string | null;
 }
 
 interface SessionListRow {
@@ -279,7 +280,7 @@ sessions.post('/', (c) =>
     const requestedAgentId = connectBody.agentId;
 
     const endpoint = await queryOne<EndpointRow>(
-      `SELECT id, org_id, status, server_token
+      `SELECT id, org_id, status, server_token, gateway_url
          FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
@@ -736,7 +737,7 @@ async function killSessionCore(
   if (sess.org_id !== callerOrgId) return { found: false, notFound: true };
 
   const endpoint = await queryOne<EndpointRow>(
-    `SELECT id, org_id, status, server_token
+    `SELECT id, org_id, status, server_token, gateway_url
        FROM waddling.datalake WHERE id = $1`,
     [sess.datalake_id],
   );

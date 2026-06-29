@@ -26,6 +26,7 @@ import { compileEndpointPolicy } from '../lib/effective-policy';
 import { policyVersionFor, grantVersionFor, authVersionFor, bumpPolicyVersion } from '../lib/policy-version';
 import { loadSigningKey } from '../lib/session-jwt';
 import { provisionOrgCatalog } from '../lib/catalog-provision';
+import { provisionGateway, type ProvisionableDatalake } from '../lib/provisioner';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import type { DescribeResult, TableInfo, DatalakeStatus, DatalakeSummary, DatalakeDetail, DatalakeRuntime } from '../lib/types';
 
@@ -249,6 +250,27 @@ datalakes.post('/', (c) =>
         await q(`UPDATE waddling.datalake SET status = 'running', updated_at = now() WHERE id = $1`, [datalakeId]);
         return { id: datalakeId, status: 'running' as const };
       });
+
+      // Deploy this datalake's OWN private Cloud Run gateway (gw-<slug>, max=1) via the provisioner
+      // and record its URL, so control-api targets it for snapshot pushes / revocations. Runs after
+      // the row commits (the deploy is ~30-60s and needs the catalog ready). Best-effort: on failure
+      // the datalake is still 'running' and POST /:id/provision re-attempts; connect fails clearly
+      // until the gateway exists. Unset PROVISIONER_URL ⇒ legacy single-gateway (GATEWAY_BASE_URL).
+      if (c.env.PROVISIONER_URL) {
+        try {
+          const dlRow = await queryOne<ProvisionableDatalake>(
+            `SELECT id, org_id, slug, server_token, catalog_schema, catalog_mode, encrypted
+               FROM waddling.datalake WHERE id = $1`,
+            [created.id],
+          );
+          if (dlRow) {
+            const { url } = await provisionGateway(c.env, dlRow);
+            await query(`UPDATE waddling.datalake SET gateway_url = $1 WHERE id = $2`, [url, created.id]);
+          }
+        } catch (e) {
+          console.log(`[datalake create] gateway provisioning failed for ${created.id}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
 
       // Provisioning funnel: a new endpoint/datalake was created. Server-side,
       // fire-and-forget via waitUntil; no-op when POSTHOG_KEY is unset.
