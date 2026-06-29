@@ -137,11 +137,17 @@ export async function resolveGatewayBoot(env: Env, datalakeId: string): Promise<
       };
     }
 
-    // Managed lake data: provision the org's R2 bucket + mint SHORT-LIVED creds scoped to
-    // exactly this datalake's prefix. The gateway never sees a broad account credential.
+    // Managed lake data lives in GCS now, provisioned into the per-endpoint gateway's deploy env
+    // by the provisioner; gatewayBoot is inert on the wire (the gateway reads its catalog + storage
+    // from env, not the snapshot). So when the legacy R2 faucet is absent the push needs only the
+    // catalog alias + schema — no bucket/cred minting. (The R2 path below is kept for any legacy
+    // R2-faucet deployment.)
     const faucet = getR2Faucet(env);
     if (!faucet) {
-      throw new StorageNotReadyError('managed storage requires the R2 faucet (R2_FAUCET_TOKEN / R2_PARENT_ACCESS_KEY_ID)');
+      return {
+        lakeCatalog: LAKE_ALIAS,
+        gatewayBoot: { ...base, catalogDsn: dsn, metadataSchema: schema },
+      };
     }
     const slug = await orgSlugFor(ep.org_id);
     const bucket = orgBucketName(slug);

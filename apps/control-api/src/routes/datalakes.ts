@@ -306,6 +306,7 @@ interface EndpointRow {
   server_token: string;
   data_path: string;
   region: string;
+  gateway_url: string | null;
 }
 
 const PatchSchema = z.object({
@@ -315,7 +316,7 @@ const PatchSchema = z.object({
 
 async function loadOwned(id: string, orgId: string): Promise<EndpointRow | null> {
   const ep = await queryOne<EndpointRow>(
-    `SELECT id, org_id, name, slug, status, server_token, data_path, region
+    `SELECT id, org_id, name, slug, status, server_token, data_path, region, gateway_url
        FROM waddling.datalake WHERE id = $1`,
     [id],
   );
@@ -686,6 +687,7 @@ interface DescribeEndpointRow {
   org_id: string;
   status: string;
   server_token: string;
+  gateway_url: string | null;
 }
 
 datalakes.get('/:id/describe', (c) =>
@@ -704,7 +706,7 @@ datalakes.get('/:id/describe', (c) =>
     }
 
     const endpoint = await queryOne<DescribeEndpointRow>(
-      `SELECT id, org_id, status, server_token
+      `SELECT id, org_id, status, server_token, gateway_url
          FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
@@ -795,7 +797,7 @@ datalakes.get('/:id/catalog', (c) =>
     const caller = await resolveCaller(c);
     const datalakeId = c.req.param('id');
     const endpoint = await queryOne<DescribeEndpointRow>(
-      `SELECT id, org_id, status, server_token FROM waddling.datalake WHERE id = $1`,
+      `SELECT id, org_id, status, server_token, gateway_url FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
     if (!endpoint) return err(c, 'datalake_not_found', 404);
@@ -822,7 +824,7 @@ datalakes.post('/:id/catalog/refresh', (c) =>
     const caller = await resolveCaller(c);
     const datalakeId = c.req.param('id');
     const endpoint = await queryOne<DescribeEndpointRow>(
-      `SELECT id, org_id, status, server_token FROM waddling.datalake WHERE id = $1`,
+      `SELECT id, org_id, status, server_token, gateway_url FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
     if (!endpoint) return err(c, 'datalake_not_found', 404);
@@ -893,6 +895,25 @@ datalakes.post('/:id/provision', (c) =>
       `UPDATE waddling.datalake SET status = 'running', updated_at = now() WHERE id = $1`,
       [id],
     );
+
+    // (d) Ensure this datalake's own private gateway is deployed (idempotent create-or-update via
+    // the provisioner). This is the recovery for a datalake whose create-time provision failed or
+    // a legacy row with no gateway_url. Best-effort: connect re-checks and the next call retries.
+    if (c.env.PROVISIONER_URL) {
+      try {
+        const dlRow = await queryOne<ProvisionableDatalake>(
+          `SELECT id, org_id, slug, server_token, catalog_schema, catalog_mode, encrypted
+             FROM waddling.datalake WHERE id = $1`,
+          [id],
+        );
+        if (dlRow) {
+          const { url } = await provisionGateway(c.env, dlRow);
+          await query(`UPDATE waddling.datalake SET gateway_url = $1 WHERE id = $2`, [url, id]);
+        }
+      } catch (e) {
+        console.log(`[datalake provision] gateway (re)provision failed for ${id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
 
     // Echo the resolved config WITHOUT secrets, so the dashboard can confirm the
     // credential plumbing without exposing keys to the browser. The gateway is a
