@@ -18,6 +18,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { Loader2 } from 'lucide-react';
 import { authClient } from '@/lib/auth-client';
 import { fetchCp, cpPost } from '@/components/dashboard/fetch';
+import { BrandMark } from '@/components/brand-mark';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -189,7 +190,7 @@ export function OnboardingFlow({
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="flex w-full max-w-lg flex-col gap-6">
         <div className="text-center">
-          <span className="font-mono text-xl font-bold text-primary">waddling</span>
+          <BrandMark />
           <p className="mt-1 text-sm text-muted-foreground">Set up billing to get started</p>
         </div>
 

@@ -167,11 +167,18 @@ are distinct verbs (`create`, `write`, `drop`, `read_source`, … — see
    subsequent run REPLACE drops first. Without `drop`, run #2+ is denied — and
    because the build is a full rebuild, the *previous* run's tables persist
    unchanged, which can masquerade as "idempotent" (see the proof note below).
-4. **`read_source` on `marketing.*` (or the source host)** — `read_parquet` over
-   `s3://…` egresses; birdshot authorizes the read_source verb + host first.
+4. **`read_source` (a source policy)** — `read_parquet` over `s3://…` egresses;
+   birdshot authorizes the read_source verb against a **source policy** first. NOTE:
+   `read_source` is NOT an `acl_rule` capability — it is an `acl_policy` row (kind
+   `source`) carrying a **pattern**, authored via `POST /api/cp/acl-policy` or the
+   dashboard's access editor ("External sources").
 
-Plus the **source-policy allowing the staging-glob host** so the `read_parquet`
-over `s3://<lake-bucket>/org-<ID>/_ingest/funnel/**` is permitted at fetch time.
+Plus the source policy itself. **Critical:** birdshot host-matches a source pattern
+ONLY for `https://`/`quack://` URIs. For an `s3://` read the pattern must be `*` or
+the **EXACT glob literal** the build uses — the bucket name or R2 endpoint host will
+NOT match. So grant the funnel agent a source policy whose pattern equals the spec's
+`stagingGlob` verbatim, e.g.
+`s3://<lake-bucket>/<datalakeId>/_ingest/funnel/**/*.parquet`.
 
 > Grant all four verbs (least-privilege is still satisfied — these are exactly the
 > verbs the ETL runs, nothing more). A missing verb surfaces as a typed

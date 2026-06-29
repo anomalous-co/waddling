@@ -180,7 +180,7 @@ async function main(): Promise<void> {
 
   // 6. Seed endpoint prod-lake
   console.log('[seed] Seeding endpoint prod-lake...');
-  const endpointId = await seedEndpoint(orgId);
+  const datalakeId = await seedEndpoint(orgId);
 
   // 7. Seed agents analyst + etl-bot
   console.log('[seed] Seeding agents...');
@@ -188,18 +188,18 @@ async function main(): Promise<void> {
 
   // 8. Load DuckLake sales schema with synthetic data
   console.log('[seed] Loading DuckLake sales schema (~50k rows)...');
-  await seedDuckLake(endpointId);
+  await seedDuckLake(datalakeId);
 
   // 9. Install ACL rules
   console.log('[seed] Installing ACL rules...');
-  await seedAclRules(orgId, endpointId, analystId, etlBotId, adminUserId);
+  await seedAclRules(orgId, datalakeId, analystId, etlBotId, adminUserId);
 
   console.log('\n[seed] ─────────────────────────────────────────────────────');
   console.log('[seed] Seed complete!');
   console.log('[seed]');
   console.log('[seed]  Org:      acme');
   console.log('[seed]  Admin:    admin@acme.test  /  waddling-demo');
-  console.log('[seed]  Endpoint: prod-lake (id:', endpointId, ')');
+  console.log('[seed]  Datalake: prod-lake (id:', datalakeId, ')');
   console.log('[seed]');
   console.log('[seed]  analyst API key :  ' + analystKey);
   console.log('[seed]  etl-bot API key :  ' + etlBotKey);
@@ -458,33 +458,29 @@ async function seedOrgAndAdmin(): Promise<{ orgId: string; adminUserId: string }
 // ── Endpoint ──────────────────────────────────────────────────────────────────
 async function seedEndpoint(orgId: string): Promise<string> {
   const existing = await pool.query<{ id: string }>(
-    `SELECT id FROM waddling.endpoint WHERE org_id = $1 AND slug = 'prod-lake'`,
+    `SELECT id FROM waddling.datalake WHERE org_id = $1 AND slug = 'prod-lake'`,
     [orgId],
   );
   if (existing.rows.length > 0) {
-    console.log('[seed] Endpoint prod-lake already exists, skipping.');
+    console.log('[seed] Datalake prod-lake already exists, skipping.');
     return existing.rows[0]!.id;
   }
 
-  // Host the control plane reaches the gateway at: the Docker service name
-  // 'gateway' in compose, or 'localhost' for the no-Docker host-native run.
-  const gatewayHost = process.env.GATEWAY_HOST ?? 'gateway';
   const id = genId();
   await pool.query(
-    `INSERT INTO waddling.endpoint
+    `INSERT INTO waddling.datalake
        (id, org_id, name, slug, status, catalog_dsn, data_path, region, encrypted,
-        gateway_host, quack_port, server_token)
+        server_token)
      VALUES ($1,$2,'prod-lake','prod-lake','running',$3,$4,'auto',false,
-             $5,9500,'demo-server-token-change-in-prod')`,
+             'demo-server-token-change-in-prod')`,
     [
       id,
       orgId,
       DATABASE_URL,
       DATA_PATH,
-      gatewayHost,
     ],
   );
-  console.log('[seed] Created endpoint prod-lake id=' + id);
+  console.log('[seed] Created datalake prod-lake id=' + id);
   return id;
 }
 
@@ -571,7 +567,7 @@ async function seedAgents(orgId: string, ownerUserId: string): Promise<{
 }
 
 // ── DuckLake seed ─────────────────────────────────────────────────────────────
-async function seedDuckLake(endpointId: string): Promise<void> {
+async function seedDuckLake(datalakeId: string): Promise<void> {
   // We spin up a DuckDB instance, install ducklake + postgres extensions,
   // ATTACH the DuckLake, and INSERT synthetic data.
   const duck = await DuckDBInstance.create(':memory:', {
@@ -728,8 +724,8 @@ async function seedDuckLake(endpointId: string): Promise<void> {
 
     // Update endpoint status to 'running'
     await pool.query(
-      `UPDATE waddling.endpoint SET status = 'running', updated_at = now() WHERE id = $1`,
-      [endpointId],
+      `UPDATE waddling.datalake SET status = 'running', updated_at = now() WHERE id = $1`,
+      [datalakeId],
     );
 
   } finally {
@@ -741,7 +737,7 @@ async function seedDuckLake(endpointId: string): Promise<void> {
 // ── ACL rules ─────────────────────────────────────────────────────────────────
 async function seedAclRules(
   orgId: string,
-  endpointId: string,
+  datalakeId: string,
   analystId: string,
   etlBotId: string,
   adminUserId: string,
@@ -756,9 +752,9 @@ async function seedAclRules(
   ): Promise<void> {
     const existing = await pool.query(
       `SELECT id FROM waddling.acl_rule
-       WHERE org_id=$1 AND endpoint_id=$2 AND agent_id=$3
+       WHERE org_id=$1 AND datalake_id=$2 AND agent_id=$3
          AND schema_name=$4 AND table_name=$5 AND verb=$6`,
-      [orgId, endpointId, agentId, schemaName, tableName, verb],
+      [orgId, datalakeId, agentId, schemaName, tableName, verb],
     );
     if (existing.rows.length > 0) {
       console.log(`[seed] ACL rule already exists: ${description}`);
@@ -767,13 +763,13 @@ async function seedAclRules(
 
     await pool.query(
       `INSERT INTO waddling.acl_rule
-         (id, org_id, endpoint_id, agent_id, schema_name, table_name,
+         (id, org_id, datalake_id, agent_id, schema_name, table_name,
           columns, verb, effect, priority, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'allow',100,$9)`,
       [
         genId(),
         orgId,
-        endpointId,
+        datalakeId,
         agentId,
         schemaName,
         tableName,

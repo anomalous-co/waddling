@@ -50,7 +50,7 @@
   //   RUN_TOKEN (optional)     — bearer gate for GET /run when not behind Access
   "vars": {
     "POSTHOG_APP_HOST": "https://us.posthog.com",
-    "POSTHOG_PROJECT_ID": "<PROJECT_ID>",
+    "POSTHOG_PROJECT_ID": "203672",
     "CONTROL_API_BASE": "https://api.getwaddling.com",
     // The dogfood org's lake the star schema is loaded into (Anomalous Context
     // Lake). Keep in sync with the registry spec's datalakeId.
