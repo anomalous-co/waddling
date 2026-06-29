@@ -155,4 +155,12 @@ export interface Env {
   // SendGrid API key (Node/Cloud Run transactional email path). When set, email.ts
   // sends via SendGrid HTTP before falling back to the CF EMAIL binding.
   SENDGRID_API_KEY?: string;
+
+  // Shared Cloud SQL instance coordinates for per-org catalog provisioning (cloudsql.ts).
+  // PG_HOST is the instance host the GATEWAY dials over mTLS for the org's DuckLake catalog
+  // (the Cloud SQL public IP); it is baked into the DSN minted by provisionOrgDatabase, never
+  // used by control-api itself (control-api reaches Cloud SQL via its own unix socket).
+  // Unset ⇒ cloudSqlConfigured() is false and managed-catalog provisioning degrades.
+  PG_HOST?: string;
+  PG_PORT?: string;
 }

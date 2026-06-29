@@ -97,6 +97,9 @@ const config: Env = {
   GATEWAY_BASE_URL: process.env.GATEWAY_BASE_URL,
   GATEWAY_INTERNAL_URL: process.env.GATEWAY_INTERNAL_URL,
   SENDGRID_API_KEY: process.env.SENDGRID_API_KEY,
+
+  PG_HOST: process.env.PG_HOST,
+  PG_PORT: process.env.PG_PORT,
 };
 
 startupInit(config);
