@@ -23,8 +23,8 @@
  *                     reference to agent_memory (ungranted) is denied, leak-proof.
  *
  * Auth: each route resolves the caller (API-key agent or delegated OAuth) and binds
- * agent_role server-side. The data plane stays private (reached only via the DATAPLANE
- * service binding). The session JWT (kid → the pushed JWKS) is the quack TOKEN and never
+ * agent_role server-side. The data plane stays private (reached only via HTTP+OIDC from
+ * gatewayClientFor). The session JWT (kid → the pushed JWKS) is the quack TOKEN and never
  * leaves the server.
  */
 import { z } from 'zod';
@@ -33,7 +33,13 @@ import { importJWK, SignJWT, type JWK } from 'jose';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
 import type { BirdshotSnapshot } from '../lib/types';
-import type { GatewayBoot } from '../lib/gateway-client';
+import {
+  gatewayClientFor,
+  GatewayError,
+  type GatewayBoot,
+  type GatewayQueryResult,
+  type GatewayAck,
+} from '../lib/gateway-client';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import { resolveCaller, handle, ok, err, parseBody, AuthError, type Caller } from '../lib/cp-shared';
 
@@ -105,6 +111,8 @@ interface QbContext {
   agentId: string;
   /** The attribution value stamped into the data tables (= the agent id). Server-bound. */
   agentRole: string;
+  /** The per-org QB gateway's own Cloud Run URL (datalake.gateway_url); selects the HTTP+OIDC target. */
+  gatewayUrl: string | null;
   jwt: string;
   gatewayBoot: GatewayBoot;
   snapshot: BirdshotSnapshot;
@@ -117,8 +125,8 @@ async function prepareQbContext(c: Parameters<typeof resolveCaller>[0], env: Env
   const caller = await resolveCaller(c, true, true);
   const orgId = caller.orgId;
 
-  const ep = await queryOne<{ id: string; status: string }>(
-    `SELECT id, status FROM waddling.datalake
+  const ep = await queryOne<{ id: string; status: string; gateway_url: string | null }>(
+    `SELECT id, status, gateway_url FROM waddling.datalake
        WHERE org_id = $1 AND kind = 'quackboard'
        ORDER BY created_at ASC LIMIT 1`,
     [orgId],
@@ -166,7 +174,7 @@ async function prepareQbContext(c: Parameters<typeof resolveCaller>[0], env: Env
     .setExpirationTime(`${QB_JWT_TTL_SECONDS}s`)
     .sign(key);
 
-  return { orgId, datalakeId: ep.id, agentId, agentRole: agentId, jwt, gatewayBoot: boot.gatewayBoot, snapshot, auth };
+  return { orgId, datalakeId: ep.id, agentId, agentRole: agentId, gatewayUrl: ep.gateway_url, jwt, gatewayBoot: boot.gatewayBoot, snapshot, auth };
 }
 
 /** Resolve the acting agent: API-key agents are themselves; delegated OAuth callers get a
@@ -187,57 +195,58 @@ async function resolveActingAgent(caller: Caller, orgId: string): Promise<string
   throw new AuthError('agent_required', 400, 'quackboard tools require an agent identity (sk_agent_… key or OAuth token)');
 }
 
-async function dpFetch(env: Env, path: string, body: unknown): Promise<{ status: number; json: any }> {
-  const res = await env.DATAPLANE.fetch(`https://dataplane${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const txt = await res.text();
-  let json: any = txt;
-  try { json = txt ? JSON.parse(txt) : {}; } catch { /* keep raw */ }
-  return { status: res.status, json };
+/** The HTTP+OIDC client for THIS org's QB gateway (selected by datalake.gateway_url), same
+ *  transport as the lake/workspace path. All QB data-plane calls go through here. */
+function gw(ctx: QbContext) {
+  return gatewayClientFor({ gateway_url: ctx.gatewayUrl });
 }
 
-/** Push the org's birdshot snapshot + JWKS to the QuackboardDO (boots it if cold). */
-async function configureQb(env: Env, ctx: QbContext): Promise<{ status: number; json: any }> {
-  return dpFetch(env, '/qb/configure', {
-    orgId: ctx.orgId,
-    gatewayBoot: ctx.gatewayBoot,
-    snapshot: { snapshot: ctx.snapshot, auth: ctx.auth, lakeCatalog: 'quackboard' },
-  });
+/** Push the org's birdshot snapshot + JWKS to the QB gateway (boots/re-arms it if cold).
+ *  Mirrors the lake path: pushSnapshot(SnapshotRequest). Throws GatewayError on non-2xx. */
+async function configureQb(ctx: QbContext): Promise<GatewayAck> {
+  // A freshly-provisioned QB gateway's run.invoker binding can take ~1-3 min to propagate to Cloud
+  // Run's invoke-enforcement layer, so the first snapshot push after create may 403 even though
+  // control-api already HAS invoker (the binding shows in get-iam-policy immediately). Retry on 403
+  // with backoff — the same race the workspace connect path handles.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await gw(ctx).pushSnapshot({
+        datalakeId: ctx.datalakeId,
+        auth: ctx.auth,
+        snapshot: ctx.snapshot,
+        lakeCatalog: 'quackboard',
+        gatewayBoot: ctx.gatewayBoot,
+      });
+    } catch (e) {
+      if (e instanceof GatewayError && e.status === 403 && attempt < 5) {
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
-/** Run a gated query AS the agent (JWT = quack TOKEN). On a cold-boot / lost-config failure the
- *  container has no JWKS, so quack AUTHENTICATION fails — re-push the snapshot + retry once. A
- *  birdshot AUTHORIZATION deny (auth succeeded, no grant) is a real verdict: do NOT retry it
- *  (retrying would double the audit row and waste a snapshot push). */
-async function gatedQuery(env: Env, ctx: QbContext, sql: string): Promise<{ status: number; json: any }> {
-  const run = () => dpFetch(env, '/qb/query', {
-    orgId: ctx.orgId, gatewayBoot: ctx.gatewayBoot, sql, lakeToken: ctx.jwt,
-  });
-  let r = await run();
-  // Reconfigure+retry only on an authentication/connection failure (cold container lost its
-  // JWKS), never on a genuine authorization deny.
-  if (r.status !== 200 && !isAuthzDeny(r)) {
-    await configureQb(env, ctx);
-    r = await run();
+/** Run a gated query AS the agent (JWT = quack TOKEN). /query is HTTP-200-ALWAYS — the outcome is
+ *  in the BODY ({ ok, rows, rowCount, error, authorizeDecision, phase }). On a cold-boot / lost-
+ *  config failure the container has no JWKS, so quack AUTHENTICATION fails and the body carries
+ *  phase === 'authenticate' — re-push the snapshot (re-arm) + retry once. A birdshot AUTHORIZATION
+ *  deny (ok:false, authorizeDecision 'deny') is a real verdict: never retried. A genuine transport
+ *  failure throws GatewayError (caller wraps). */
+async function gatedQuery(ctx: QbContext, sql: string): Promise<GatewayQueryResult> {
+  let r = await gw(ctx).qbGatedQuery(ctx.jwt, sql);
+  if (r.phase === 'authenticate') {
+    await configureQb(ctx);
+    r = await gw(ctx).qbGatedQuery(ctx.jwt, sql);
   }
   return r;
-}
-
-/** A birdshot authorization deny (vs a cold-boot authentication failure): quack reports
- *  "Authorization failed" only after the JWT authenticated. */
-function isAuthzDeny(r: { status: number; json: any }): boolean {
-  const reason = String(r.json?.reason ?? r.json?.error ?? '');
-  return /authoriz/i.test(reason) && !/authentic/i.test(reason);
 }
 
 /** Persist one gated query's birdshot audit decision(s) + a usage count, mirroring the lake
  *  path's recordQueryAudit. The drain is process-global + destructive (exactly-once per record);
  *  each record is attributed to ITS own agent via `user` ('agent:<id>'), so interleaved agents'
  *  queries on the shared board still attribute correctly. Best-effort (callers run in waitUntil). */
-async function recordQbAudit(env: Env, ctx: QbContext): Promise<void> {
+async function recordQbAudit(ctx: QbContext): Promise<void> {
   // Stable per-op id for the idempotency_key column (migration 018) — keeps the
   // quackboard usage row shaped like the lake path. This op is awaited (not waitUntil)
   // and un-billed, so a fresh id per call is sufficient; the ON CONFLICT guard makes
@@ -248,8 +257,8 @@ async function recordQbAudit(env: Env, ctx: QbContext): Promise<void> {
      ON CONFLICT (org_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
     [ctx.orgId, ctx.agentId, ctx.datalakeId, crypto.randomUUID()],
   );
-  const drained = await dpFetch(env, '/qb/audit-drain', { orgId: ctx.orgId });
-  const records: any[] = drained.json?.records ?? [];
+  const drained = await gw(ctx).drainAudit(ctx.datalakeId);
+  const records: any[] = drained.records ?? [];
   if (records.length === 0) return;
   const tuples: string[] = [];
   const params: unknown[] = [];
@@ -275,12 +284,28 @@ async function recordQbAudit(env: Env, ctx: QbContext): Promise<void> {
  *  runInDbScope calls pool.end() synchronously once the handler returns (lib/db.ts), so a
  *  deferred audit would issue its INSERTs against an already-closing pool and silently drop them.
  *  Wrapped so an audit failure never fails the agent's request. */
-async function recordAuditSafe(env: Env, ctx: QbContext): Promise<void> {
+async function recordAuditSafe(ctx: QbContext): Promise<void> {
   try {
-    await recordQbAudit(env, ctx);
+    await recordQbAudit(ctx);
   } catch (e) {
     console.log(`[quackboard] audit failed: ${e instanceof Error ? e.message : String(e)}`);
   }
+}
+
+/** Flush the board to GCS after a successful mutation, so it survives Cloud Run scale-to-zero.
+ *  /ctrl/checkpoint does CHECKPOINT + gcsUpload (enabled for quackboard mode by the entrypoint
+ *  durability guard). Best-effort: waitUntil when the platform offers it (CF), else AWAIT — on
+ *  Cloud Run there is no waitUntil and a fire-and-forget would race scale-to-zero and lose the
+ *  flush. The promise swallows its own failure so a checkpoint error never fails the mutation. */
+async function checkpointBoard(c: any, ctx: QbContext): Promise<void> {
+  const run = gw(ctx).checkpointWorkspace().then(
+    () => {},
+    (e) => console.log(`[quackboard] checkpoint failed: ${e instanceof Error ? e.message : String(e)}`),
+  );
+  let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
+  try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
+  if (exCtx) { exCtx.waitUntil(run); return; }
+  await run;
 }
 
 /** Pull a one-line message out of a node traceback / multiline error for the agent. */
@@ -290,16 +315,22 @@ function cleanReason(raw: string): string {
 }
 
 /** Map a gated-query data-plane response to the tool contract, distinguishing a birdshot
- *  denial (403, structured) from a query error (500). */
-function gatedResult(c: any, r: { status: number; json: any }) {
-  if (r.status === 200) {
-    return ok(c, { columns: r.json?.columns ?? [], rows: r.json?.rows ?? [], rowCount: r.json?.rowCount ?? (r.json?.rows?.length ?? 0) });
+ *  denial (403, structured) from a query error (500). /query is HTTP-200-ALWAYS, so the verdict
+ *  lives in the BODY: key on r.ok — never treat ok:false as empty-rows success. rows are
+ *  ROW-OBJECTS now; derive the columns list from the first row's keys for the tool contract. */
+function gatedResult(c: any, r: GatewayQueryResult) {
+  if (r.ok) {
+    const rows = r.rows ?? [];
+    const columns = rows.length ? Object.keys(rows[0]) : [];
+    return ok(c, { columns, rows, rowCount: r.rowCount ?? rows.length });
   }
-  const raw = String(r.json?.reason ?? r.json?.error ?? 'query failed');
-  if (/authoriz|permission|denied|not allowed|forbidden/i.test(raw)) {
-    // The data-plane surfaces birdshot's deny as the quack client's stderr (a node traceback).
-    // Replace it with a clean, agent-actionable message; birdshot's structured reason
-    // (acl:read:<table>) is preserved in the audit_event log, not here.
+  // ok:false is a real failure — a birdshot AUTHORIZATION deny (authorizeDecision 'deny', the
+  // authoritative signal) OR a pre-hook parse-walk/forbidden-class denial (the authorize hook
+  // never fired, so authorizeDecision is null/allow but the error text names the denial) OR a
+  // plain query error. The dual check catches both denial shapes.
+  const raw = String(r.error ?? 'query failed');
+  if (r.authorizeDecision === 'deny' || /authoriz|permission|denied|not allowed|forbidden/i.test(raw)) {
+    // birdshot's structured reason (acl:read:<table>) is preserved in the audit_event log, not here.
     return c.json(
       { error: 'authorization_denied', reason: 'Not permitted by your quackboard ACL (a shared table you lack access to, or private memory — use qb_remember/qb_mine for that).' },
       403,
@@ -310,12 +341,32 @@ function gatedResult(c: any, r: { status: number; json: any }) {
 
 const quackboard = new Hono<{ Bindings: Env }>();
 
+// GET — owner-facing detection: does this org have a quackboard yet? Powers the
+// control-plane UI's "create your quackboard" flow (there is exactly one QB per
+// org). Resolves the caller with the PLAIN owner path (resolveCaller), NOT
+// prepareQbContext — the tool routes below bind an agent identity and would 400
+// an owner's cookie session with agent_required. Returns the single QB row or null.
+quackboard.get('/', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const row = await queryOne<{ id: string; name: string; slug: string; status: string }>(
+      `SELECT id, name, slug, status FROM waddling.datalake
+        WHERE org_id = $1 AND kind = 'quackboard' ORDER BY created_at ASC LIMIT 1`,
+      [caller.orgId],
+    );
+    return ok(c, { quackboard: row ?? null });
+  }),
+);
+
 quackboard.post('/join', (c) =>
   handle(c, async () => {
     const ctx = await prepareQbContext(c, c.env);
-    const cfg = await configureQb(c.env, ctx);
-    if (cfg.status !== 200) {
-      return err(c, 'quackboard_configure_failed', 502, `data plane /qb/configure → ${cfg.status}: ${JSON.stringify(cfg.json)}`);
+    try {
+      const ack = await configureQb(ctx);
+      if (!ack.ok) return err(c, 'quackboard_configure_failed', 502, `snapshot push not acked: ${JSON.stringify(ack)}`);
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'quackboard_configure_failed', 502, e.message);
+      throw e;
     }
     return ok(c, {
       org_id: ctx.orgId,
@@ -339,23 +390,33 @@ quackboard.post('/observe', (c) =>
     const ctx = await prepareQbContext(c, c.env);
     const { content, refs, topic } = await parseBody(c, ObserveSchema);
     const refsJson = JSON.stringify(refs ?? []);
-    // agent_role is BOUND from the authenticated identity (ctx.agentRole), never the tool args.
-    const insert = await gatedQuery(c.env, ctx,
-      `INSERT INTO observations(agent_role, content, refs, topic) VALUES (${lit(ctx.agentRole)}, ${lit(content)}, ${lit(refsJson)}::JSON, ${topic ? lit(topic) : 'NULL'})`,
-    );
-    if (insert.status !== 200) return gatedResult(c, insert);
-    // Pub/sub fan-out: notify every OTHER agent whose subscription pattern matches this
-    // observation (substring match — robust + no per-write FTS rebuild). Runs as the same
-    // agent (write notifications + read subscriptions, both shared/granted).
-    const fanout = await gatedQuery(c.env, ctx,
-      `INSERT INTO notifications(to_role, sub_id, snippet)
-         SELECT s.agent_role, s.id, substr(${lit(content)}, 1, 200)
-           FROM subscriptions s
-          WHERE s.agent_role <> ${lit(ctx.agentRole)}
-            AND ${lit(content)} ILIKE '%' || s.pattern || '%'`,
-    );
-    const notified = fanout.status === 200 ? (fanout.json?.rows?.[0]?.[0] ?? 0) : 0;
-    await recordAuditSafe(c.env, ctx);
+    let insert: GatewayQueryResult;
+    let fanout: GatewayQueryResult;
+    try {
+      // agent_role is BOUND from the authenticated identity (ctx.agentRole), never the tool args.
+      insert = await gatedQuery(ctx,
+        `INSERT INTO observations(agent_role, content, refs, topic) VALUES (${lit(ctx.agentRole)}, ${lit(content)}, ${lit(refsJson)}::JSON, ${topic ? lit(topic) : 'NULL'})`,
+      );
+      if (!insert.ok) return gatedResult(c, insert);
+      // Pub/sub fan-out: notify every OTHER agent whose subscription pattern matches this
+      // observation (substring match — robust + no per-write FTS rebuild). Runs as the same
+      // agent (write notifications + read subscriptions, both shared/granted).
+      fanout = await gatedQuery(ctx,
+        `INSERT INTO notifications(to_role, sub_id, snippet)
+           SELECT s.agent_role, s.id, substr(${lit(content)}, 1, 200)
+             FROM subscriptions s
+            WHERE s.agent_role <> ${lit(ctx.agentRole)}
+              AND ${lit(content)} ILIKE '%' || s.pattern || '%'`,
+      );
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'observe_failed', 502, e.message);
+      throw e;
+    }
+    // rows are ROW-OBJECTS; a gated INSERT returns a single { Count: n } row — read the first
+    // value of the first row (robust to the count column's name).
+    const notified = fanout.ok ? Number(Object.values(fanout.rows?.[0] ?? {})[0] ?? 0) : 0;
+    await recordAuditSafe(ctx);
+    await checkpointBoard(c, ctx);
     return ok(c, { ok: true, notified });
   }),
 );
@@ -366,12 +427,14 @@ quackboard.post('/recall', (c) =>
     const ctx = await prepareQbContext(c, c.env);
     const { query: term, limit } = await parseBody(c, RecallSchema);
     // FTS BM25 ranked recall over the SHARED observations corpus (trusted typed op — see
-    // data plane /qb/recall). Returns rows ordered by relevance score, freshest index.
-    const r = await dpFetch(c.env, '/qb/recall', {
-      orgId: ctx.orgId, gatewayBoot: ctx.gatewayBoot, term, limit: Math.min(limit ?? 20, 100),
-    });
-    if (r.status !== 200) return err(c, 'recall_failed', 502, `data plane /qb/recall → ${r.status}: ${JSON.stringify(r.json)}`);
-    return ok(c, { rows: r.json?.rows ?? [] });
+    // data plane /ctrl/qb-recall). Returns rows ordered by relevance score, freshest index.
+    try {
+      const r = await gw(ctx).qbRecall({ term, limit: Math.min(limit ?? 20, 100) });
+      return ok(c, { rows: r?.rows ?? [] });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'recall_failed', 502, e.message);
+      throw e;
+    }
   }),
 );
 
@@ -381,10 +444,13 @@ quackboard.post('/remember', (c) =>
     const ctx = await prepareQbContext(c, c.env);
     const { key, content } = await parseBody(c, RememberSchema);
     // Trusted typed op — agent_role bound server-side; agent_memory carries no birdshot grant.
-    const r = await dpFetch(c.env, '/qb/remember', {
-      orgId: ctx.orgId, gatewayBoot: ctx.gatewayBoot, agentRole: ctx.agentRole, key, content,
-    });
-    if (r.status !== 200) return err(c, 'remember_failed', 502, `data plane /qb/remember → ${r.status}: ${JSON.stringify(r.json)}`);
+    try {
+      await gw(ctx).qbRemember({ agentRole: ctx.agentRole, key, content });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'remember_failed', 502, e.message);
+      throw e;
+    }
+    await checkpointBoard(c, ctx);
     return ok(c, { ok: true });
   }),
 );
@@ -394,11 +460,13 @@ quackboard.post('/mine', (c) =>
   handle(c, async () => {
     const ctx = await prepareQbContext(c, c.env);
     const { key, limit } = await parseBody(c, MineSchema);
-    const r = await dpFetch(c.env, '/qb/mine', {
-      orgId: ctx.orgId, gatewayBoot: ctx.gatewayBoot, agentRole: ctx.agentRole, key, limit,
-    });
-    if (r.status !== 200) return err(c, 'mine_failed', 502, `data plane /qb/mine → ${r.status}: ${JSON.stringify(r.json)}`);
-    return ok(c, { rows: r.json?.rows ?? [] });
+    try {
+      const r = await gw(ctx).qbMine({ agentRole: ctx.agentRole, key, limit });
+      return ok(c, { rows: r?.rows ?? [] });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'mine_failed', 502, e.message);
+      throw e;
+    }
   }),
 );
 
@@ -407,11 +475,18 @@ quackboard.post('/subscribe', (c) =>
   handle(c, async () => {
     const ctx = await prepareQbContext(c, c.env);
     const { pattern, topic } = await parseBody(c, SubscribeSchema);
-    const r = await gatedQuery(c.env, ctx,
-      `INSERT INTO subscriptions(agent_role, pattern, match_type, topic) VALUES (${lit(ctx.agentRole)}, ${lit(pattern)}, 'ilike', ${topic ? lit(topic) : 'NULL'})`,
-    );
-    if (r.status !== 200) return gatedResult(c, r);
-    await recordAuditSafe(c.env, ctx);
+    let r: GatewayQueryResult;
+    try {
+      r = await gatedQuery(ctx,
+        `INSERT INTO subscriptions(agent_role, pattern, match_type, topic) VALUES (${lit(ctx.agentRole)}, ${lit(pattern)}, 'ilike', ${topic ? lit(topic) : 'NULL'})`,
+      );
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'subscribe_failed', 502, e.message);
+      throw e;
+    }
+    if (!r.ok) return gatedResult(c, r);
+    await recordAuditSafe(ctx);
+    await checkpointBoard(c, ctx);
     return ok(c, { ok: true });
   }),
 );
@@ -423,11 +498,17 @@ quackboard.post('/inbox', (c) =>
     const { limit } = await parseBody(c, InboxSchema);
     const cap = Math.min(limit ?? 20, 100);
     // to_role = caller is bound server-side (convenience scoping; the corpus is shared).
-    const r = await gatedQuery(c.env, ctx,
-      `SELECT id, sub_id, snippet, ts, is_read FROM notifications
-         WHERE to_role = ${lit(ctx.agentRole)} ORDER BY ts DESC LIMIT ${cap}`,
-    );
-    await recordAuditSafe(c.env, ctx);
+    let r: GatewayQueryResult;
+    try {
+      r = await gatedQuery(ctx,
+        `SELECT id, sub_id, snippet, ts, is_read FROM notifications
+           WHERE to_role = ${lit(ctx.agentRole)} ORDER BY ts DESC LIMIT ${cap}`,
+      );
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'inbox_failed', 502, e.message);
+      throw e;
+    }
+    await recordAuditSafe(ctx);
     return gatedResult(c, r);
   }),
 );
@@ -437,8 +518,14 @@ quackboard.post('/query', (c) =>
   handle(c, async () => {
     const ctx = await prepareQbContext(c, c.env);
     const { sql } = await parseBody(c, QuerySchema);
-    const r = await gatedQuery(c.env, ctx, sql);
-    await recordAuditSafe(c.env, ctx);
+    let r: GatewayQueryResult;
+    try {
+      r = await gatedQuery(ctx, sql);
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'query_failed', 502, e.message);
+      throw e;
+    }
+    await recordAuditSafe(ctx);
     return gatedResult(c, r);
   }),
 );

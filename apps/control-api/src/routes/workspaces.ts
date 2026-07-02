@@ -27,33 +27,15 @@ import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
 import { resolveCaller, assertOrg, handle, ok, err, AuthError } from '../lib/cp-shared';
-import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
 import { resolveAgentIdentity } from '../lib/agent-identity';
 import { mintLakeToken, loadSigningKey } from '../lib/session-jwt';
 import { gatewayClientFor } from '../lib/gateway-client';
+import { workspaceGatewayUrl } from '../lib/provisioner';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import type { SnapshotRequest, BirdshotJwk } from '../lib/gateway-client';
 import { compileEndpointPolicy } from '../lib/effective-policy';
 
 const workspaces = new Hono<{ Bindings: Env }>();
-
-/** POST a JSON body to a data-plane lifecycle route over the DATAPLANE service binding
- *  (private — no public route). Mirrors sessions.ts's dpFetch. */
-async function dpFetch(
-  env: Env,
-  path: string,
-  body: unknown,
-): Promise<{ status: number; json: any }> {
-  const res = await env.DATAPLANE.fetch(`https://dataplane${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const txt = await res.text();
-  let json: any = txt;
-  try { json = txt ? JSON.parse(txt) : {}; } catch { /* keep raw */ }
-  return { status: res.status, json };
-}
 
 interface WsOwnershipRow {
   ws_org_id: string;
@@ -165,13 +147,15 @@ workspaces.post('/:wsId/agents/:agentId/destroy', (c) =>
       return err(c, 'forbidden', 403, 'An agent may only destroy its own workspace');
     }
 
-    // Tear the container down (best-effort: it may already be gone / hibernated).
+    // Flush the workspace's encrypted .duckdb to GCS, then let Cloud Run idle it out (scale to
+    // zero) — never hard-destroy the service. Best-effort: a cold/hibernated or not-yet-provisioned
+    // service just means there is nothing to flush.
     let shutdown: any = null;
     try {
-      const r = await dpFetch(c.env, '/end', { workspaceId, agentId });
-      shutdown = r.json;
+      const wsUrl = workspaceGatewayUrl(c.env, workspaceId, agentId);
+      shutdown = await gatewayClientFor({ gateway_url: wsUrl }).checkpointWorkspace();
     } catch {
-      /* container already reclaimed — nothing to destroy */
+      /* container already reclaimed / not yet provisioned — nothing to flush */
     }
 
     // Kill any active sessions on this (agent, datalake) so the dashboard reflects reality.
@@ -238,8 +222,8 @@ workspaces.post('/:wsId/agents/:agentId/reconfigure', (c) =>
     // Re-push the endpoint's FULL birdshot snapshot (the gateway may have slept and lost
     // its in-memory policy; a reconfigure without this would ATTACH with a JWT the gateway
     // can't verify → "Authentication failed"). Mirrors the connect path's push leg.
-    const endpoint = await queryOne<{ id: string; org_id: string; status: string; server_token: string }>(
-      `SELECT id, org_id, status, server_token FROM waddling.datalake WHERE id = $1`,
+    const endpoint = await queryOne<{ id: string; org_id: string; slug: string; status: string; server_token: string }>(
+      `SELECT id, org_id, slug, status, server_token FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
     if (!endpoint) return err(c, 'endpoint_not_found', 404);
@@ -267,25 +251,28 @@ workspaces.post('/:wsId/agents/:agentId/reconfigure', (c) =>
     };
     await gatewayClientFor(endpoint).pushSnapshot(snapshotReq);
 
-    // Mint a fresh lakeToken (the connect JWT is never stored in plaintext) + the
-    // workspace key, then configure with lockConfiguration:false.
+    // Mint a fresh lakeToken (the connect JWT is never stored in plaintext), then re-ATTACH the lake
+    // into the surviving workspace via /ctrl/configure-lake (idempotent: it DETACHes + re-ATTACHes).
     const identity = await resolveAgentIdentity(agentId);
     if (!identity) return err(c, 'agent_not_found', 404);
     const lakeToken = await mintLakeToken(c.env, agentId, datalakeId, identity.mode);
-    const workspaceKey = await ensureWorkspaceKey(workspaceId, agentId);
 
-    const cfg = await dpFetch(c.env, '/configure', {
-      workspaceId,
-      agentId,
-      datalakeId,
-      workspaceKey,
-      lakeToken,
-      disableSsl: false,
-      lockConfiguration: false, // ← the whole point: re-init without the lock error
-    });
-    if (cfg.status !== 200 || cfg.json?.ok !== true) {
+    const routerSuffix = c.env.ROUTER_HOST_SUFFIX || 'getwaddling.com';
+    const wsUrl = workspaceGatewayUrl(c.env, workspaceId, agentId);
+    let cfg: { ok: boolean; lakeAttached?: boolean; error?: string };
+    try {
+      cfg = await gatewayClientFor({ gateway_url: wsUrl }).configureLake({
+        lakeProxy: `gw-${endpoint.slug}.${routerSuffix}:443`,
+        lakeToken,
+        disableSsl: false,
+      });
+    } catch (e) {
       return err(c, 'workspace_reconfigure_failed', 502,
-        `data plane /configure → ${cfg.status}: ${JSON.stringify(cfg.json)}`);
+        `data plane /ctrl/configure-lake failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (cfg?.ok !== true) {
+      return err(c, 'workspace_reconfigure_failed', 502,
+        `workspace re-attach did not succeed: ${JSON.stringify(cfg)}`);
     }
 
     await query(
@@ -298,7 +285,7 @@ workspaces.post('/:wsId/agents/:agentId/reconfigure', (c) =>
       ok: true,
       workspaceId,
       agentId,
-      lakeAttached: cfg.json?.lakeAttached === true,
+      lakeAttached: cfg.lakeAttached === true,
       lockConfiguration: false,
     });
   }),

@@ -35,9 +35,9 @@
  * The quack `sid` is per-connection and unknown at mint time; the JWT `jti` is the
  * logical session key (agent_session.sid = jti, jwt_jti = jti).
  *
- * Gateway + workspace interactions transport over the DATAPLANE service binding
- * (gatewayClientFor + dpFetch). PostHog is neutered via lib/agent-identity's
- * captureAgentEvent (guarded no-op on workerd).
+ * Gateway + workspace interactions transport over HTTP+OIDC via gatewayClientFor.
+ * PostHog is neutered via lib/agent-identity's captureAgentEvent (guarded no-op on
+ * workerd).
  */
 import { z } from 'zod';
 import { Hono } from 'hono';
@@ -53,10 +53,14 @@ import {
 } from '../lib/agent-identity';
 import {
   gatewayClientFor,
+  GatewayError,
   type SnapshotRequest,
   type BirdshotJwk,
+  type RelayQueryResult,
+  type GovernedLoadResult,
 } from '../lib/gateway-client';
 import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
+import { provisionWorkspace, workspaceSlug, workspaceGatewayUrl } from '../lib/provisioner';
 import { hasCredit, debitQueryFloor } from '../lib/credits';
 import { makePostHog } from '../lib/posthog';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
@@ -75,32 +79,6 @@ import {
 } from '../lib/cp-shared';
 
 const SESSION_TTL_SECONDS = SESSION_TTL_SECONDS_IMPORT; // from lib/session-jwt (kept as the connect-path local name)
-
-/**
- * POST a JSON body to a data-plane lifecycle route over the DATAPLANE service binding
- * (the data plane is private — no public route). Returns the parsed JSON + status; the
- * caller maps status (200 ok / 409 needs_configure / 500 error) to its own contract.
- * The host is ignored by the binding.
- */
-async function dpFetch(
-  env: Env,
-  path: string,
-  body: unknown,
-): Promise<{ status: number; json: any }> {
-  const res = await env.DATAPLANE.fetch(`https://dataplane${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const txt = await res.text();
-  let json: any = txt;
-  try {
-    json = txt ? JSON.parse(txt) : {};
-  } catch {
-    /* keep raw text */
-  }
-  return { status: res.status, json };
-}
 
 /**
  * Record one query: count usage + persist the gateway's birdshot audit decision(s).
@@ -203,6 +181,7 @@ const KillSchema = z.object({ sessionId: z.string().min(1), reason: z.string().o
 interface EndpointRow {
   id: string;
   org_id: string;
+  slug: string;
   status: string;
   server_token: string;
   gateway_url: string | null;
@@ -280,7 +259,7 @@ sessions.post('/', (c) =>
     const requestedAgentId = connectBody.agentId;
 
     const endpoint = await queryOne<EndpointRow>(
-      `SELECT id, org_id, status, server_token, gateway_url
+      `SELECT id, org_id, slug, status, server_token, gateway_url
          FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
@@ -463,9 +442,9 @@ sessions.post('/', (c) =>
       return err(c, 'no_grants', 403, 'Agent has no active ACL rules for this endpoint');
     }
 
-    // Push the FULL birdshot policy snapshot to the gateway control channel (over the
-    // DATAPLANE binding → boots gw:<datalakeId> if cold). Column + window ACLs ride
-    // INSIDE the snapshot (`roleConstraints`), enforced by birdshot's bind-walk.
+    // Push the FULL birdshot policy snapshot to the gateway control channel (HTTP+OIDC
+    // → boots gw:<datalakeId> if cold). Column + window ACLs ride INSIDE the snapshot
+    // (`roleConstraints`), enforced by birdshot's bind-walk.
     const { kid, publicJwk, privateJwk } = await loadSigningKey();
     const gw = gatewayClientFor(endpoint);
     const jwks: BirdshotJwk[] = [{ kid, n: publicJwk.n, e: publicJwk.e }];
@@ -541,28 +520,68 @@ sessions.post('/', (c) =>
     // below).
     const ws = await resolveWorkspaceForSession(endpoint.org_id, datalakeId, agentId);
     const workspaceKey = await ensureWorkspaceKey(ws.workspaceId, agentId);
-    const cfg = await dpFetch(c.env, '/configure', {
-      workspaceId: ws.workspaceId,
-      agentId,
-      datalakeId,
-      workspaceKey,
-      lakeToken: sessionJwt,
-      disableSsl: false, // quack speaks HTTPS:443 (intercepted by the CF egress handler)
-    });
-    if (cfg.status !== 200 || cfg.json?.ok !== true) {
+    // Provision (or wake) the per-(workspace, agent) Cloud Run workspace service. It opens the
+    // agent's ENCRYPTED durable .duckdb (restored from GCS) and will relay the governed lake. The
+    // slug is a deterministic hash of (workspaceId, agentId), so a reconnect just wakes the existing
+    // service; the encryption key crosses ONLY into the service env, never back to the agent.
+    let wsUrl: string;
+    try {
+      const prov = await provisionWorkspace(c.env, {
+        slug: workspaceSlug(ws.workspaceId, agentId),
+        workspaceId: ws.workspaceId,
+        agentId,
+        encryptionKey: workspaceKey,
+        serverToken: endpoint.server_token,
+      });
+      wsUrl = prov.url;
+    } catch (e) {
       return err(
         c,
-        'workspace_configure_failed',
-        502,
-        `data plane /configure → ${cfg.status}: ${JSON.stringify(cfg.json)}`,
+        'workspace_provisioning',
+        503,
+        `workspace not ready — retry connect: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
-    if (cfg.json?.lakeAttached !== true) {
+    // Configure the lake relay: the workspace ATTACHes 'quack:<lake public router host>' with the
+    // agent's lake-JWT (sessionJwt, aud gw:<datalakeId>). Lake reads relayed through the workspace
+    // are then gated at the LAKE under the agent's real identity. The ws→lake hop is quack through
+    // the PUBLIC router (quack carries no OIDC header — the router mints it for the private gw hop).
+    const routerSuffix = c.env.ROUTER_HOST_SUFFIX || 'getwaddling.com';
+    const lakeProxy = `gw-${endpoint.slug}.${routerSuffix}:443`;
+    const wsClient = gatewayClientFor({ gateway_url: wsUrl });
+    // A freshly-provisioned ws service's run.invoker binding takes up to a minute+ to propagate to
+    // Cloud Run's invoke-enforcement layer, so the first configure-lake right after a CREATE can 403
+    // even though control-api already HAS invoker (the binding shows in get-iam-policy immediately).
+    // Retry a few times on 403; if still not ready, return a retryable 503 so the agent's
+    // connect-retry loop waits out the rest of propagation.
+    let cfg: { ok: boolean; lakeAttached?: boolean; error?: string } | null = null;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        cfg = await wsClient.configureLake({ lakeProxy, lakeToken: sessionJwt, disableSsl: false });
+        break;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (e instanceof GatewayError && e.status === 403) {
+          if (attempt < 5) {
+            await new Promise((r) => setTimeout(r, 3000));
+            continue;
+          }
+          return err(
+            c,
+            'workspace_provisioning',
+            503,
+            `workspace IAM still propagating — retry connect: ${msg}`,
+          );
+        }
+        return err(c, 'lake_attach_failed', 502, `workspace configure-lake failed: ${msg}`);
+      }
+    }
+    if (cfg?.ok !== true) {
       return err(
         c,
         'lake_attach_failed',
         502,
-        'workspace configured but the lake quack ATTACH did not succeed (check gateway JWKS / JWT triangle)',
+        `workspace configured but the lake quack ATTACH did not succeed: ${JSON.stringify(cfg)}`,
       );
     }
 
@@ -945,26 +964,35 @@ sessions.post('/:id/query', (c) =>
     // Re-resolve the workspace deterministically (idempotent upsert) — the data plane
     // is keyed by (workspaceId, agentId), not the sessionId.
     const ws = await resolveWorkspaceForSession(sess.org_id, sess.datalake_id, sess.agent_id);
+    const wsUrl = workspaceGatewayUrl(c.env, ws.workspaceId, sess.agent_id);
     const queryStartedAt = Date.now();
-    const r = await dpFetch(c.env, '/query', {
-      workspaceId: ws.workspaceId,
-      agentId: sess.agent_id,
-      sql,
-    });
-    const queryDurationMs = Date.now() - queryStartedAt;
-
-    // Cold/hibernated workspace → caller must reconnect (re-push snapshot + reconfigure).
-    // The query never reached the gateway, so there is nothing to record.
-    if (r.status === 409 && r.json?.error === 'needs_configure') {
-      return c.json(
-        {
-          error: 'needs_configure',
-          reason:
-            'Your workspace went cold (the session container was reclaimed). Call waddling_connect again to re-establish it, then retry the query.',
-        },
-        409,
+    let r: RelayQueryResult;
+    try {
+      // Lake READ relayed through the agent's workspace: /relay-query runs on the workspace's trusted
+      // connection (which ATTACHed the lake at connect), Form A → Form B for two-table JOINs.
+      r = await gatewayClientFor({ gateway_url: wsUrl }).relayQuery(sql);
+    } catch (e) {
+      // Cold (scaled-to-zero) or unconfigured workspace answers 409 "lake not configured" → the
+      // caller must reconnect to re-provision + re-ATTACH. The query never reached the lake, so
+      // there is nothing to record.
+      if (e instanceof GatewayError && e.status === 409) {
+        return c.json(
+          {
+            error: 'needs_configure',
+            reason:
+              'Your workspace went cold (the service scaled to zero or lost its lake attach). Call waddling_connect again to re-establish it, then retry the query.',
+          },
+          409,
+        );
+      }
+      return err(
+        c,
+        'query_failed',
+        502,
+        `data plane /relay-query failed: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
+    const queryDurationMs = Date.now() - queryStartedAt;
 
     // The query reached the gateway (allowed, denied, or errored at the workspace) →
     // count it + drain birdshot's audit decision(s). Best-effort, AFTER the response
@@ -1038,30 +1066,25 @@ sessions.post('/:id/query', (c) =>
     });
     if (exCtx) exCtx.waitUntil(flooring);
 
-    // The sidecar returns HTTP 500 with an error string on a birdshot denial. Map it to
-    // the structured authorization_denied shape the agent surface knows (so mcp-external
-    // can show table + reason instead of a raw 500).
-    if (r.status === 500) {
-      const msg = String(r.json?.error ?? '');
+    // The relay returns ok:false with an error string on a birdshot denial (or a query error).
+    // Map an authorization failure to the structured authorization_denied shape the agent surface
+    // knows (so mcp-external can show table + reason instead of a raw 500).
+    if (r.ok !== true) {
+      const msg = String(r.error ?? '');
       if (/authoriz|permission|denied|not allowed/i.test(msg)) {
         if (exCtx) exCtx.waitUntil(fireActivation('deny', classifyDenial(msg)));
         return c.json({ error: 'authorization_denied', reason: msg }, 403);
       }
       return err(c, 'query_failed', 500, msg || 'workspace query failed');
     }
-    if (r.status !== 200) {
-      // Any other non-200 from the data plane is an upstream failure (e.g. 400 bad
-      // args, 502 boot failure) — surface as 502 with the raw detail.
-      return err(c, 'query_failed', 502, `data plane /query → ${r.status}: ${JSON.stringify(r.json)}`);
-    }
 
-    // Sidecar /query → { columns, rows, rowCount, queueDepth, peakDepth }. Map to the
-    // QueryResult contract (the workspace sidecar does not truncate — the locked DuckDB
-    // returns exactly what birdshot's column/row enforcement let through).
+    // /relay-query → { ok, columns, rows:[arrays], rowCount, form }. Map to the QueryResult
+    // contract (no truncation — birdshot's column/row enforcement already bounded the result
+    // at the lake).
     const result: QueryResult = {
-      columns: r.json?.columns ?? [],
-      rows: r.json?.rows ?? [],
-      rowCount: r.json?.rowCount ?? (r.json?.rows?.length ?? 0),
+      columns: r.columns ?? [],
+      rows: r.rows ?? [],
+      rowCount: r.rowCount ?? (r.rows?.length ?? 0),
       truncated: false,
     };
     if (exCtx) exCtx.waitUntil(fireActivation('allow'));
@@ -1115,11 +1138,24 @@ sessions.post('/:id/etl', (c) =>
     const identity = await resolveAgentIdentity(sess.agent_id);
     if (!identity) return err(c, 'agent_not_found', 404);
     const lakeToken = await mintLakeToken(c.env, sess.agent_id, sess.datalake_id, identity.mode);
-    const r = await dpFetch(c.env, '/gw/load', {
-      datalakeId: sess.datalake_id,
-      sql,
-      lakeToken,
-    });
+    // Lake WRITE goes DIRECT to the lake gateway's /governed-load — the trusted connection that owns
+    // the DuckLake catalog + GCS creds. The workspace holds no lake storage creds and cannot persist a
+    // lake write; birdshot authorizes the exact statement at the lake under the agent's lake-JWT.
+    const endpoint = await queryOne<{ gateway_url: string | null }>(
+      `SELECT gateway_url FROM waddling.datalake WHERE id = $1`,
+      [sess.datalake_id],
+    );
+    let j: GovernedLoadResult;
+    try {
+      j = await gatewayClientFor({ gateway_url: endpoint?.gateway_url }).governedLoad(lakeToken, sql);
+    } catch (e) {
+      return err(
+        c,
+        'etl_failed',
+        502,
+        `data plane /governed-load failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
 
     // Best-effort audit AFTER the response (waitUntil) — never adds latency or fails the call.
     let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
@@ -1138,11 +1174,7 @@ sessions.post('/:id/etl', (c) =>
     });
     if (exCtx) exCtx.waitUntil(flooring);
 
-    if (r.status !== 200) {
-      return err(c, 'etl_failed', 502, `data plane /gw/load → ${r.status}: ${JSON.stringify(r.json)}`);
-    }
     // /governed-load → { ok, phase, authorizeDecision, error? }.
-    const j = (r.json ?? {}) as { ok?: boolean; phase?: string; authorizeDecision?: string; error?: string };
     if (j.ok !== true) {
       if (j.phase === 'authorize' || j.authorizeDecision === 'deny') {
         return c.json(
@@ -1171,6 +1203,7 @@ sessions.post('/:id/etl', (c) =>
       org_id: sess.org_id,
       status: 'running',
       server_token: '',
+      gateway_url: endpoint?.gateway_url ?? null,
     });
     return ok(c, { ok: true, phase: j.phase ?? 'done', authorizeDecision: j.authorizeDecision ?? 'allow' });
   }),

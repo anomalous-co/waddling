@@ -22,6 +22,9 @@ export interface CatalogEndpoint {
   org_id: string;
   status: string;
   server_token: string;
+  // Per-endpoint Cloud Run gateway URL — REQUIRED so the catalog fetch targets THIS lake's gateway
+  // (gatewayClientFor falls back to the bringup gateway when absent, fetching the wrong catalog).
+  gateway_url?: string | null;
 }
 
 async function sha256Hex(s: string): Promise<string> {

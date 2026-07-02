@@ -196,6 +196,10 @@ async function main() {
     // quackboard bootstraps coordination schema; workspace boots with empty schema.
     quackboard,
     workspaceMode,
+    // Workspace-at-rest encryption key (64 hex). When set in workspace mode, bootDuckRuntime
+    // opens ':memory:' and ATTACHes the durable file ENCRYPTED before it is persisted to GCS.
+    // Empty ⇒ plaintext open (back-compat). Ignored outside workspace mode.
+    encryptionKey: process.env.WORKSPACE_ENCRYPTION_KEY ?? "",
     databasePath: process.env.DUCKDB_DATABASE_PATH || ":memory:",
   };
 
@@ -211,7 +215,7 @@ async function main() {
   // storage.objectAdmin on the workspace bucket — provisioned in provision.sh.
   const wsBucket = process.env.WORKSPACE_GCS_BUCKET ?? "";
   const wsObject = process.env.WORKSPACE_GCS_OBJECT ?? "";
-  if (workspaceMode && wsBucket && wsObject && config.databasePath !== ":memory:") {
+  if ((workspaceMode || quackboard) && wsBucket && wsObject && config.databasePath !== ":memory:") {
     mkdirSync(dirname(resolve(config.databasePath)), { recursive: true });
     const found = await gcsDownload(wsBucket, wsObject, config.databasePath);
     log(found
@@ -242,6 +246,11 @@ async function main() {
   let wsLakeToken = null;
   let wsLakeDisableSsl = false;
   let wsLakeAttached = false;
+  // S1 finalizer: SET lock_configuration=true exactly once, at the END of the FIRST successful
+  // /ctrl/configure-lake (after the lake ATTACH), never in bootDuckRuntime. Locking earlier would
+  // block the relay's own quack ATTACH; the guard also avoids re-SETting it (which errors once set).
+  // Re-configure (DETACH+ATTACH) is DDL, not config, so it still works under the lock.
+  let wsConfigLocked = false;
   if (process.env.GW_BOOT_SNAPSHOT) {
     try {
       const parsed = JSON.parse(Buffer.from(process.env.GW_BOOT_SNAPSHOT, "base64").toString("utf8"));
@@ -452,7 +461,7 @@ async function main() {
     // A no-op CHECKPOINT on a lake gateway (:memory:) is harmless.
     if (path === "/ctrl/checkpoint" && method === "POST") {
       await rt.run("CHECKPOINT");
-      if (workspaceMode && wsBucket && wsObject && config.databasePath !== ":memory:") {
+      if ((workspaceMode || quackboard) && wsBucket && wsObject && config.databasePath !== ":memory:") {
         try {
           await gcsUpload(wsBucket, wsObject, config.databasePath);
         } catch (uploadErr) {
@@ -663,6 +672,13 @@ async function main() {
       wsLakeToken = lakeToken;
       wsLakeDisableSsl = !!disableSsl;
       wsLakeAttached = true;
+      // S1: pin configuration now that the lake ATTACH has succeeded (done LAST + once, so it
+      // never blocks the ATTACH above). disabled_filesystems was already made irreversible at
+      // boot; this also freezes autoload/unsigned/etc for the life of the workspace process.
+      if (!wsConfigLocked) {
+        await rt.run("SET lock_configuration=true;");
+        wsConfigLocked = true;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, lakeProxy }));
       return;
@@ -754,6 +770,65 @@ async function main() {
         // signal. "deny" + a thrown query = a genuine authorization denial.
         authorizeDecision: decision,
       }));
+      return;
+    }
+
+    // ── QB gated query: authorize the agent's statement, then run it on the TRUSTED
+    //    connection that owns the served quackboard db. Unlike /query (a read-only quack
+    //    ATTACH built for the lake, where bare names don't resolve and WRITES can't push
+    //    through the federation), the quackboard board is unqualified reads AND writes on
+    //    the served catalog. Same authenticate→authorize→execute split as /governed-load,
+    //    but returns ROWS (reads) and executes writes on rt.connection (bare `observations`
+    //    resolves because duck.ts USEd the QB db). 200-always; outcome in the body.
+    if (path === "/qb-query" && method === "POST") {
+      const body = await readJson(req);
+      const { token, sql } = body;
+      if (!token || !sql) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing token/sql" }));
+        return;
+      }
+      const reply = (status, obj) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(obj));
+      };
+      if (!isSingleStatement(sql)) {
+        reply(200, { ok: false, phase: "reject", error: "only a single SQL statement is allowed" });
+        return;
+      }
+      const sid = `qb-${++etlSeq}`;
+      const lit = (s) => String(s).replace(/'/g, "''");
+      let authed = false;
+      try {
+        const r = await rt.connection.runAndReadAll(`SELECT birdshot_authenticate('${sid}', '${lit(token)}', '') AS ok`);
+        authed = r.getRowObjects()[0]?.ok === true;
+      } catch (e) {
+        reply(200, { ok: false, phase: "authenticate", error: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+      if (!authed) {
+        reply(200, { ok: false, phase: "authenticate", error: "token rejected" });
+        return;
+      }
+      let allowed = false;
+      try {
+        const r = await rt.connection.runAndReadAll(`SELECT birdshot_authorize('${sid}', '${lit(sql)}') AS ok`);
+        allowed = r.getRowObjects()[0]?.ok === true;
+      } catch (e) {
+        reply(200, { ok: false, phase: "authorize", error: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+      if (!allowed) {
+        reply(200, { ok: false, phase: "authorize", authorizeDecision: "deny", error: "not authorized for this statement" });
+        return;
+      }
+      try {
+        const reader = await rt.connection.runAndReadAll(sql);
+        const rows = normalize(reader.getRowObjects());
+        reply(200, { ok: true, phase: "done", authorizeDecision: "allow", rows, rowCount: Array.isArray(rows) ? rows.length : null });
+      } catch (e) {
+        reply(200, { ok: false, phase: "execute", authorizeDecision: "allow", error: e instanceof Error ? e.message : String(e) });
+      }
       return;
     }
 
@@ -893,6 +968,7 @@ async function main() {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         ok: relayResult != null,
+        columns: relayResult?.columns ?? [],
         rows: relayResult?.rows ?? null,
         rowCount: relayResult?.rowCount ?? null,
         form: relayForm,

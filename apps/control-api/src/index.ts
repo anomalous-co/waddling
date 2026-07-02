@@ -37,6 +37,7 @@ import { agents } from "./routes/agents";
 import { notebooks } from "./routes/notebooks";
 import { views } from "./routes/views";
 import { settings } from "./routes/settings";
+import { team } from "./routes/team";
 import { usage } from "./routes/usage";
 import { audit } from "./routes/audit";
 import { billing } from "./routes/billing";
@@ -57,7 +58,7 @@ function errMessage(e: unknown): string {
 }
 
 // Initialize per-isolate singletons once, before any handler — the db pool plus
-// the secret-crypto pair and the DATAPLANE service binding the ported lib layer
+// the secret-crypto pair and the gateway transport the ported lib layer
 // resolves through getCrypto()/gatewayClientFor(). All read from `c.env` (no
 // ambient env on workerd) and are idempotent — only the first request in a warm
 // isolate does work. The crypto secret uses WADDLING_SECRET_KEY with a
@@ -113,9 +114,7 @@ app.use("*", async (c, next) => {
   initCrypto(c.env.WADDLING_SECRET_KEY ?? c.env.BETTER_AUTH_SECRET);
   if (c.env.HYPERDRIVE) initPool(c.env.HYPERDRIVE.connectionString);
   initAuth(c.env);
-  // Prefer GATEWAY_BASE_URL (Node/Cloud Run HTTP) over DATAPLANE service binding (CF).
-  if (c.env.GATEWAY_BASE_URL) initDataplane(c.env.GATEWAY_BASE_URL);
-  else initDataplane(c.env.DATAPLANE);
+  initDataplane(c.env.GATEWAY_BASE_URL);
   await next();
 });
 
@@ -548,6 +547,7 @@ app.route("/api/cp/agents", agents);
 app.route("/api/cp/notebooks", notebooks);
 app.route("/api/cp/views", views);
 app.route("/api/cp/settings", settings);
+app.route("/api/cp/team", team);
 app.route("/api/cp/usage", usage);
 app.route("/api/cp/audit", audit);
 app.route("/api/cp/billing", billing);
@@ -617,14 +617,6 @@ app.get("/probe/gw-push", async (c) => {
   }
 });
 
-// Temporary diagnostic: does the dataplane's R2 cred reach a per-org bucket? Forwards to
-// the private dataplane /r2probe. Remove with the rest of /probe/* scaffolding.
-app.get("/probe/r2dp", async (c) => {
-  const bucket = new URL(c.req.url).searchParams.get("bucket") ?? "";
-  const res = await c.env.DATAPLANE.fetch(`https://dataplane/r2probe?bucket=${encodeURIComponent(bucket)}`);
-  return c.json((await res.json()) as Record<string, unknown>, res.status as 200);
-});
-
 // Temporary diagnostic: list a table's columns (default 'apikey') to ground-truth the
 // Better-Auth-owned schema (case/quoting). Remove with the rest of /probe/* scaffolding.
 app.get("/probe/cols", async (c) => {
@@ -683,8 +675,7 @@ export function startupInit(config: Env): void {
   const connStr = config.HYPERDRIVE?.connectionString ?? config.DATABASE_URL ?? '';
   initPool(connStr);
   initAuth(config);
-  if (config.GATEWAY_BASE_URL) initDataplane(config.GATEWAY_BASE_URL);
-  else initDataplane(config.DATAPLANE);
+  initDataplane(config.GATEWAY_BASE_URL);
 }
 
 /**
@@ -702,8 +693,7 @@ export async function scheduledHandler(env: Env): Promise<void> {
   // initCrypto so recompile→resolveGatewayBoot can seal/open per-endpoint boot secrets;
   // initDataplane so the catalog refresh + dispatch drain reach the gateway (URL on Node).
   initCrypto(env.WADDLING_SECRET_KEY ?? env.BETTER_AUTH_SECRET);
-  if (env.GATEWAY_BASE_URL) initDataplane(env.GATEWAY_BASE_URL);
-  else initDataplane(env.DATAPLANE);
+  initDataplane(env.GATEWAY_BASE_URL);
   try {
     // Out-of-band catalog refresh: pull the live catalog from each WARM gateway (status-gated,
     // never cold-boots a sleeping pool) and enqueue a recompile on change so wildcard grants fold

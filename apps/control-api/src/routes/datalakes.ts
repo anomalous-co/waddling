@@ -23,11 +23,10 @@ import { getCachedCatalog, refreshCatalog } from '../lib/catalog-cache';
 import { recompileAndPush } from '../lib/gateway-push';
 import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
 import { compileEndpointPolicy } from '../lib/effective-policy';
-import { policyVersionFor, grantVersionFor, authVersionFor, bumpPolicyVersion } from '../lib/policy-version';
+import { grantVersionFor, authVersionFor, bumpPolicyVersion } from '../lib/policy-version';
 import { loadSigningKey } from '../lib/session-jwt';
 import { provisionOrgCatalog } from '../lib/catalog-provision';
-import { provisionGateway, type ProvisionableDatalake } from '../lib/provisioner';
-import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
+import { provisionGateway, provisionQuackboard, type ProvisionableDatalake } from '../lib/provisioner';
 import type { DescribeResult, TableInfo, DatalakeStatus, DatalakeSummary, DatalakeDetail, DatalakeRuntime } from '../lib/types';
 
 // Endpoint status domain (canonical: lib/types DatalakeSummary['status']). The full
@@ -95,8 +94,13 @@ datalakes.get('/', (c) =>
       slug: string;
       status: DatalakeStatusName;
     }>(
+      // Exclude quackboards: they are a distinct kind (a catalog-less coordination
+      // board), not a governed data lake, and must not surface in any lake list — a
+      // quackboard row has no DuckLake catalog, so rendering it as a selectable lake
+      // (lake index, connect-agent wizard) would offer a broken target. IS DISTINCT
+      // FROM is null-safe; the column is NOT NULL DEFAULT 'lake', but future-proof.
       `SELECT id, name, slug, status FROM waddling.datalake
-        WHERE org_id = $1 ORDER BY created_at ASC`,
+        WHERE org_id = $1 AND kind IS DISTINCT FROM 'quackboard' ORDER BY created_at ASC`,
       [caller.orgId],
     );
     const list: DatalakeSummary[] = rows.rows.map((r) => ({
@@ -264,7 +268,15 @@ datalakes.post('/', (c) =>
             [created.id],
           );
           if (dlRow) {
-            const { url } = await provisionGateway(c.env, dlRow);
+            // A quackboard row has no catalog DSN, so provisionGateway would throw resolving one.
+            // Provision the per-org QB gateway (QUACKBOARD=1 mode) instead; both return { url }.
+            const { url } = isQb
+              ? await provisionQuackboard(c.env, {
+                  slug: dlRow.slug,
+                  orgId: dlRow.org_id,
+                  serverToken: dlRow.server_token,
+                })
+              : await provisionGateway(c.env, dlRow);
             await query(`UPDATE waddling.datalake SET gateway_url = $1 WHERE id = $2`, [url, created.id]);
           }
         } catch (e) {
@@ -937,48 +949,6 @@ datalakes.post('/:id/provision', (c) =>
           : null,
       },
     });
-  }),
-);
-
-/**
- * POST /:id/seed-hn — trusted data load: index the top HN stories from the last `days`
- * into the endpoint's real lake. Resolves the boot config (faucet creds + catalog) and
- * hands it to the data plane, which boots the gateway and runs the loader on its trusted
- * connection (parquet → R2). Agents only READ the result via the birdshot-gated path.
- */
-datalakes.post('/:id/seed-hn', (c) =>
-  handle(c, async () => {
-    const caller = await resolveCaller(c);
-    const id = c.req.param('id');
-    const ep = await queryOne<{ org_id: string }>(
-      `SELECT org_id FROM waddling.datalake WHERE id = $1`,
-      [id],
-    );
-    if (!ep || ep.org_id !== caller.orgId) return err(c, 'endpoint_not_found', 404);
-    const body = (await c.req.json().catch(() => ({}))) as { days?: number; limit?: number };
-
-    let boot;
-    try {
-      boot = await resolveGatewayBoot(c.env, id);
-    } catch (e) {
-      if (e instanceof CatalogNotReadyError) return err(c, 'catalog_provisioning', 503, e.message);
-      if (e instanceof StorageNotReadyError) return err(c, 'storage_unavailable', 503, e.message);
-      throw e;
-    }
-    if (!boot.gatewayBoot) return err(c, 'no_real_lake', 409, 'endpoint has no managed/real lake to load into');
-
-    const res = await c.env.DATAPLANE.fetch('https://dataplane/lakeload', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        datalakeId: id,
-        gatewayBoot: boot.gatewayBoot,
-        days: body.days ?? 30,
-        limit: body.limit ?? 1000,
-      }),
-    });
-    const json = (await res.json().catch(() => ({ error: 'non-json data-plane response' }))) as Record<string, unknown>;
-    return c.json(json, res.status as 200);
   }),
 );
 

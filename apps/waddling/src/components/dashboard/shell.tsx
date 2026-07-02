@@ -1,11 +1,17 @@
 'use client';
 
-import { type ReactNode, Fragment, useEffect, useState } from 'react';
+import {
+  type ReactNode,
+  Fragment,
+  useEffect,
+  useState,
+  useRef,
+  useCallback,
+} from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import {
   Building2,
-  ChevronsUpDown,
   Database,
   Plus,
   Check,
@@ -13,20 +19,17 @@ import {
   Settings,
   CreditCard,
   Plug,
-  LayoutDashboard,
+  Home,
   Bot,
-  ShieldCheck,
-  Radio,
-  ScrollText,
-  BarChart3,
-  NotebookText,
-  Table2,
+  LayoutGrid,
+  Users,
+  Search,
+  ChevronRight,
   Sun,
   Moon,
   Monitor,
   User,
   Palette,
-  Link2,
 } from 'lucide-react';
 import { useTheme } from 'fumadocs-ui/provider/base';
 import { authClient } from '@/lib/auth-client';
@@ -34,6 +37,23 @@ import { DataLakeIcon } from '@/components/data-lake-icon';
 import { BrandMark } from '@/components/brand-mark';
 import { fetchCp } from '@/components/dashboard/fetch';
 import { BreadcrumbProvider, useBreadcrumbOverrides } from '@/components/dashboard/breadcrumb-context';
+import {
+  ConnectAgentProvider,
+  useConnectAgent,
+} from '@/components/waddling/connect-agent-dialog';
+import { StatusDot } from '@/components/waddling/status-dot';
+import { agentSemanticStatus } from '@/components/waddling/agent-status';
+import {
+  Command,
+  CommandDialog,
+  CommandInput,
+  CommandList,
+  CommandEmpty,
+  CommandGroup,
+  CommandItem,
+  CommandShortcut,
+} from '@/components/ui/command';
+import type { AgentSummary, DatalakeSummary as DatalakeSummaryType } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
@@ -45,7 +65,6 @@ import {
   SidebarFooter,
   SidebarGroup,
   SidebarGroupContent,
-  SidebarGroupLabel,
   SidebarInset,
   SidebarMenu,
   SidebarMenuButton,
@@ -91,46 +110,24 @@ interface Org {
   slug: string;
 }
 
-interface DatalakeSummary {
-  id: string;
-  name: string;
-  slug: string;
-  status: string;
-}
-
-// Grouped primary nav. Billing + Settings live in the user menu; the onboarding
-// flow is the header "Connect" action.
-const NAV_GROUPS = [
-  {
-    label: 'Platform',
-    items: [
-      { href: '/dashboard', label: 'Overview', icon: LayoutDashboard },
-      { href: '/datalakes', label: 'Data Lakes', icon: DataLakeIcon },
-      { href: '/agents', label: 'Agents', icon: Bot },
-      { href: '/connected', label: 'Connected', icon: Link2 },
-      { href: '/acl', label: 'Access', icon: ShieldCheck },
-    ],
-  },
-  {
-    label: 'Operations',
-    items: [
-      { href: '/sessions', label: 'Sessions', icon: Radio },
-      { href: '/audit', label: 'Audit', icon: ScrollText },
-      { href: '/usage', label: 'Usage', icon: BarChart3 },
-    ],
-  },
-  {
-    label: 'Workspace',
-    items: [
-      { href: '/notebooks', label: 'Notebooks', icon: NotebookText },
-      { href: '/views', label: 'Views', icon: Table2 },
-    ],
-  },
+// Primary nav — the redesigned simplified surface (Home/Agents/Data/Quackboard/
+// Team/Settings). Billing + Account live in the user menu; "Connect" is the header
+// action (opens the connect-agent modal). Operational surfaces (sessions/audit/
+// usage/acl/connected/notebooks/views) remain reachable by URL but are folded out
+// of the sidebar per the new information architecture.
+const NAV_ITEMS = [
+  { href: '/dashboard',  label: 'Home',       icon: Home },
+  { href: '/agents',     label: 'Agents',     icon: Bot },
+  { href: '/datalakes',  label: 'Data',       icon: DataLakeIcon },
+  { href: '/quackboard', label: 'Quackboard', icon: LayoutGrid },
+  { href: '/team',       label: 'Team',       icon: Users },
+  { href: '/settings',   label: 'Settings',   icon: Settings },
 ] as const;
 
 const SEGMENT_LABELS: Record<string, string> = {
-  dashboard: 'Overview',
-  datalakes: 'Data Lakes',
+  dashboard: 'Home',
+  datalakes: 'Data',
+  quackboard: 'Quackboard',
   agents: 'Agents',
   connected: 'Connected agents',
   acl: 'Access',
@@ -140,6 +137,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   notebooks: 'Notebooks',
   views: 'Views',
   billing: 'Billing',
+  team: 'Team',
   settings: 'Settings',
   account: 'Account',
   onboarding: 'Connect',
@@ -313,32 +311,29 @@ function AppSidebar() {
       className="top-(--header-height) !h-[calc(100svh-var(--header-height))] [--dl-gap:var(--sidebar)]"
     >
       <SidebarContent>
-        {NAV_GROUPS.map((group) => (
-          <SidebarGroup key={group.label}>
-            <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {group.items.map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <SidebarMenuItem key={item.href}>
-                      <SidebarMenuButton
-                        asChild
-                        isActive={isActive(pathname, item.href)}
-                        tooltip={item.label}
-                      >
-                        <Link href={item.href}>
-                          <Icon />
-                          <span>{item.label}</span>
-                        </Link>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  );
-                })}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
-        ))}
+        <SidebarGroup>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {NAV_ITEMS.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <SidebarMenuItem key={item.href}>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={isActive(pathname, item.href)}
+                      tooltip={item.label}
+                    >
+                      <Link href={item.href}>
+                        <Icon />
+                        <span>{item.label}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
       </SidebarContent>
       <SidebarFooter className={cn('flex', collapsed ? 'items-center' : 'items-start')}>
         <SidebarTrigger className="shrink-0" />
@@ -348,67 +343,6 @@ function AppSidebar() {
   );
 }
 
-function DatalakeSwitcher() {
-  const router = useRouter();
-  const [datalakes, setDatalakes] = useState<DatalakeSummary[]>([]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void fetchCp<{ datalakes: DatalakeSummary[] }>('/api/cp/datalakes').then(
-      (res) => {
-        if (!cancelled && res.ok) setDatalakes(res.data.datalakes ?? []);
-      },
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="sm" className="gap-2">
-          <Database data-icon="inline-start" />
-          <span className="hidden max-w-32 truncate sm:inline">
-            {datalakes.length
-              ? `${datalakes.length} data lakes`
-              : 'Data lakes'}
-          </span>
-          <ChevronsUpDown data-icon="inline-end" className="text-muted-foreground" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-64">
-        <DropdownMenuLabel>Data lakes</DropdownMenuLabel>
-        <DropdownMenuGroup>
-          {datalakes.map((dl) => (
-            <DropdownMenuItem
-              key={dl.id}
-              onClick={() => router.push(`/datalakes/${dl.id}`)}
-            >
-              <span
-                className={cn(
-                  'size-2 rounded-full',
-                  dl.status === 'running' ? 'bg-green-500' : 'bg-muted-foreground',
-                )}
-              />
-              <span className="truncate">{dl.name}</span>
-              <span className="ml-auto text-xs text-muted-foreground">
-                {dl.status}
-              </span>
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuGroup>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem asChild>
-          <Link href="/datalakes/new">
-            <Plus data-icon="inline-start" />
-            New data lake
-          </Link>
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
 
 function Breadcrumbs({ pathname }: { pathname: string }) {
   const overrides = useBreadcrumbOverrides();
@@ -441,7 +375,144 @@ function Breadcrumbs({ pathname }: { pathname: string }) {
   );
 }
 
-export function DashboardShell({
+// ── Command palette (⌘K) ──────────────────────────────────────────────────────
+
+function CommandPalette({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+}) {
+  const router = useRouter();
+  const { openConnect } = useConnectAgent();
+  const [agents, setAgents] = useState<AgentSummary[] | null>(null);
+  const [lakes, setLakes] = useState<DatalakeSummaryType[] | null>(null);
+  const dataLoadedRef = useRef(false);
+
+  useEffect(() => {
+    if (!open || dataLoadedRef.current) return;
+    let cancelled = false;
+    async function load() {
+      const [agentsRes, lakesRes] = await Promise.all([
+        fetchCp<{ agents: AgentSummary[] }>('/api/cp/agents'),
+        fetchCp<{ datalakes: DatalakeSummaryType[] }>('/api/cp/datalakes'),
+      ]);
+      if (cancelled) return;
+      dataLoadedRef.current = true;
+      if (agentsRes.ok) setAgents(agentsRes.data.agents);
+      if (lakesRes.ok) setLakes(lakesRes.data.datalakes);
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  const run = useCallback(
+    (href: string) => {
+      onOpenChange(false);
+      router.push(href);
+    },
+    [router, onOpenChange],
+  );
+
+  return (
+    <CommandDialog open={open} onOpenChange={onOpenChange}>
+      <Command>
+      <CommandInput placeholder="Search agents, lakes, actions…" />
+      <CommandList>
+        <CommandEmpty>No results found.</CommandEmpty>
+
+        {agents && agents.length > 0 && (
+          <CommandGroup heading="Agents">
+            {agents.map((agent) => (
+              <CommandItem
+                key={agent.id}
+                value={'agent ' + agent.name + ' ' + (agent.description ?? '')}
+                onSelect={() => run('/agents/' + agent.id)}
+              >
+                <StatusDot status={agentSemanticStatus(agent)} decorative className="mr-2" />
+                <span>{agent.name}</span>
+                {agent.description && (
+                  <span className="ml-2 truncate text-xs text-muted-foreground">
+                    {agent.description}
+                  </span>
+                )}
+                <CommandShortcut>
+                  <ChevronRight className="size-3 opacity-40" aria-hidden="true" />
+                </CommandShortcut>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
+
+        {lakes && lakes.length > 0 && (
+          <CommandGroup heading="Data lakes">
+            {lakes.map((lake) => (
+              <CommandItem
+                key={lake.id}
+                value={'lake ' + lake.name + ' ' + lake.slug}
+                onSelect={() => run('/datalakes/' + lake.id)}
+              >
+                <Database className="mr-2 size-4" aria-hidden="true" />
+                <span>{lake.name}</span>
+                <span className="ml-2 truncate text-xs text-muted-foreground">{lake.slug}</span>
+                <CommandShortcut>
+                  <ChevronRight className="size-3 opacity-40" aria-hidden="true" />
+                </CommandShortcut>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
+
+        <CommandGroup heading="Navigation">
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <CommandItem
+                key={item.href}
+                value={'go ' + item.label}
+                onSelect={() => run(item.href)}
+              >
+                <Icon className="mr-2 size-4" aria-hidden="true" />
+                {item.label}
+              </CommandItem>
+            );
+          })}
+        </CommandGroup>
+
+        <CommandGroup heading="Actions">
+          <CommandItem
+            value="connect an agent"
+            onSelect={() => {
+              onOpenChange(false);
+              openConnect();
+            }}
+          >
+            <Plug className="mr-2 size-4" aria-hidden="true" />
+            Connect an agent
+          </CommandItem>
+        </CommandGroup>
+      </CommandList>
+      </Command>
+    </CommandDialog>
+  );
+}
+
+// ── Header connect button (inside ConnectAgentProvider) ───────────────────────
+
+function ConnectButton() {
+  const { openConnect } = useConnectAgent();
+  return (
+    <Button size="sm" onClick={() => openConnect()}>
+      <Plug data-icon="inline-start" />
+      <span className="hidden sm:inline">Connect</span>
+    </Button>
+  );
+}
+
+function DashboardShellInner({
   user,
   activeOrgId,
   children,
@@ -451,44 +522,84 @@ export function DashboardShell({
   children: ReactNode;
 }) {
   const pathname = usePathname();
+  const [cmdOpen, setCmdOpen] = useState(false);
+
+  // ⌘K / Ctrl+K toggles the palette. Capture phase + stopImmediatePropagation so
+  // the app shell owns ⌘K wherever it is mounted (the root fumadocs provider also
+  // binds ⌘K for docs search).
+  useEffect(() => {
+    function handleKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        setCmdOpen((v) => !v);
+      }
+    }
+    document.addEventListener('keydown', handleKey, { capture: true });
+    return () => document.removeEventListener('keydown', handleKey, { capture: true });
+  }, []);
 
   return (
-    <TooltipProvider delayDuration={200}>
-     <BreadcrumbProvider>
-      <div className="[--header-height:calc(--spacing(14))]">
-        <SidebarProvider className="flex flex-col">
-          <header className="sticky top-0 z-50 flex h-(--header-height) shrink-0 items-center gap-2 border-b border-border bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-            <Link href="/dashboard" className="flex shrink-0 items-center">
-              <BrandMark
-                align="center"
-              />
-            </Link>
-            <div className="w-px shrink-0 self-stretch bg-border" aria-hidden="true" />
-            <div className="min-w-0 flex-1 overflow-hidden">
-              <Breadcrumbs pathname={pathname} />
-            </div>
-            <div className="flex shrink-0 items-center gap-1.5">
-              <DatalakeSwitcher />
-              <Button asChild size="sm">
-                <Link href="/onboarding/connect">
-                  <Plug data-icon="inline-start" />
-                  <span className="hidden sm:inline">Connect</span>
-                </Link>
-              </Button>
-              <UserMenu user={user} activeOrgId={activeOrgId} />
-            </div>
-          </header>
-          <div className="flex flex-1">
-            <AppSidebar />
-            <SidebarInset className="min-w-0">
-              <div className="flex min-w-0 flex-1 flex-col gap-4 p-6">
-                {children}
-              </div>
-            </SidebarInset>
+    <div className="[--header-height:calc(--spacing(14))]">
+      <SidebarProvider className="flex flex-col">
+        <header className="sticky top-0 z-50 flex h-(--header-height) shrink-0 items-center gap-2 border-b border-border bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+          <Link href="/dashboard" className="flex shrink-0 items-center">
+            <BrandMark align="center" />
+          </Link>
+          <div className="w-px shrink-0 self-stretch bg-border" aria-hidden="true" />
+          <div className="min-w-0 flex-1 overflow-hidden">
+            <Breadcrumbs pathname={pathname} />
           </div>
-        </SidebarProvider>
-      </div>
-     </BreadcrumbProvider>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setCmdOpen(true)}
+              aria-label="Open command palette (⌘K)"
+              className="flex h-8 items-center gap-2 rounded-lg border bg-muted/50 px-3 text-xs text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Search className="size-3.5 shrink-0" aria-hidden="true" />
+              <span className="hidden sm:inline">Search…</span>
+              <kbd
+                className="pointer-events-none ml-1 hidden h-5 items-center gap-0.5 rounded border bg-background px-1.5 font-mono text-[10px] font-medium sm:flex"
+                aria-hidden="true"
+              >
+                ⌘K
+              </kbd>
+            </button>
+            <ConnectButton />
+            <UserMenu user={user} activeOrgId={activeOrgId} />
+          </div>
+        </header>
+        <div className="flex flex-1">
+          <AppSidebar />
+          <SidebarInset className="min-w-0">
+            <div className="flex min-w-0 flex-1 flex-col gap-4 p-6">{children}</div>
+          </SidebarInset>
+        </div>
+      </SidebarProvider>
+      <CommandPalette open={cmdOpen} onOpenChange={setCmdOpen} />
+    </div>
+  );
+}
+
+export function DashboardShell({
+  user,
+  activeOrgId,
+  children,
+}: {
+  user: UserInfo;
+  activeOrgId?: string;
+  children: ReactNode;
+}) {
+  return (
+    <TooltipProvider delayDuration={200}>
+      <BreadcrumbProvider>
+        <ConnectAgentProvider>
+          <DashboardShellInner user={user} activeOrgId={activeOrgId}>
+            {children}
+          </DashboardShellInner>
+        </ConnectAgentProvider>
+      </BreadcrumbProvider>
       <Toaster />
     </TooltipProvider>
   );
