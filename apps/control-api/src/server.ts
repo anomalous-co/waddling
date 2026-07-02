@@ -4,9 +4,8 @@
  * Reads all configuration from process.env, initializes module-level singletons
  * (pool, auth, crypto, gateway transport), then starts @hono/node-server.
  *
- * CF binding stubs (DATAPLANE, AVATARS) provide graceful 503 / no-op responses
- * for CF-only routes (workspaces, catalog DATAPLANE fetch, avatar upload) that
- * aren't available on Node — the rest of the API works normally.
+ * The AVATARS R2 binding is stubbed as a no-op on Node (avatar upload/serve is a
+ * CF-only route) — the rest of the API works normally.
  */
 import { serve } from '@hono/node-server';
 import { app, startupInit, scheduledHandler } from './index.js';
@@ -22,19 +21,6 @@ function makeSecret(val: string | undefined): { get(): Promise<string> } {
   return { get: () => Promise.resolve(val ?? '') };
 }
 
-// CF DATAPLANE service-binding stub — routes that do `env.DATAPLANE.fetch(...)`
-// receive a 503 on Node (data-plane routes not available here).
-const dataplaneStub: Fetcher = {
-  fetch() {
-    return Promise.resolve(
-      new Response(JSON.stringify({ error: 'DATAPLANE not available on Node deployment' }), {
-        status: 503,
-        headers: { 'content-type': 'application/json' },
-      }),
-    );
-  },
-};
-
 // CF R2 AVATARS binding stub — avatar reads return null; writes are silent no-ops.
 const avatarsStub: R2Bucket = {
   get(_key: string) { return Promise.resolve(null); },
@@ -46,7 +32,6 @@ const config: Env = {
 
   // CF binding stubs — unused on Node, but required by the Env type.
   HYPERDRIVE: undefined,
-  DATAPLANE: dataplaneStub,
   AVATARS: avatarsStub,
 
   // SecretBinding stubs that read from process.env.
@@ -102,6 +87,8 @@ const config: Env = {
   PG_PORT: process.env.PG_PORT,
 
   PROVISIONER_URL: process.env.PROVISIONER_URL,
+  ROUTER_HOST_SUFFIX: process.env.ROUTER_HOST_SUFFIX,
+  CLOUD_RUN_URL_SUFFIX: process.env.CLOUD_RUN_URL_SUFFIX,
 
   CF_EMAIL_BRIDGE_URL: process.env.CF_EMAIL_BRIDGE_URL,
   CF_EMAIL_BRIDGE_TOKEN: process.env.CF_EMAIL_BRIDGE_TOKEN,

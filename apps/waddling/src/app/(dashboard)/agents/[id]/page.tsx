@@ -2,15 +2,15 @@
 
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
+import Link from 'next/link';
 import {
-  Info,
-  KeyRound,
+  ChevronLeft,
+  Clock,
   EllipsisVertical,
-  Radio,
   RefreshCw,
-  ScrollText,
-  ShieldCheck,
+  Sparkles,
   Trash2,
+  User,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useBreadcrumbLabel } from '@/components/dashboard/breadcrumb-context';
@@ -32,22 +32,23 @@ import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp, cpPatch, cpDelete } from '@/components/dashboard/fetch';
 import { AgentAccess } from '@/components/dashboard/agent-access';
 import { decodeProposal } from '@/lib/access-diff';
-import {
-  NoAccessBanner,
-  WorkspacePanel,
-  needsAccess,
-  type AgentSection,
-} from '@/components/dashboard/agent/kit';
+import { NoAccessBanner, needsAccess } from '@/components/dashboard/agent/kit';
 import { OverviewSection } from '@/components/dashboard/agent/overview-section';
 import { KeysSection } from '@/components/dashboard/agent/keys-section';
 import { SessionsSection } from '@/components/dashboard/agent/sessions-section';
 import { ActivitySection } from '@/components/dashboard/agent/activity-section';
 import { ConnectDialog } from '@/components/dashboard/agent/connect-dialog';
+import { DetailLayout, type DetailSection } from '@/components/waddling/detail-layout';
+import { ModeChip } from '@/components/waddling/agent-chips';
+import { agentSemanticStatus, formatRelative } from '@/components/waddling/agent-status';
+import { SectionCard } from '@/components/waddling/section-card';
+import { EmptyState } from '@/components/waddling/empty-state';
+import { formatBytes } from '@/lib/format';
 import type { AgentSummary } from '@/lib/types';
+import type { QbMemoryEntry } from './types';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -69,39 +70,97 @@ interface AclRuleRow {
   capability: string;
 }
 
+// ── Memory section ───────────────────────────────────────────────────────────────
+// Private agent_memory, surfaced read-only for oversight. The control-api memory
+// endpoint is not wired in production yet — a failed fetch (e.g. 404) resolves to
+// an empty list and renders the EmptyState, never an error.
+
+function MemorySection({ agentId }: { agentId: string }) {
+  const [entries, setEntries] = useState<QbMemoryEntry[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchCp<{ entries: QbMemoryEntry[] }>(`/api/cp/agents/${agentId}/memory`).then((res) => {
+      if (cancelled) return;
+      setEntries(res.ok ? res.data.entries : []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+
+  if (entries === null) {
+    return (
+      <div className="flex flex-col gap-3">
+        {[0, 1, 2].map((i) => (
+          <Skeleton key={i} className="h-14 rounded-xl" />
+        ))}
+      </div>
+    );
+  }
+
+  if (entries.length === 0) {
+    return (
+      <EmptyState
+        icon={<Sparkles aria-hidden="true" />}
+        title="No memory entries"
+        description="This agent has not stored anything in its private memory yet."
+      />
+    );
+  }
+
+  return (
+    <SectionCard title="Agent memory" headingLevel={2}>
+      <p className="text-xs text-muted-foreground">
+        Private to this agent — shown for oversight, not editable.
+      </p>
+      <ul className="mt-4 flex flex-col divide-y divide-border">
+        {entries.map((mem) => (
+          <li key={mem.id} className="flex flex-col gap-1 py-2.5 first:pt-0 last:pb-0">
+            <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+              <code className="font-mono text-sm font-medium text-foreground">{mem.key}</code>
+              <span className="text-xs text-muted-foreground">
+                updated {formatRelative(mem.updatedAt)}
+              </span>
+              <span className="text-xs text-muted-foreground">{formatBytes(mem.sizeBytes)}</span>
+            </div>
+            <code className="block truncate rounded bg-muted px-2 py-1 font-mono text-xs text-muted-foreground">
+              {mem.valuePreview}
+            </code>
+          </li>
+        ))}
+      </ul>
+    </SectionCard>
+  );
+}
+
 // ── Loading skeleton ────────────────────────────────────────────────────────────
 
 function PageSkeleton() {
   return (
-    <div className="flex flex-col gap-4">
-      <Skeleton className="h-4 w-36" />
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <Skeleton className="h-8 w-48" />
-          <Skeleton className="h-6 w-16" />
-          <Skeleton className="h-6 w-20" />
+    <div className="flex flex-col gap-6">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex flex-col gap-2">
+          <Skeleton className="h-8 w-48 rounded-lg" />
+          <Skeleton className="h-4 w-64 rounded-lg" />
         </div>
         <div className="flex gap-2">
           <Skeleton className="h-8 w-20" />
-          <Skeleton className="h-8 w-20" />
+          <Skeleton className="h-8 w-9" />
         </div>
       </div>
-      <Skeleton className="h-[70vh] w-full" />
+      <div className="flex gap-8">
+        <div className="hidden w-44 shrink-0 flex-col gap-1 sm:flex">
+          {[1, 2, 3, 4, 5, 6].map((i) => (
+            <Skeleton key={i} className="h-9 rounded-lg" />
+          ))}
+        </div>
+        <div className="min-w-0 flex-1">
+          <Skeleton className="h-64 rounded-xl" />
+        </div>
+      </div>
     </div>
   );
-}
-
-// ── Relative time helper ────────────────────────────────────────────────────────
-
-function formatRelative(dateStr: string): string {
-  const diff = Date.now() - new Date(dateStr).getTime();
-  const s = Math.floor(diff / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return new Date(dateStr).toLocaleDateString();
 }
 
 // ── Page ────────────────────────────────────────────────────────────────────────
@@ -112,9 +171,9 @@ export default function AgentDetailPage() {
   const searchParams = useSearchParams();
 
   // Deep-link support for the `waddling_request_access` MCP tool: ?section= jumps to a
-  // section, ?propose= carries a base64url access proposal that the Access editor overlays
-  // as a pending diff. A proposal with no explicit section opens straight on Access.
-  const sectionParam = searchParams.get('section');
+  // section (handled natively by DetailLayout), ?propose= carries a base64url access
+  // proposal that the Access editor overlays as a pending diff. A proposal with no
+  // explicit section opens straight on Access (via defaultSection).
   const proposeParam = searchParams.get('propose');
   const proposed = useMemo(
     () => (proposeParam ? decodeProposal(proposeParam) : null),
@@ -133,11 +192,6 @@ export default function AgentDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [suspending, setSuspending] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
-  // Active section (controlled) so the No-access banner can jump straight to Access,
-  // and so a request-access deep link can open directly on the requested section.
-  const [activeSection, setActiveSection] = useState(
-    () => sectionParam ?? (proposeParam ? 'access' : 'overview'),
-  );
 
   const agentId = params.id;
 
@@ -175,7 +229,9 @@ export default function AgentDetailPage() {
     setLoading(false);
   }, [agentId]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   const handleSuspendResume = async () => {
     if (!agent) return;
@@ -186,7 +242,7 @@ export default function AgentDetailPage() {
     if (res.ok) {
       toast.success(newStatus === 'suspended' ? 'Agent suspended' : 'Agent resumed');
       // Optimistic update, then re-fetch
-      setAgent((a) => a ? { ...a, status: newStatus } : a);
+      setAgent((a) => (a ? { ...a, status: newStatus } : a));
       void load();
     } else {
       toast.error(`Failed: ${res.error}`);
@@ -206,51 +262,6 @@ export default function AgentDetailPage() {
       toast.error(`Failed to delete agent: ${res.error}`);
     }
   };
-
-  // ── Section registry ─────────────────────────────────────────────────────────
-
-  // The Access section IS the editor (no read-only table, no modal); a `fill` section
-  // so AgentAccess/AccessEditor owns its own scrolling. Closes over `proposed` so a
-  // request-access deep link surfaces as a pending diff.
-  const AccessSectionBody = useCallback(
-    ({ agentId: id }: { agentId: string }) => <AgentAccess agentId={id} proposed={proposed} />,
-    [proposed],
-  );
-
-  const sections: AgentSection[] = [
-    {
-      id: 'overview',
-      label: 'Overview',
-      icon: Info,
-      Component: OverviewSection,
-    },
-    {
-      id: 'access',
-      label: 'Access',
-      icon: ShieldCheck,
-      fill: true,
-      Component: AccessSectionBody,
-    },
-    {
-      id: 'keys',
-      label: 'Keys',
-      icon: KeyRound,
-      badge: keyCount > 0 ? keyCount : null,
-      Component: KeysSection,
-    },
-    {
-      id: 'sessions',
-      label: 'Sessions',
-      icon: Radio,
-      Component: SessionsSection,
-    },
-    {
-      id: 'activity',
-      label: 'Activity',
-      icon: ScrollText,
-      Component: ActivitySection,
-    },
-  ];
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
@@ -282,100 +293,144 @@ export default function AgentDetailPage() {
   const isActive = agent.status === 'active';
   const isSuspended = agent.status === 'suspended';
 
+  // ── Section registry ─────────────────────────────────────────────────────────
+  // Each section's content is a real, self-fetching capability module (prop
+  // contract `{ agentId }`), so the sub-rail stays a thin presentation layer.
+  const sections: DetailSection[] = [
+    {
+      id: 'overview',
+      label: 'Overview',
+      content: <OverviewSection agentId={agentId} />,
+    },
+    {
+      id: 'access',
+      label: 'Access',
+      badge: grantCount > 0 ? grantCount : undefined,
+      // The Access editor owns its own internal scroll (`h-full min-h-0`), so it
+      // needs a bounded-height parent — DetailLayout renders in normal page flow.
+      content: (
+        <div className="h-[calc(100vh-16rem)] min-h-[28rem]">
+          <AgentAccess agentId={agentId} proposed={proposed} />
+        </div>
+      ),
+    },
+    {
+      id: 'keys',
+      label: 'Keys',
+      badge: keyCount > 0 ? keyCount : undefined,
+      content: <KeysSection agentId={agentId} />,
+    },
+    {
+      id: 'sessions',
+      label: 'Sessions',
+      badge:
+        agent.activeSessions && agent.activeSessions > 0 ? agent.activeSessions : undefined,
+      content: <SessionsSection agentId={agentId} />,
+    },
+    {
+      id: 'memory',
+      label: 'Memory',
+      content: <MemorySection agentId={agentId} />,
+    },
+    {
+      id: 'activity',
+      label: 'Activity',
+      content: <ActivitySection agentId={agentId} />,
+    },
+  ];
+
   return (
-    // Bound the page to the viewport (below the sticky header + page padding) so the
-    // section content area — not the page — is what scrolls, consistently for every
-    // section. Header + banner are auto-height; the panel region takes the rest.
-    <div className="flex min-h-0 flex-col gap-4 h-[calc(100vh-var(--header-height)-3rem)]">
-      {/* Header (breadcrumb lives in the top navbar — see useBreadcrumbLabel below) */}
-      <div className="flex items-start justify-between gap-4">
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-center gap-2.5 flex-wrap">
-            <h1 className="text-2xl font-semibold tracking-tight">{agent.name}</h1>
-            <StatusBadge status={agent.status} />
-            <StatusBadge status={agent.mode} />
-          </div>
-          {agent.lastSeenAt ? (
-            <p className="text-sm text-muted-foreground">
-              last seen {formatRelative(agent.lastSeenAt)}
-            </p>
-          ) : (
-            <p className="text-sm text-muted-foreground">never seen</p>
-          )}
-        </div>
-
-        {/* Header actions */}
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setConnectOpen(true)}
-          >
-            Connect
-          </Button>
-
-          {isActive ? (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={suspending}
-              onClick={() => void handleSuspendResume()}
-            >
-              {suspending ? 'Suspending…' : 'Suspend'}
-            </Button>
-          ) : isSuspended ? (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={suspending}
-              onClick={() => void handleSuspendResume()}
-            >
-              {suspending ? 'Resuming…' : 'Resume'}
-            </Button>
-          ) : null}
-
-          {/* ⋯ menu — Delete */}
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" aria-label="More actions">
-                <EllipsisVertical className="size-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem
-                className="whitespace-nowrap text-destructive focus:text-destructive"
-                onClick={() => setDeleteOpen(true)}
-              >
-                <Trash2 className="mr-2 size-4" />
-                Delete agent
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-      </div>
-
-      {/* No-access banner (shown only when: active + 0 grants, only after data loaded) */}
+    <div className="flex flex-col gap-4">
+      {/* No-access banner (active + 0 grants, only after data loaded). The CTA is a
+          link because DetailLayout is URL-driven (?section=) — no controlled state. */}
       {showBanner && (
         <NoAccessBanner
           action={
-            <Button size="sm" onClick={() => setActiveSection('access')}>
-              Grant access
+            <Button size="sm" asChild>
+              <Link href="?section=access" scroll={false}>
+                Grant access
+              </Link>
             </Button>
           }
         />
       )}
 
-      {/* Workspace panel — the canonical frame; fills remaining height so the
-          active section's content (not the page) scrolls. */}
-      <div className="flex min-h-0 flex-1 flex-col">
-        <WorkspacePanel
-          sections={sections}
-          agentId={agentId}
-          activeId={activeSection}
-          onSelect={setActiveSection}
-          className="flex-1"
-        />
-      </div>
+      <DetailLayout
+        title={agent.name}
+        status={agentSemanticStatus(agent)}
+        // A proposal deep-link opens straight on Access; otherwise Overview.
+        defaultSection={proposeParam ? 'access' : 'overview'}
+        meta={
+          <>
+            <span className="flex items-center gap-1">
+              <User className="size-3.5" aria-hidden="true" />
+              {agent.owner ?? 'No owner'}
+            </span>
+            <ModeChip mode={agent.mode} />
+            {agent.lastSeenAt ? (
+              <span className="flex items-center gap-1">
+                <Clock className="size-3.5" aria-hidden="true" />
+                {formatRelative(agent.lastSeenAt)}
+              </span>
+            ) : (
+              <span className="text-muted-foreground">never seen</span>
+            )}
+            <Link
+              href="/agents"
+              className="ml-auto flex items-center gap-1 rounded text-xs hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label="Back to Agents roster"
+            >
+              <ChevronLeft className="size-3.5" aria-hidden="true" />
+              Agents
+            </Link>
+          </>
+        }
+        actions={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setConnectOpen(true)}>
+              Connect
+            </Button>
+
+            {isActive ? (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={suspending}
+                onClick={() => void handleSuspendResume()}
+              >
+                {suspending ? 'Suspending…' : 'Suspend'}
+              </Button>
+            ) : isSuspended ? (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={suspending}
+                onClick={() => void handleSuspendResume()}
+              >
+                {suspending ? 'Resuming…' : 'Resume'}
+              </Button>
+            ) : null}
+
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" aria-label="More actions">
+                  <EllipsisVertical className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  className="whitespace-nowrap text-destructive focus:text-destructive"
+                  onClick={() => setDeleteOpen(true)}
+                >
+                  <Trash2 className="mr-2 size-4" />
+                  Delete agent
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </>
+        }
+        sections={sections}
+      />
 
       {/* Connect dialog */}
       <ConnectDialog
@@ -392,26 +447,16 @@ export default function AgentDetailPage() {
             <DialogTitle>Delete agent</DialogTitle>
             <DialogDescription>
               This will permanently delete{' '}
-              <span className="font-mono font-medium text-foreground">
-                {agent.name}
-              </span>{' '}
-              and kill all active sessions. This action cannot be undone.
+              <span className="font-mono font-medium text-foreground">{agent.name}</span> and kill
+              all active sessions. This action cannot be undone.
             </DialogDescription>
           </DialogHeader>
           <Separator />
           <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setDeleteOpen(false)}
-              disabled={deleting}
-            >
+            <Button variant="outline" onClick={() => setDeleteOpen(false)} disabled={deleting}>
               Cancel
             </Button>
-            <Button
-              variant="destructive"
-              onClick={() => void handleDelete()}
-              disabled={deleting}
-            >
+            <Button variant="destructive" onClick={() => void handleDelete()} disabled={deleting}>
               <Trash2 data-icon="inline-start" />
               {deleting ? 'Deleting…' : 'Delete agent'}
             </Button>

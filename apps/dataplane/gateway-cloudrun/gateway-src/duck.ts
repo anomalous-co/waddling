@@ -203,7 +203,12 @@ export async function bootDuckRuntime(
   // ducklake/postgres/fts here), so the INSTALLs below are local cache hits, not network
   // downloads — the single biggest cold-boot win. Same dir + same node-api version as the
   // build ⇒ the <dir>/v<ver>/<platform>/ path matches.
-  const instance = await DuckDBInstance.create(config.databasePath, {
+  // Encrypted workspace: open ':memory:' and ATTACH the durable file ENCRYPTED below (a file
+  // cannot be opened encrypted directly — encryption is an ATTACH option). Every other mode
+  // (lake ':memory:', quackboard/plaintext-workspace file) opens config.databasePath directly.
+  const encryptedWorkspace = config.workspaceMode && !!config.encryptionKey;
+  const openPath = encryptedWorkspace ? ":memory:" : config.databasePath;
+  const instance = await DuckDBInstance.create(openPath, {
     allow_unsigned_extensions: "true",
     extension_directory: process.env.DUCKDB_EXTENSION_DIR || "/opt/duckdb-extensions",
   });
@@ -243,11 +248,31 @@ export async function bootDuckRuntime(
     // birdshot hooks + quack_serve below. Idempotent — a no-op on a restored db.
     await bootstrapQuackboardSchema(connection);
     mark("quackboard-schema");
+  } else if (config.workspaceMode && config.encryptionKey) {
+    // Encrypted workspace: the instance was opened ':memory:'; ATTACH the durable file
+    // ENCRYPTED and USE it, mirroring apps/dataplane/workspace/sidecar/workspace-sidecar.mjs.
+    // httpfs MUST be loaded before the encrypted ATTACH (it provides the OpenSSL crypto
+    // provider). S1: disabled_filesystems is set AFTER httpfs and BEFORE the ATTACH — it is
+    // append-only/irreversible and blocks read_csv/read_parquet exfil over http:// and s3://,
+    // while quack's own HTTP transport and local .duckdb access keep working (proven by the
+    // sidecar). The catalog alias is KNOWN to be 'w' (we chose it), so hardcode USE w +
+    // lakeAlias='w' and SKIP the duckdb_databases() discovery: opening ':memory:' leaves a
+    // non-internal 'memory' catalog that sorts before 'w' and would be mis-picked by the
+    // ORDER BY database_name discovery.
+    await connection.run("LOAD httpfs;");
+    await connection.run("SET disabled_filesystems='HTTPFileSystem,S3FileSystem';");
+    await connection.run(
+      `ATTACH ${q(config.databasePath)} AS w (ENCRYPTION_KEY ${q(config.encryptionKey)})`,
+    );
+    await connection.run("USE w");
+    config.lakeAlias = "w";
+    console.log(`[gateway] encrypted workspace attached as w, lakeAlias=w`);
+    mark("workspace-open-encrypted");
   } else if (config.workspaceMode) {
-    // Workspace mode: durable .duckdb file opened directly (like quackboard) but the schema
-    // is EMPTY — agent DDL creates its own tables. Discover the catalog name (derived from
-    // the file basename) and set it so birdshot's bind-walk and quack's serving connections
-    // resolve bare refs against the right catalog. No FTS, no coordination schema.
+    // Plaintext workspace (back-compat, no encryption key): durable .duckdb file opened directly
+    // (like quackboard) but the schema is EMPTY — agent DDL creates its own tables. Discover the
+    // catalog name (derived from the file basename) and set it so birdshot's bind-walk and
+    // quack's serving connections resolve bare refs against the right catalog. No FTS, no schema.
     const dbReader = await connection.runAndReadAll(
       "SELECT database_name FROM duckdb_databases() WHERE internal = false ORDER BY database_name",
     );

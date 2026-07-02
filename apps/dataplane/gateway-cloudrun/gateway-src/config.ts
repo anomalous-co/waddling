@@ -63,6 +63,13 @@ export interface GatewayConfig {
    */
   workspaceMode: boolean;
   /**
+   * Workspace encryption key (64 hex chars) for the durable .duckdb. When set in workspace
+   * mode the gateway opens ':memory:' and ATTACHes {@link databasePath} ENCRYPTED (OpenSSL via
+   * httpfs), so the file is encrypted at rest before it is uploaded to GCS. Empty ⇒ plaintext
+   * workspace open (back-compat). Unused outside workspace mode.
+   */
+  encryptionKey: string;
+  /**
    * DuckDB database to open. ':memory:' for a lake gateway (durable data lives in the
    * ATTACHed lake). An absolute file path for a quackboard or workspace — the durable .duckdb
    * the data plane restored from GCS/R2 — so quack serves its tables directly with no views.
@@ -140,6 +147,7 @@ export function loadGatewayConfig(): GatewayConfig {
 
     quackboard,
     workspaceMode,
+    encryptionKey: opt("WORKSPACE_ENCRYPTION_KEY", ""),
     databasePath: opt("DUCKDB_DATABASE_PATH", ":memory:"),
 
     // S3 creds are required only for an s3:// data path; in local mode they are unused.

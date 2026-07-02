@@ -139,14 +139,8 @@ export interface Env {
   R2_REGION: string;
 
   // ── Data plane ─────────────────────────────────────────────────────────────
-  // CF deploy: the waddling-dataplane Worker service binding (Fetcher).
-  // Node/Cloud Run: a stub Fetcher is provided by server.ts; real gateway traffic
-  // goes through GATEWAY_BASE_URL instead (via lib/gateway-client HTTP transport).
-  DATAPLANE: Fetcher;
-
-  // Base URL of the GCP Cloud Run gateway service (Node/Cloud Run path).
-  // When set, gateway-client sends /ctrl/* HTTP requests here instead of using the
-  // DATAPLANE service binding. Unset on CF (service binding handles routing).
+  // Base URL of the GCP Cloud Run gateway service. gateway-client sends /ctrl/*
+  // HTTP requests here (per-endpoint gateways override it with their own URL).
   GATEWAY_BASE_URL?: string;
 
   // Legacy: kept so an old wrangler var doesn't break typing.
@@ -156,6 +150,15 @@ export interface Env {
   // to deploy a per-datalake private gateway at create. Unset ⇒ no per-endpoint provisioning
   // (datalakes fall back to the single GATEWAY_BASE_URL bring-up gateway).
   PROVISIONER_URL?: string;
+
+  // Public router host suffix (e.g. 'getwaddling.com'). A workspace ATTACHes the lake via quack at
+  // gw-<lakeslug>.<ROUTER_HOST_SUFFIX>:443 — the public router forwards /quack to the private lake
+  // gateway (quack carries no OIDC header; the router mints it). Default 'getwaddling.com'.
+  ROUTER_HOST_SUFFIX?: string;
+
+  // Cloud Run URL suffix (project-constant '-<hash>-<region>.a.run.app'). Lets control-api address a
+  // per-(workspace,agent) workspace service by deterministic name without persisting its URL.
+  CLOUD_RUN_URL_SUFFIX?: string;
 
   // SendGrid API key (Node/Cloud Run transactional email path). When set, email.ts
   // sends via SendGrid HTTP before falling back to the CF EMAIL binding.

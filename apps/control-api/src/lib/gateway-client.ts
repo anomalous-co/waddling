@@ -1,12 +1,9 @@
 /**
- * Gateway control-channel HTTP client — dual-transport.
+ * Gateway control-channel HTTP client.
  *
- * CF deploy: `initDataplane(fetcher)` wires the DATAPLANE service binding; send()
- * routes through `fetcher.fetch('https://dataplane/gw/...')`.
- *
- * Node/Cloud Run: `initDataplane(url)` sets a base URL; send() issues plain HTTP
- * requests to `<baseUrl>/ctrl/...` (path prefix rewrite /gw/ → /ctrl/). Google
- * Cloud Run identity tokens are added automatically for https:// URLs.
+ * `initDataplane(url)` sets the base URL; send() issues plain HTTP requests to
+ * `<baseUrl>/ctrl/...` (path prefix rewrite /gw/ → /ctrl/). Google Cloud Run
+ * identity tokens are added automatically for https:// URLs.
  */
 import type { BirdshotSnapshot } from './types';
 
@@ -87,6 +84,31 @@ export interface GatewayStatus {
   version: number;
 }
 
+export interface GovernedLoadResult {
+  ok: boolean;
+  phase?: string;
+  authorizeDecision?: string;
+  error?: string | null;
+}
+
+export interface GatewayQueryResult {
+  ok: boolean;
+  rows: Record<string, unknown>[] | null;
+  rowCount: number | null;
+  error?: string | null;
+  authorizeDecision?: string | null;
+  phase?: string;
+}
+
+export interface RelayQueryResult {
+  ok: boolean;
+  columns?: string[];
+  rows: unknown[][] | null;
+  rowCount: number | null;
+  form?: 'A' | 'B' | null;
+  error?: string | null;
+}
+
 export class GatewayError extends Error {
   readonly status: number;
   constructor(message: string, status: number) {
@@ -132,18 +154,15 @@ async function getCloudRunAuthHeaders(
 // ── Client ───────────────────────────────────────────────────────────────────
 
 export interface GatewayClientOptions {
-  fetcher?: Fetcher;
   baseUrl?: string;
   timeoutMs?: number;
 }
 
 export class GatewayClient {
-  private readonly fetcher: Fetcher | undefined;
   private readonly baseUrl: string | undefined;
   private readonly timeoutMs: number;
 
   constructor(opts: GatewayClientOptions) {
-    this.fetcher = opts.fetcher;
     this.baseUrl = opts.baseUrl;
     this.timeoutMs = opts.timeoutMs ?? 10_000;
   }
@@ -157,35 +176,23 @@ export class GatewayClient {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs ?? this.timeoutMs);
     try {
-      let res: Response;
-      if (this.baseUrl !== undefined) {
-        // Node/Cloud Run HTTP path: rewrite /gw/ → /ctrl/
-        const ctrlPath = path.replace('/gw/', '/ctrl/');
-        const url = `${this.baseUrl}${ctrlPath}`;
-        const headers: Record<string, string> = { 'content-type': 'application/json' };
-        if (url.startsWith('https://')) {
-          const authHeaders = await getCloudRunAuthHeaders(this.baseUrl, url);
-          Object.assign(headers, authHeaders);
-        }
-        res = await fetch(url, {
-          method,
-          headers,
-          body: body === undefined ? undefined : JSON.stringify(body),
-          signal: ctrl.signal,
-        });
-      } else {
-        const f = this.fetcher;
-        if (!f) {
-          throw new GatewayError('gateway not initialized — call initDataplane before gatewayClientFor', 0);
-        }
-        // CF service-binding path: host is ignored by the binding.
-        res = await f.fetch(`https://dataplane${path}`, {
-          method,
-          headers: { 'content-type': 'application/json' },
-          body: body === undefined ? undefined : JSON.stringify(body),
-          signal: ctrl.signal,
-        });
+      if (this.baseUrl === undefined) {
+        throw new GatewayError('gateway not initialized — call initDataplane before gatewayClientFor', 0);
       }
+      // Rewrite /gw/ → /ctrl/ for the Cloud Run gateway HTTP surface.
+      const ctrlPath = path.replace('/gw/', '/ctrl/');
+      const url = `${this.baseUrl}${ctrlPath}`;
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (url.startsWith('https://')) {
+        const authHeaders = await getCloudRunAuthHeaders(this.baseUrl, url);
+        Object.assign(headers, authHeaders);
+      }
+      const res = await fetch(url, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: ctrl.signal,
+      });
       if (!res.ok) {
         const detail = await res.text().catch(() => '');
         throw new GatewayError(
@@ -219,7 +226,15 @@ export class GatewayClient {
   }
 
   catalog(datalakeId: string): Promise<GatewayCatalog> {
-    return this.send<GatewayCatalog>('POST', '/gw/catalog', { endpointId: datalakeId }, 45_000);
+    // The Cloud Run gateway serves /ctrl/catalog as GET (entrypoint.mjs); on a per-endpoint gateway
+    // the URL already selects the endpoint, so endpointId rides as a query param (inert there, used
+    // by the CF worker binding).
+    return this.send<GatewayCatalog>(
+      'GET',
+      `/gw/catalog?endpointId=${encodeURIComponent(datalakeId)}`,
+      undefined,
+      45_000,
+    );
   }
 
   revoke(req: RevokeRequest): Promise<GatewayAck> {
@@ -274,6 +289,54 @@ export class GatewayClient {
   clearSnapshot(datalakeId: string): Promise<{ ok: boolean; markedStale: number; version: number }> {
     return this.send('POST', '/gw/pool/clear-snapshot', { endpointId: datalakeId });
   }
+
+  // ── Data-path methods ─────────────────────────────────────────────────────
+  // These paths carry no '/gw/' segment, so send()'s /gw/→/ctrl/ rewrite leaves
+  // them intact; per-audience Cloud Run OIDC headers are still applied. The
+  // caller picks the target by constructing the client with the right baseUrl
+  // via gatewayClientFor({ gateway_url }).
+
+  governedLoad(token: string, sql: string): Promise<GovernedLoadResult> {
+    return this.send<GovernedLoadResult>('POST', '/governed-load', { token, sql }, 60_000);
+  }
+
+  lakeQuery(token: string, sql: string): Promise<GatewayQueryResult> {
+    return this.send<GatewayQueryResult>('POST', '/query', { token, sql }, 60_000);
+  }
+
+  // Quackboard gated query: authorize the agent's statement, then run it on the gateway's TRUSTED
+  // connection (which owns the served quackboard db). Handles unqualified reads AND writes — unlike
+  // /query, whose read-only quack-ATTACH-as-lake path can't resolve bare names or persist writes.
+  qbGatedQuery(token: string, sql: string): Promise<GatewayQueryResult> {
+    return this.send<GatewayQueryResult>('POST', '/qb-query', { token, sql }, 60_000);
+  }
+
+  relayQuery(sql: string): Promise<RelayQueryResult> {
+    return this.send<RelayQueryResult>('POST', '/relay-query', { sql }, 60_000);
+  }
+
+  configureLake(args: { lakeProxy: string; lakeToken: string; disableSsl?: boolean }): Promise<{ ok: boolean; lakeAttached?: boolean; error?: string }> {
+    return this.send('POST', '/ctrl/configure-lake', { lakeProxy: args.lakeProxy, lakeToken: args.lakeToken, disableSsl: args.disableSsl ?? false }, 45_000);
+  }
+
+  checkpointWorkspace(): Promise<{ ok: boolean; error?: string }> {
+    return this.send('POST', '/ctrl/checkpoint', {}, 45_000);
+  }
+
+  qbRemember(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-remember', body);
+  }
+  qbMine(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-mine', body);
+  }
+  qbRecall(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-recall', body);
+  }
+
+  // Generic escape hatch for any other /ctrl/* route without a dedicated method.
+  post<T>(path: string, body?: unknown, timeoutMs?: number): Promise<T> {
+    return this.send<T>('POST', path, body, timeoutMs);
+  }
 }
 
 export interface GatewayAuditRecord {
@@ -288,33 +351,27 @@ export interface GatewayAuditRecord {
 
 // ── Module-level singleton transport ─────────────────────────────────────────
 
-let _fetcher: Fetcher | undefined;
 let _baseUrl: string | undefined;
 
 /**
  * Initialize the gateway transport. Idempotent — first call wins.
  *
- * Pass a URL string for Node/Cloud Run (HTTP transport to /ctrl/* paths).
- * Pass a Fetcher for CF workerd (service-binding transport to /gw/* paths).
+ * Pass the base URL of the Cloud Run gateway (HTTP transport to /ctrl/* paths).
  */
-export function initDataplane(input: Fetcher | string): void {
-  if (_fetcher !== undefined || _baseUrl !== undefined) return;
-  if (typeof input === 'string') {
-    if (input) _baseUrl = input.replace(/\/$/, '');
-  } else {
-    _fetcher = input;
-  }
+export function initDataplane(input: string | undefined): void {
+  if (_baseUrl !== undefined) return;
+  if (input) _baseUrl = input.replace(/\/$/, '');
 }
 
 // Resolve the gateway for a given datalake. Per-endpoint gateways carry their own Cloud Run
 // URL (datalake.gateway_url, set by the provisioner at create); when present it is the target
 // (and its own identity-token audience). Falls back to the module GATEWAY_BASE_URL (single-
-// gateway bring-up) or the CF service binding for legacy/unprovisioned endpoints.
+// gateway bring-up) for unprovisioned endpoints.
 export function gatewayClientFor(_endpoint?: {
   server_token?: string;
   ctrl_port?: number | null;
   gateway_url?: string | null;
 }): GatewayClient {
   const baseUrl = _endpoint?.gateway_url || _baseUrl;
-  return new GatewayClient({ fetcher: _fetcher, baseUrl });
+  return new GatewayClient({ baseUrl });
 }

@@ -68,6 +68,9 @@ function TableRow({ className, ...props }: React.ComponentProps<"tr">) {
 function TableHead({ className, ...props }: React.ComponentProps<"th">) {
   return (
     <th
+      // Column-header semantics by default (WCAG 1.3.1); TableHead is always a
+      // header cell inside <thead>. Overridable via an explicit `scope` prop.
+      scope="col"
       data-slot="table-head"
       className={cn(
         "h-10 px-2 text-left align-middle font-medium whitespace-nowrap text-foreground [&:has([role=checkbox])]:pr-0",

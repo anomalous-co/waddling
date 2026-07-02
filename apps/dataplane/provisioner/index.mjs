@@ -38,10 +38,16 @@ async function api(method, url, body) {
 
 // Build the google.cloud.run.v2.Service body, cloning the bringup template (max=1, cpu always-on,
 // gen2, cloudsql socket, gateway SA) and injecting this datalake's plain env + the shared PEM secrets.
-function serviceBody(envMap, secretEnvMap) {
+//
+// kind 'workspace' opens an encrypted durable .duckdb (restored/persisted to GCS) and relays the lake
+// over the public router — it has NO Cloud SQL catalog and NO libpq mTLS, so its body OMITS the shared
+// PEM secrets and the cloudsql-instances annotation. kind 'gateway' (default) is unchanged.
+function serviceBody(envMap, secretEnvMap, kind = "gateway") {
+  const isWorkspace = kind === "workspace";
   const env = [
     ...Object.entries(envMap ?? {}).map(([name, value]) => ({ name, value: String(value) })),
-    ...Object.entries({ ...PEM_SECRETS, ...(secretEnvMap ?? {}) }).map(([name, secret]) => ({
+    // Workspaces have no libpq client cert; only inject the shared PEM secrets for gateways.
+    ...Object.entries({ ...(isWorkspace ? {} : PEM_SECRETS), ...(secretEnvMap ?? {}) }).map(([name, secret]) => ({
       name,
       valueSource: { secretKeyRef: { secret, version: "latest" } },
     })),
@@ -51,7 +57,8 @@ function serviceBody(envMap, secretEnvMap) {
       scaling: { minInstanceCount: 0, maxInstanceCount: 1 },
       serviceAccount: GATEWAY_SA,
       executionEnvironment: "EXECUTION_ENVIRONMENT_GEN2",
-      annotations: { "run.googleapis.com/cloudsql-instances": CLOUDSQL_INSTANCE },
+      // Workspaces don't reach Cloud SQL, so they get no cloudsql-instances annotation.
+      ...(isWorkspace ? {} : { annotations: { "run.googleapis.com/cloudsql-instances": CLOUDSQL_INSTANCE } }),
       containers: [
         {
           image: GATEWAY_IMAGE,
@@ -80,10 +87,11 @@ async function waitOperation(opName) {
   throw new Error("operation timed out after 240s");
 }
 
-async function provision(slug, envMap, secretEnvMap) {
-  const service = `gw-${slug}`;
+async function provision(slug, envMap, secretEnvMap, kind = "gateway") {
+  // Workspaces deploy as ws-<slug>; gateways as gw-<slug>.
+  const service = `${kind === "workspace" ? "ws" : "gw"}-${slug}`;
   const svcPath = `${parent}/services/${service}`;
-  const body = serviceBody(envMap, secretEnvMap);
+  const body = serviceBody(envMap, secretEnvMap, kind);
 
   // create-or-update (idempotent): GET → PATCH if exists, else POST with serviceId.
   const existing = await api("GET", `${API}/${svcPath}`);
@@ -123,11 +131,13 @@ const server = http.createServer((req, res) => {
   req.on("data", (c) => (raw += c));
   req.on("end", async () => {
     try {
-      const { slug, env: envMap, secretEnv } = JSON.parse(raw || "{}");
+      const { slug, env: envMap, secretEnv, kind: rawKind } = JSON.parse(raw || "{}");
       if (!slug || !/^[a-z0-9-]+$/.test(slug)) return send(400, { error: "invalid slug" });
       if (!GATEWAY_IMAGE || !GATEWAY_SA) return send(500, { error: "provisioner misconfigured: GATEWAY_IMAGE/GATEWAY_SA unset" });
-      log(`provision gw-${slug} (${Object.keys(envMap ?? {}).length} env)`);
-      const out = await provision(slug, envMap, secretEnv);
+      const kind = rawKind === "workspace" ? "workspace" : "gateway";
+      const prefix = kind === "workspace" ? "ws" : "gw";
+      log(`provision ${prefix}-${slug} (${Object.keys(envMap ?? {}).length} env)`);
+      const out = await provision(slug, envMap, secretEnv, kind);
       log(`provisioned ${out.service} → ${out.url}`);
       send(200, { ok: true, ...out });
     } catch (e) {

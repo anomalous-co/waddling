@@ -106,7 +106,7 @@ export async function refreshWarmCatalogs(
   env: Env,
 ): Promise<{ scanned: number; warm: number; changed: number }> {
   const { rows } = await query<CatalogEndpoint>(
-    `SELECT id, org_id, status, server_token
+    `SELECT id, org_id, status, server_token, gateway_url
        FROM waddling.datalake WHERE status = 'running'`,
   );
   let warm = 0;
@@ -198,7 +198,7 @@ export function kickDispatch(
   }
   if (!ctx) return;
   ctx.waitUntil(
-    runInDbScope(undefined, c.env.HYPERDRIVE.connectionString, async () => {
+    runInDbScope(undefined, c.env.HYPERDRIVE?.connectionString ?? c.env.DATABASE_URL ?? '', async () => {
       await drainGatewayDispatch(c.env, { onlyDatalakeId: datalakeId });
     }).catch(() => {
       /* best-effort fast path; the cron drain retries */
@@ -218,13 +218,13 @@ interface DispatchRow {
  * Deliver due dispatch rows (snapshots + revokes) to the gateway, with exponential
  * backoff on failure. Called by the control-api 5-minute cron (whole backlog) and by
  * kickDispatch (one datalake, immediately after an edit). Must run inside a DB scope;
- * initialises the DATAPLANE binding itself (idempotent) so it works from cron too.
+ * initialises the gateway transport itself (idempotent) so it works from cron too.
  */
 export async function drainGatewayDispatch(
   env: Env,
   opts: { onlyDatalakeId?: string; limit?: number } = {},
 ): Promise<{ delivered: number; failed: number }> {
-  initDataplane(env.DATAPLANE);
+  initDataplane(env.GATEWAY_BASE_URL);
   const { onlyDatalakeId, limit = DRAIN_BATCH } = opts;
 
   const due = await query<DispatchRow>(
