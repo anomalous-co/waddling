@@ -15,7 +15,7 @@ import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
 import { resolveCaller, handle, ok, err, assertOrg } from '../lib/cp-shared';
-import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
+import { grantsForKey, agentSubject } from '../lib/grant-store';
 import type { SessionGrant, WhoamiResult } from '../lib/types';
 
 export const whoami = new Hono<{ Bindings: Env }>();
@@ -28,7 +28,7 @@ interface SessionRow {
   expires_at: string;
 }
 
-const EMPTY_GRANT: SessionGrant = { tables: [] };
+const EMPTY_GRANT: SessionGrant = { statements: [] };
 
 whoami.get('/', (c) =>
   handle(c, async () => {
@@ -69,16 +69,11 @@ whoami.get('/', (c) =>
       name = a.name;
     }
 
-    // Grants are per-(datalake, agent): only meaningful when both are known.
+    // Grants are per-(datalake, agent): only meaningful when both are known. The literal
+    // GRANT/DENY SQL for the agent's key (subject ∪ PUBLIC ∪ transitive roles), verbatim.
     let grants: SessionGrant = EMPTY_GRANT;
     if (agentId && datalakeId) {
-      const ruleRows = await query<AclRuleRow>(
-        `SELECT * FROM waddling.acl_rule
-          WHERE datalake_id = $1 AND (agent_id = $2 OR agent_id IS NULL)`,
-        [datalakeId, agentId],
-      );
-      const compiled = compilePolicy(ruleRows.rows, new Date());
-      grants = grantsForAgent(compiled, agentId);
+      grants = { statements: await grantsForKey(datalakeId, agentSubject(agentId)) };
     }
 
     const result: WhoamiResult = {

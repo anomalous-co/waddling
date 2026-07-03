@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { Dashboard } from "@/components/dashboard";
 import { Badge } from "@/components/ui/badge";
 import type { InstanceInfo } from "@/lib/types";
@@ -21,6 +22,12 @@ export default function Home() {
             PGlite × DuckDB <span className="font-mono">quack</span> analytics
           </h1>
           <Badge variant="secondary">Instance {info.instance}</Badge>
+          <Link
+            href="/agents"
+            className="ml-auto text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+          >
+            Agents →
+          </Link>
         </div>
         <p className="max-w-2xl text-sm text-muted-foreground">
           Each instance stores todos in its own PGlite database and exposes them

@@ -608,7 +608,6 @@ app.get("/probe/gw-push", async (c) => {
     const ack = await gatewayClientFor().pushSnapshot({
       datalakeId: "probe",
       auth: { issuer: "probe-iss", audience: "gw:probe", mode: "rs256", jwks: [] },
-      snapshot: { userRoles: [{ userId: "agent:probe", role: "r1" }], roleGrants: [{ role: "r1", tableRef: "main.probe_t", action: "read" }] },
       lakeCatalog: "lake",
     });
     return c.json({ ok: true, ack });

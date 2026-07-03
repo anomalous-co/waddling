@@ -5,15 +5,19 @@
  * `<baseUrl>/ctrl/...` (path prefix rewrite /gw/ → /ctrl/). Google Cloud Run
  * identity tokens are added automatically for https:// URLs.
  */
-import type { BirdshotSnapshot } from './types';
-
 // ── Request payloads ────────────────────────────────────────────────────────────
 
+// CONFIG-ONLY gateway boot (spec §13 pull model). The gateway no longer receives compiled
+// grant tuples — birdshot PULLS literal GRANT/DENY SQL from the ATTACHed Postgres store and
+// freshness-validates it itself. So the "snapshot" push carries only scalar config: auth
+// (issuer/audience/JWKS), the lake catalog alias, and the read-only grant-store DSN + scope.
 export interface SnapshotRequest {
   datalakeId: string;
   auth: { issuer: string; audience: string; mode: 'rs256'; jwks: BirdshotJwk[] };
-  snapshot: BirdshotSnapshot;
   lakeCatalog?: string;
+  /** Read-only Postgres DSN the gateway ATTACHes as the protected `__birdshot` catalog +
+   *  points birdshot's grant store at (scoped to `datalakeId`). Undefined ⇒ no store ATTACH. */
+  grantStoreDsn?: string;
   gatewayBoot?: GatewayBoot;
 }
 

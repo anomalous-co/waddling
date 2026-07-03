@@ -52,11 +52,10 @@ async function main(): Promise<void> {
 
   const { publicKey, privateKey } = await generateKeyPair("RS256", { extractable: true });
   const pub = await exportJWK(publicKey);
-  await applySnapshot(
-    rt,
-    { userRoles: [{ userId: PRINCIPAL, role: "r1" }], roleGrants: [{ role: "r1", tableRef: "main.allowed", action: "read" }] },
-    { issuer: ISSUER, audience: AUD, jwks: [{ kid: KID, n: pub.n!, e: pub.e! }] },
-  );
+  // Pull-model (spec §13): applySnapshot is CONFIG-only; grants come from the store, not here.
+  await applySnapshot(rt, {
+    auth: { issuer: ISSUER, audience: AUD, jwks: [{ kid: KID, n: pub.n!, e: pub.e! }] },
+  });
   const jwt = await new SignJWT({ id: PRINCIPAL, mode: "service", cap: "connect" })
     .setProtectedHeader({ alg: "RS256", kid: KID })
     .setSubject(PRINCIPAL).setIssuer(ISSUER).setAudience(AUD)

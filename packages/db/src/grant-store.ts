@@ -14,6 +14,33 @@ export interface Pg {
   query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
 }
 
+/**
+ * Optional store scoping. The default (no scope) targets an unqualified, un-scoped
+ * `__birdshot_grants`/`__birdshot_meta` — the standalone/test backend (one store per
+ * process, single epoch row), exactly what the pglite e2e uses.
+ *
+ * In the SHARED control DB one store serves every datalake, so a scope supplies:
+ *  - `datalake`     — written into a `datalake` column on every row and used to
+ *                     filter reads/version/epoch (mirrors birdshot's scoped pull,
+ *                     `WHERE ... AND datalake = ?`).
+ *  - `grantsTable`  — qualified name, e.g. `public.__birdshot_grants` (default
+ *                     `__birdshot_grants`). Caller-controlled constant, never user input.
+ *  - `metaTable`    — qualified `public.__birdshot_meta` (default `__birdshot_meta`).
+ *                     Scoped mode keeps ONE epoch row per datalake (`ON CONFLICT (datalake)`).
+ */
+export interface StoreScope {
+  datalake?: string;
+  grantsTable?: string;
+  metaTable?: string;
+}
+
+function grantsTableOf(scope?: StoreScope): string {
+  return scope?.grantsTable ?? "__birdshot_grants";
+}
+function metaTableOf(scope?: StoreScope): string {
+  return scope?.metaTable ?? "__birdshot_meta";
+}
+
 // ---- statement builders (canonical, human-readable — this text is shown in the UI) ----
 
 export type Grantee = { role: string } | { subject: string } | "public";
@@ -88,16 +115,36 @@ export function deriveGrantee(stmt: string): { grantee_kind: "subject" | "role" 
  * transaction, so birdshot's next authorize re-hydrates and reflects it. REVOKE/UNDENY
  * are appended rows (never deletions) so re-hydration applies them in order (§12f).
  */
-export async function applyStatement(db: Pg, stmt: string): Promise<void> {
+export async function applyStatement(db: Pg, stmt: string, scope?: StoreScope): Promise<void> {
   const { grantee_kind, grantee } = deriveGrantee(stmt);
+  const grants = grantsTableOf(scope);
+  const meta = metaTableOf(scope);
+  const dl = scope?.datalake;
   await db.query("BEGIN");
   try {
-    await db.query(
-      `INSERT INTO __birdshot_grants (grantee_kind, grantee, stmt, version)
-       VALUES ($1, $2, $3, (SELECT COALESCE(MAX(version), 0) + 1 FROM __birdshot_grants))`,
-      [grantee_kind, grantee, stmt],
-    );
-    await db.query("UPDATE __birdshot_meta SET epoch = epoch + 1");
+    if (dl != null) {
+      // Scoped (shared control DB): the row carries its datalake, version is monotonic
+      // PER datalake, and the epoch is one row per datalake (upserted + bumped).
+      await db.query(
+        `INSERT INTO ${grants} (datalake, grantee_kind, grantee, stmt, version)
+         VALUES ($1, $2, $3, $4,
+           (SELECT COALESCE(MAX(version), 0) + 1 FROM ${grants} WHERE datalake = $1))`,
+        [dl, grantee_kind, grantee, stmt],
+      );
+      await db.query(
+        `INSERT INTO ${meta} (datalake, epoch) VALUES ($1, 1)
+         ON CONFLICT (datalake) DO UPDATE SET epoch = ${meta}.epoch + 1`,
+        [dl],
+      );
+    } else {
+      // Unscoped (standalone/tests): single global version + single epoch row.
+      await db.query(
+        `INSERT INTO ${grants} (grantee_kind, grantee, stmt, version)
+         VALUES ($1, $2, $3, (SELECT COALESCE(MAX(version), 0) + 1 FROM ${grants}))`,
+        [grantee_kind, grantee, stmt],
+      );
+      await db.query(`UPDATE ${meta} SET epoch = epoch + 1`);
+    }
     await db.query("COMMIT");
   } catch (e) {
     await db.query("ROLLBACK");
@@ -121,11 +168,15 @@ function membershipRole(stmt: string): string | null {
  * Returns verbatim `stmt` text (never re-rendered) — this is what the UI displays as
  * "this key's grants". Mirrors birdshot's hydration BFS (bounded, cycle-safe).
  */
-export async function grantsForKey(db: Pg, subject: string): Promise<string[]> {
+export async function grantsForKey(db: Pg, subject: string, scope?: StoreScope): Promise<string[]> {
   const out: string[] = [];
   const seen = new Set<string>();
   const roleQueue: string[] = [];
   const visitedRoles = new Set<string>();
+  const grants = grantsTableOf(scope);
+  const dl = scope?.datalake;
+  // Scoped mode filters every read to this datalake (extra bound param appended).
+  const dlClause = dl != null ? " AND datalake = $%" : "";
 
   const push = (stmt: string) => {
     if (!seen.has(stmt)) {
@@ -136,8 +187,8 @@ export async function grantsForKey(db: Pg, subject: string): Promise<string[]> {
 
   // subject's own rows (+ discover role memberships)
   const subjRows = await db.query(
-    "SELECT stmt FROM __birdshot_grants WHERE grantee_kind = $1 AND grantee = $2 ORDER BY version",
-    ["subject", subject],
+    `SELECT stmt FROM ${grants} WHERE grantee_kind = $1 AND grantee = $2${dlClause.replace("$%", "$3")} ORDER BY version`,
+    dl != null ? ["subject", subject, dl] : ["subject", subject],
   );
   for (const r of subjRows.rows) {
     const stmt = r.stmt as string;
@@ -148,7 +199,8 @@ export async function grantsForKey(db: Pg, subject: string): Promise<string[]> {
 
   // PUBLIC rows reach every identity
   const pubRows = await db.query(
-    "SELECT stmt FROM __birdshot_grants WHERE grantee_kind = 'public' ORDER BY version",
+    `SELECT stmt FROM ${grants} WHERE grantee_kind = 'public'${dlClause.replace("$%", "$1")} ORDER BY version`,
+    dl != null ? [dl] : [],
   );
   for (const r of pubRows.rows) push(r.stmt as string);
 
@@ -160,8 +212,8 @@ export async function grantsForKey(db: Pg, subject: string): Promise<string[]> {
     if (visitedRoles.has(role)) continue;
     visitedRoles.add(role);
     const roleRows = await db.query(
-      "SELECT stmt FROM __birdshot_grants WHERE grantee_kind = 'role' AND grantee = $1 ORDER BY version",
-      [role],
+      `SELECT stmt FROM ${grants} WHERE grantee_kind = 'role' AND grantee = $1${dlClause.replace("$%", "$2")} ORDER BY version`,
+      dl != null ? [role, dl] : [role],
     );
     for (const r of roleRows.rows) {
       const stmt = r.stmt as string;

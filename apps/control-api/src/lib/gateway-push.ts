@@ -1,20 +1,21 @@
 /**
- * Shared gateway-push helper — extracted from routes/acl.ts so that both
- * routes/acl.ts and routes/delegations.ts can recompile and push without
- * copy-pasting the push logic.
+ * Shared gateway CONFIG-push helper (pull-model cutover, spec §13).
  *
- * recompileAndPush always pushes the FULL endpoint policy (every agent) because
- * the GatewayDO is shared per endpoint and applySnapshot does a full
- * birdshot_reset_config → re-add → commit. Pushing a single agent's slice would
- * wipe every other agent's grants on the shared gateway.
+ * The gateway no longer receives compiled grant tuples: birdshot PULLS literal GRANT/DENY
+ * SQL from the ATTACHed Postgres store and freshness-validates it itself. So this push
+ * shrinks to CONFIG ONLY — auth (issuer/audience/JWKS), the lake catalog alias, the
+ * read-only grant-store DSN (scoped to the datalake), and the boot payload. There is no
+ * `compileEndpointPolicy` / `BirdshotSnapshot` anywhere in the grant path anymore.
  *
- * Uses compileEndpointPolicy (effective-policy.ts) so that derived per-(user,
- * agent) delegation grants are included in every recompile (Phase 1 invariant).
+ * pushConfig (exported as recompileAndPush for call-site stability) always pushes the
+ * endpoint's config. Best-effort by default: a gateway failure leaves grants durable in the
+ * store (the gateway re-pulls on its next authorize / connect) and is reported via
+ * `pushError`. Pass `{ surfacePushError: true }` (admin refresh-policy / the dispatch drain)
+ * to RE-THROW instead.
  */
 import { queryOne } from './db';
-import { compileEndpointPolicy } from './effective-policy';
 import { bumpPolicyVersion } from './policy-version';
-import type { CompileResult } from './policy-compiler';
+import { epochFor } from './grant-store';
 import { gatewayClientFor, type SnapshotRequest, type BirdshotJwk } from './gateway-client';
 import { resolveGatewayBoot } from './gateway-boot';
 import { refreshCatalog, type CatalogEndpoint } from './catalog-cache';
@@ -40,48 +41,34 @@ async function loadJwk(): Promise<BirdshotJwk | null> {
   return { kid: row.id, n: pub.n, e: pub.e };
 }
 
-/**
- * Recompile the endpoint's FULL policy (every agent) via compileEndpointPolicy
- * and push it to the gateway. Best-effort by default: a gateway failure leaves the
- * rule persisted for the next connect/recompile to re-push, and the failure is
- * reported via the returned `pushError` field (NOT thrown).
- *
- * Pass `{ surfacePushError: true }` (the admin refresh-policy path) to instead
- * RE-THROW the gateway error so the caller can surface a 502 to the admin rather
- * than silently reporting best-effort success.
- *
- * When datalakeId is NULL (e.g. a global-scope delegation) we cannot push to a
- * specific gateway — skip the push, return a trivial empty compile result. The
- * next per-endpoint connect/recompile picks it up (consistent with best-effort
- * posture).
- *
- * Returns the CompileResult augmented with push telemetry: `pushed` is true only
- * when a snapshot was actually delivered to a running gateway; `pushError` carries
- * the reason on a best-effort failure; `pushSkipped` is true when no push was
- * attempted (null datalake, or a non-running endpoint).
- */
-export interface RecompileResult extends CompileResult {
-  /** true only when a snapshot was delivered to a running gateway. */
+/** Outcome of a config push. `pushed` is true only when config reached a running gateway. */
+export interface RecompileResult {
   pushed?: boolean;
   /** best-effort failure reason (only when surfacePushError is false). */
   pushError?: string;
   /** true when no push was attempted (null datalake / non-running endpoint). */
   pushSkipped?: boolean;
+  /** the datalake's current grant-store epoch (grant version), for callers/telemetry. */
+  epoch?: number;
 }
 
 export interface RecompileOptions {
-  /** Re-throw gateway push errors instead of swallowing + reporting via pushError.
-   *  Used by the admin refresh-policy endpoint so a failed push surfaces as 502. */
+  /** Re-throw gateway push errors instead of swallowing + reporting via pushError. */
   surfacePushError?: boolean;
 }
 
+/**
+ * Push the endpoint's CONFIG (auth/JWKS/lakeCatalog/grantStoreDsn) to its gateway. Named
+ * recompileAndPush for call-site stability, but it compiles NOTHING — grants live in the
+ * store and the gateway pulls them.
+ */
 export async function recompileAndPush(
   c: { env: Env },
   datalakeId: string | null,
   opts: RecompileOptions = {},
 ): Promise<RecompileResult> {
   if (!datalakeId) {
-    return { snapshot: { roleGrants: [], userRoles: [], roleConstraints: [] }, constraints: [], activeAgentIds: [], pushSkipped: true };
+    return { pushSkipped: true };
   }
 
   const endpoint = await queryOne<EndpointRow>(
@@ -90,14 +77,12 @@ export async function recompileAndPush(
     [datalakeId],
   );
 
-  const compiled = await compileEndpointPolicy(datalakeId, new Date());
-
-  // Cache the compiled version on the datalake row (migration 013) so the refresh
-  // alarm (Step 11) can poll one column. Best-effort + non-throwing. Computed from
-  // the same jwks the push below uses, so the cached version matches what landed.
   const jwk = await loadJwk();
   const jwksArr = jwk ? [jwk] : undefined;
-  const version = await bumpPolicyVersion(datalakeId, compiled.snapshot, jwksArr);
+  const epoch = await epochFor(datalakeId).catch(() => 0);
+  // Cache the version (epoch + auth) on the datalake row so the refresh alarm can poll one
+  // column. Best-effort + non-throwing.
+  await bumpPolicyVersion(datalakeId, epoch, jwksArr);
 
   if (endpoint && endpoint.status === 'running') {
     const gw = gatewayClientFor(endpoint);
@@ -111,31 +96,27 @@ export async function recompileAndPush(
           mode: 'rs256',
           jwks: jwksArr ?? [],
         },
-        snapshot: compiled.snapshot,
         lakeCatalog: boot.lakeCatalog,
+        grantStoreDsn: c.env.BIRDSHOT_STORE_DSN,
         gatewayBoot: boot.gatewayBoot,
       };
       await gw.pushSnapshot(snapshotReq);
-      return { ...compiled, pushed: true };
+      return { pushed: true, epoch };
     } catch (e) {
-      // gateway down / catalog provisioning — persisted rule re-pushes on next connect/recompile.
-      // The admin refresh path opts out of swallowing so a failed push is visible.
       if (opts.surfacePushError) throw e;
-      return { ...compiled, pushed: false, pushError: e instanceof Error ? e.message : String(e) };
+      return { pushed: false, epoch, pushError: e instanceof Error ? e.message : String(e) };
     }
   }
 
-  // endpoint missing or not running — no push attempted; the rule re-pushes on the
-  // next connect/recompile once the gateway is running.
-  return { ...compiled, pushed: false, pushSkipped: true };
+  return { pushed: false, epoch, pushSkipped: true };
 }
 
 /**
- * Change-tracked catalog refresh + conditional recompile. Called after a governed
- * catalog-mutating statement (CTAS/ETL/DROP/...), when the gateway is already warm:
- * pull the fresh catalog, and IF it changed, recompile + push so any covering
- * read/write WILDCARD grant folds in the new/removed table (the "future tables are
- * auto-covered" path). Best-effort — never throws into the caller (run in waitUntil).
+ * Change-tracked catalog refresh + conditional config re-push. Called after a governed
+ * catalog-mutating statement when the gateway is warm: pull the fresh catalog, and IF it
+ * changed, re-push config. (In the pull model this no longer re-folds wildcard grants — the
+ * gateway resolves `ALL TABLES IN SCHEMA` natively — but a changed catalog can still warrant
+ * a config re-arm.) Best-effort — never throws into the caller.
  */
 export async function refreshCatalogAndRecompile(
   c: { env: Env },

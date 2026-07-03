@@ -321,17 +321,16 @@ delegations.post('/', (c) =>
       );
     }
 
-    // Enqueue the recompiled policy for delivery. When datalakeId is NULL (all-lakes
-    // scope) there's no single gateway to reach — compile-only; the next per-endpoint
-    // connect/recompile picks it up.
-    const compiled = await recompileAndEnqueue(c, input.datalakeId ?? null);
+    // Config-only re-arm (spec §13). NOTE: delegation → literal grant-store SQL is not yet
+    // wired (this subsystem still writes waddling.delegation rows, which no longer feed
+    // birdshot's pull store). Kept enqueuing so a JWKS/lake change re-arms the gateway.
+    await recompileAndEnqueue(c, input.datalakeId ?? null);
 
     return ok(
       c,
       {
         delegation: created ? mapDelegation(created) : null,
         delegationId: created?.id,
-        compiledGrants: compiled.snapshot,
       },
       201,
     );
@@ -359,9 +358,9 @@ delegations.delete('/:id', (c) =>
 
     await query(`DELETE FROM waddling.delegation WHERE id = $1`, [id]);
 
-    const compiled = await recompileAndEnqueue(c, row.datalake_id);
+    await recompileAndEnqueue(c, row.datalake_id);
 
-    return ok(c, { success: true, delegationId: id, compiledGrants: compiled.snapshot });
+    return ok(c, { success: true, delegationId: id });
   }),
 );
 

@@ -44,8 +44,7 @@ import { Hono } from 'hono';
 import { importJWK, SignJWT, type JWK } from 'jose';
 import { query, queryOne, withTransaction } from '../lib/db';
 import type { Env } from '../lib/env';
-import { grantsForAgent } from '../lib/policy-compiler';
-import { compileEndpointPolicy } from '../lib/effective-policy';
+import { grantsForKey, agentSubject } from '../lib/grant-store';
 import {
   resolveAgentIdentity,
   captureAgentEvent,
@@ -369,82 +368,24 @@ sessions.post('/', (c) =>
       toSupersede = existing.rows;
     }
 
-    // Compile the WHOLE endpoint's policy (every agent), NOT just this agent's. The
-    // GatewayDO is shared per endpoint (`gw:<datalakeId>`) and applySnapshot does a
-    // full birdshot_reset_config → re-add → commit, so pushing only the connecting
-    // agent's grants would WIPE every other agent's grants on the shared gateway. The
-    // per-agent `granted` view is then extracted from the same full compile.
-    //
-    // compileEndpointPolicy loads all acl_rule rows, derives effective grants for every
-    // delegated/owned agent via owner ∩ delegation-scope, unions with direct agent rows,
-    // and calls compilePolicy — so delegated and autonomous-owned agents get derived
-    // grants without requiring direct subject_kind='agent' rows.
-    const now = new Date();
-    // Refresh the cached lake catalog BEFORE compiling so wildcard grants ("whole schema /
-    // entire lake", incl. future tables) expand against the CURRENT table set. The gateway is
-    // about to be woken + pushed to below, so this reuses the same warm replica (one cold boot,
-    // not two). Best-effort: if the gateway is momentarily unreachable refreshCatalog returns
-    // null and compileEndpointPolicy falls back to the cached catalog (no regression). This is
-    // the keystone that makes a freshly-created agent's grants work on its first connect, and
-    // lets every reconnect / JWT renewal pick up out-of-band table changes.
+    // Pull-model (spec §13): the gateway is CONFIG-only — birdshot pulls this agent's literal
+    // GRANT/DENY SQL from the shared store itself. The connect gate is simply "does this key
+    // have ANY statement in the store?" (subject ∪ PUBLIC ∪ transitive roles). `granted` is the
+    // literal statement list, rendered verbatim by the UI — there is no compile.
     await refreshCatalog(endpoint).catch(() => null);
-    const compiled = await compileEndpointPolicy(datalakeId, now);
-    const granted = grantsForAgent(compiled, agentId);
-    // `granted.tables` counts only read/write tables. An agent whose only grants are
-    // catalog DDL caps (create/drop/alter/detach) has ZERO read/write tables but is a
-    // legitimately-grantable principal — and MUST be able to connect to BOOTSTRAP an
-    // empty lake (create the first tables). On an empty lake every wildcard read/write
-    // grant expands to nothing (compilePolicy ∘ expandBindWalkWildcards), so a
-    // create-capable agent would otherwise be locked out with no way to create the
-    // table that would let it in — a chicken-and-egg. `activeAgentIds` is the set of
-    // agents with ≥1 compiled ALLOW grant (read/write OR DDL), so gate on THAT: only
-    // refuse when the agent has no effective grant of any kind. The snapshot pushed
-    // below carries the create grant, so birdshot authorizes the agent's CREATE.
-    const hasAnyGrant = compiled.activeAgentIds.includes(agentId);
-    if (granted.tables.length === 0 && !hasAnyGrant) {
-      // Distinguish the two zero-grant cases so the agent gets a meaningful message:
-      //  - "no user grants on this lake"    → the owner has no subject_kind='user'
-      //    grants on this datalake at all; the agent can't have any either.
-      //  - "delegation scope is empty"      → the owner has user grants but none
-      //    survived the owner ∩ scope intersection (the delegation scope is too
-      //    narrow, expired, or not yet created).
-      // onBehalfOf is the owner user id for both delegated (=callerId) and
-      // autonomous (=identity.onBehalfOf resolved above). For run-as sessions
-      // there is no delegation model, so fall through to the generic message.
-      const ownerUserId =
-        origin === 'delegated'
-          ? caller.callerId
-          : origin === 'agent'
-            ? identity.onBehalfOf ?? null
-            : null;
-      if (ownerUserId) {
-        const userGrant = await query(
-          `SELECT 1 FROM waddling.acl_rule
-            WHERE datalake_id = $1 AND subject_kind = 'user' AND user_id = $2
-            LIMIT 1`,
-          [datalakeId, ownerUserId],
-        );
-        if (userGrant.rows.length > 0) {
-          return err(
-            c,
-            'delegation_scope_empty',
-            403,
-            'This agent has no effective grants on this endpoint: the delegation scope does not overlap with the owner\'s grants (scope may be too narrow, expired, or not yet created)',
-          );
-        }
-        return err(
-          c,
-          'no_grants',
-          403,
-          'The owner user has no grants on this endpoint — an admin must add a user-subject ACL rule before this agent can connect',
-        );
-      }
-      return err(c, 'no_grants', 403, 'Agent has no active ACL rules for this endpoint');
+    const statements = await grantsForKey(datalakeId, agentSubject(agentId));
+    const granted = { statements };
+    if (statements.length === 0) {
+      return err(
+        c,
+        'no_grants',
+        403,
+        'This agent has no grants on this endpoint — an admin must author a GRANT (POST /api/cp/acl) before it can connect',
+      );
     }
 
-    // Push the FULL birdshot policy snapshot to the gateway control channel (HTTP+OIDC
-    // → boots gw:<datalakeId> if cold). Column + window ACLs ride INSIDE the snapshot
-    // (`roleConstraints`), enforced by birdshot's bind-walk.
+    // Push CONFIG (auth/JWKS/lakeCatalog/grantStoreDsn) to the gateway control channel
+    // (HTTP+OIDC → boots gw:<datalakeId> if cold). No grant tuples — birdshot pulls them.
     const { kid, publicJwk, privateJwk } = await loadSigningKey();
     const gw = gatewayClientFor(endpoint);
     const jwks: BirdshotJwk[] = [{ kid, n: publicJwk.n, e: publicJwk.e }];
@@ -475,14 +416,14 @@ sessions.post('/', (c) =>
         mode: 'rs256',
         jwks,
       },
-      snapshot: compiled.snapshot,
       lakeCatalog: boot.lakeCatalog,
+      grantStoreDsn: c.env.BIRDSHOT_STORE_DSN,
       gatewayBoot: boot.gatewayBoot,
     };
-    // connect AWAITS the push (a session must not be minted against a gateway that
-    // never received its snapshot + JWKS); a failure surfaces as 500. This is the
-    // first leg of the JWT triangle — the JWT minted just below carries `kid` and is
-    // verified against THIS pushed JWKS at ATTACH.
+    // connect AWAITS the push (a session must not be minted against a gateway that never
+    // received its config + JWKS); a failure surfaces as 500. This is the first leg of the JWT
+    // triangle — the JWT minted just below carries `kid` and is verified against THIS pushed
+    // JWKS at ATTACH. Grants are NOT here: birdshot pulls them from the store at authorize.
     await gw.pushSnapshot(snapshotReq);
 
     // Mint the RS256 session JWT (jose) with custom claims + kid header.
@@ -585,7 +526,7 @@ sessions.post('/', (c) =>
       );
     }
 
-    const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000);
+    const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
     const grantedRoles = [`agent_${agentId}`];
     // Supersede the agent's prior live session(s) and insert the new one atomically,
     // so the one-active-per-agent unique index holds. A concurrent connect that loses
@@ -692,7 +633,7 @@ sessions.post('/', (c) =>
       jti,
       datalakeId,
       // ACL/grant detail kept separate from capability (different layer).
-      extra: { granted_tables: granted.tables.length, origin },
+      extra: { granted_statements: granted.statements.length, origin },
     });
 
     // Activation funnel: the human reached "agent connected to a governed lake". Gated on

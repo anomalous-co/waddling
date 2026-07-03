@@ -17,6 +17,7 @@ import { query, queryOne } from '../lib/db';
 import { getEntitlements } from '../lib/entitlements';
 import type { Env } from '../lib/env';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err, AuthError } from '../lib/cp-shared';
+import { grantsForKey, agentSubject } from '../lib/grant-store';
 import { makePostHog } from '../lib/posthog';
 import { buildAuth } from '../lib/auth';
 import {
@@ -353,6 +354,34 @@ agents.get('/:id', (c) =>
       sessions,
     };
     return ok(c, { agent });
+  }),
+);
+
+// GET /:id/grants — the agent key's LITERAL GRANT/DENY SQL for a datalake (spec §13). Returns
+// grantsForKey(datalake, 'agent:<id>'): the subject's own rows ∪ PUBLIC ∪ transitive roles,
+// VERBATIM, for the UI to render as "this key's grants". Org-scoped; ?datalakeId= required.
+agents.get('/:id/grants', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const id = c.req.param('id');
+    const url = new URL(c.req.url);
+    const datalakeId = url.searchParams.get('datalakeId');
+    if (!datalakeId) return err(c, 'datalakeId_required', 400, 'datalakeId query param is required');
+
+    const agent = await load(id);
+    if (!agent) return err(c, 'agent_not_found', 404);
+    assertOrg(caller, agent.org_id);
+
+    // Tenant-isolate the datalake too.
+    const ep = await queryOne<{ org_id: string }>(
+      `SELECT org_id FROM waddling.datalake WHERE id = $1`,
+      [datalakeId],
+    );
+    if (!ep) return err(c, 'endpoint_not_found', 404);
+    assertOrg(caller, ep.org_id);
+
+    const statements = await grantsForKey(datalakeId, agentSubject(id));
+    return ok(c, { agentId: id, datalakeId, statements });
   }),
 );
 

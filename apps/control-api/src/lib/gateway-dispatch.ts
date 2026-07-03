@@ -25,8 +25,6 @@
  */
 import { query, runInDbScope } from './db';
 import { recompileAndPush } from './gateway-push';
-import { compileEndpointPolicy } from './effective-policy';
-import type { CompileResult } from './policy-compiler';
 import { gatewayClientFor, initDataplane } from './gateway-client';
 import { refreshCatalog, type CatalogEndpoint } from './catalog-cache';
 import type { Env } from './env';
@@ -38,25 +36,20 @@ import type { Env } from './env';
  * per-replica apply), then ENQUEUES delivery and kicks an immediate drain. The expensive
  * gateway push happens off the request path and coalesces with any concurrent edit.
  *
- * Mirrors recompileAndPush's signature/return so callers swap one import + one call.
- * A null datalake (global-scope delegation) has no gateway to reach: compile-empty, no
- * enqueue (a later per-endpoint connect/recompile picks it up).
+ * Pull-model cutover (spec §13): there is nothing to COMPILE anymore — grants live in the
+ * literal-SQL store and the gateway pulls them. This now just ENQUEUES a durable CONFIG
+ * dispatch (auth/JWKS/lakeCatalog/grantStoreDsn) and kicks an immediate drain. Kept on the
+ * edit paths so a JWKS/lake change re-arms the gateway; grant edits (acl.ts) don't need it
+ * at all (they write the store + bump the epoch, and the gateway re-pulls on next authorize).
+ * A null datalake has no gateway to reach: no-op.
  */
 export async function recompileAndEnqueue(
   c: { env: Env; executionCtx: ExecutionContext },
   datalakeId: string | null,
-): Promise<CompileResult> {
-  if (!datalakeId) {
-    return {
-      snapshot: { roleGrants: [], userRoles: [], roleConstraints: [] },
-      constraints: [],
-      activeAgentIds: [],
-    };
-  }
-  const compiled = await compileEndpointPolicy(datalakeId, new Date());
+): Promise<void> {
+  if (!datalakeId) return;
   await enqueueSnapshotDispatch(datalakeId);
   kickDispatch(c, datalakeId);
-  return compiled;
 }
 
 /**

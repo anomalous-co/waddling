@@ -33,7 +33,6 @@ import { gatewayClientFor } from '../lib/gateway-client';
 import { workspaceGatewayUrl } from '../lib/provisioner';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import type { SnapshotRequest, BirdshotJwk } from '../lib/gateway-client';
-import { compileEndpointPolicy } from '../lib/effective-policy';
 
 const workspaces = new Hono<{ Bindings: Env }>();
 
@@ -231,7 +230,6 @@ workspaces.post('/:wsId/agents/:agentId/reconfigure', (c) =>
       return err(c, 'endpoint_not_running', 409, `Endpoint status is ${endpoint.status}`);
     }
 
-    const compiled = await compileEndpointPolicy(datalakeId, new Date());
     const { kid, publicJwk } = await loadSigningKey();
     const jwks: BirdshotJwk[] = [{ kid, n: publicJwk.n, e: publicJwk.e }];
     let boot;
@@ -242,11 +240,12 @@ workspaces.post('/:wsId/agents/:agentId/reconfigure', (c) =>
       if (e instanceof StorageNotReadyError) return err(c, 'storage_unavailable', 503, e.message);
       throw e;
     }
+    // CONFIG-only push (spec §13): no grant tuples — birdshot pulls grants from the store.
     const snapshotReq: SnapshotRequest = {
       datalakeId,
       auth: { issuer: c.env.JWT_ISSUER, audience: `gw:${datalakeId}`, mode: 'rs256', jwks },
-      snapshot: compiled.snapshot,
       lakeCatalog: boot.lakeCatalog,
+      grantStoreDsn: c.env.BIRDSHOT_STORE_DSN,
       gatewayBoot: boot.gatewayBoot,
     };
     await gatewayClientFor(endpoint).pushSnapshot(snapshotReq);
