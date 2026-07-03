@@ -42,6 +42,7 @@ import { usage } from "./routes/usage";
 import { audit } from "./routes/audit";
 import { billing } from "./routes/billing";
 import { acl } from "./routes/acl";
+import { roles } from "./routes/roles";
 import { policies } from "./routes/policies";
 import { delegations } from "./routes/delegations";
 import { sessions } from "./routes/sessions";
@@ -552,6 +553,7 @@ app.route("/api/cp/usage", usage);
 app.route("/api/cp/audit", audit);
 app.route("/api/cp/billing", billing);
 app.route("/api/cp/acl", acl);
+app.route("/api/cp/roles", roles);
 app.route("/api/cp/acl-policy", policies);
 app.route("/api/cp/delegations", delegations);
 app.route("/api/cp/sessions", sessions);
@@ -694,11 +696,13 @@ export async function scheduledHandler(env: Env): Promise<void> {
   initCrypto(env.WADDLING_SECRET_KEY ?? env.BETTER_AUTH_SECRET);
   initDataplane(env.GATEWAY_BASE_URL);
   try {
-    // Out-of-band catalog refresh: pull the live catalog from each WARM gateway (status-gated,
-    // never cold-boots a sleeping pool) and enqueue a recompile on change so wildcard grants fold
-    // the new shape in. Runs before the drain so its enqueued snapshots deliver this same tick.
-    const { warm, changed } = await refreshWarmCatalogs(env);
-    if (changed > 0) console.log(`[cron] catalog refresh: ${changed}/${warm} warm datalake(s) changed → recompile enqueued`);
+    // Catalog-freshness pass: pull the live catalog from each WARM gateway (status-gated,
+    // never cold-boots a sleeping pool) and upsert waddling.datalake_catalog so the authoring
+    // picker reads a fresh schema tree. DECOUPLED from grant compilation (pull model): purely
+    // refreshes the cache, no snapshot dispatch. `refreshCatalog` never wipes a populated cache
+    // to empty, so a mid-boot warm gateway can't blank the picker.
+    const { scanned, warm, changed } = await refreshWarmCatalogs(env);
+    if (warm > 0 || changed > 0) console.log(`[cron] catalog refresh: scanned=${scanned} warm=${warm} changed=${changed}`);
   } catch (e) {
     console.log(`[cron] refreshWarmCatalogs failed: ${e instanceof Error ? e.message : String(e)}`);
   }

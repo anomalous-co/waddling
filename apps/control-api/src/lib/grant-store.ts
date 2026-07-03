@@ -82,6 +82,21 @@ export function revokeRole(role: string, from: string): string {
   return `REVOKE ROLE ${role} FROM ${from}`;
 }
 
+// ── discriminated grantee input (grant-ux-plan §4/§8.1: agent | role | PUBLIC) ─────
+// The UI authors object grants against one of three targets. This maps the wire shape to the
+// builder's `Grantee`. (The legacy acl.ts subjectKind='user'|'org' → synthetic-role mapping is
+// a SEPARATE concept and stays in acl.ts — do not route it through here.)
+export type GranteeInput =
+  | { kind: 'agent'; agentId: string }
+  | { kind: 'role'; role: string }
+  | { kind: 'public' };
+
+export function granteeFromInput(g: GranteeInput): Grantee {
+  if (g.kind === 'agent') return { subject: agentSubject(g.agentId) };
+  if (g.kind === 'role') return { role: g.role };
+  return 'public';
+}
+
 // ── grantee derivation (from the parsed stmt, so the store columns can't drift — §12f) ──
 
 export function deriveGrantee(stmt: string): { grantee_kind: 'subject' | 'role' | 'public'; grantee: string } {
@@ -226,6 +241,68 @@ export async function grantsForKey(datalake: string, subject: string): Promise<s
     );
     for (const r of roleRows.rows) {
       push(r.stmt);
+      const nested = membershipRole(r.stmt);
+      if (nested && !visitedRoles.has(nested)) roleQueue.push(nested);
+    }
+  }
+
+  return out;
+}
+
+/** Where a resolved statement came from, for the UI's read-only "inherited" marking. */
+export type Provenance = null | { via: 'role'; role: string } | { via: 'public' };
+export interface ResolvedStatement {
+  stmt: string;
+  inherited: Provenance;
+}
+
+/**
+ * Like grantsForKey, but each resolved statement CARRIES its provenance so the UI can render
+ * role/PUBLIC-derived rows read-only (grant-ux-plan §4.1). Resolution order = the subject's own
+ * rows (inherited=null) → PUBLIC (via:public) → transitive roles (via:role) — first-seen wins on
+ * dedup, exactly matching grantsForKey's ordering so the two never disagree.
+ */
+export async function grantsForKeyDetailed(datalake: string, subject: string): Promise<ResolvedStatement[]> {
+  const out: ResolvedStatement[] = [];
+  const seen = new Set<string>();
+  const roleQueue: string[] = [];
+  const visitedRoles = new Set<string>();
+
+  const push = (stmt: string, inherited: Provenance) => {
+    if (!seen.has(stmt)) {
+      seen.add(stmt);
+      out.push({ stmt, inherited });
+    }
+  };
+
+  const subjRows = await query<{ stmt: string }>(
+    `SELECT stmt FROM ${GRANTS} WHERE datalake = $1 AND grantee_kind = 'subject' AND grantee = $2 ORDER BY version`,
+    [datalake, subject],
+  );
+  for (const r of subjRows.rows) {
+    push(r.stmt, null);
+    const role = membershipRole(r.stmt);
+    if (role && !visitedRoles.has(role)) roleQueue.push(role);
+  }
+
+  const pubRows = await query<{ stmt: string }>(
+    `SELECT stmt FROM ${GRANTS} WHERE datalake = $1 AND grantee_kind = 'public' ORDER BY version`,
+    [datalake],
+  );
+  for (const r of pubRows.rows) push(r.stmt, { via: 'public' });
+
+  let depth = 0;
+  while (roleQueue.length && depth < 64) {
+    depth++;
+    const role = roleQueue.shift() as string;
+    if (visitedRoles.has(role)) continue;
+    visitedRoles.add(role);
+    const roleRows = await query<{ stmt: string }>(
+      `SELECT stmt FROM ${GRANTS} WHERE datalake = $1 AND grantee_kind = 'role' AND grantee = $2 ORDER BY version`,
+      [datalake, role],
+    );
+    for (const r of roleRows.rows) {
+      push(r.stmt, { via: 'role', role });
       const nested = membershipRole(r.stmt);
       if (nested && !visitedRoles.has(nested)) roleQueue.push(nested);
     }

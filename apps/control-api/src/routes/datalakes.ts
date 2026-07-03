@@ -779,16 +779,38 @@ datalakes.get('/:id/catalog', (c) =>
       return err(c, 'forbidden', 403, 'Only org owners and admins may browse the catalog');
     }
 
+    // Distinct, non-error states for the picker's schema browser:
+    //   ready        — a populated snapshot (fresh or cached) is served.
+    //   empty        — the gateway introspected the lake and it has no tables (real, not an error).
+    //   provisioning — the endpoint isn't 'running' yet, so there is no gateway to introspect.
+    //   unreachable  — endpoint is running but the gateway is cold/stopped and nothing is cached.
+    // The cache is always served when present (never blocked on a live fetch); boot-on-demand
+    // only fires when nothing is cached AND the endpoint is live. `stale` is kept for the
+    // existing UI (true iff we're returning an empty tree we couldn't populate).
     let cached = await getCachedCatalog(datalakeId);
-    if (!cached) {
-      // Boot-on-demand: nothing cached yet — try to populate once (may cold-boot).
+    let reachable = true;
+    if (!cached && endpoint.status === 'running') {
+      // Boot-on-demand: nothing cached yet — try to populate once (may cold-boot). A null
+      // result means the gateway was unreachable; refreshCatalog otherwise caches even an
+      // empty lake, so a subsequent read serves it as the 'empty' state.
       const snap = await refreshCatalog(endpoint);
-      if (snap) cached = await getCachedCatalog(datalakeId);
+      if (snap === null) reachable = false;
+      cached = await getCachedCatalog(datalakeId);
     }
-    if (!cached) {
-      return ok(c, { datalakeId, schemas: [], fetchedAt: null, stale: true });
+    if (cached) {
+      const empty =
+        cached.snapshot.schemas.length === 0 ||
+        cached.snapshot.schemas.every((s) => (s.tables?.length ?? 0) === 0);
+      return ok(c, {
+        datalakeId,
+        schemas: cached.snapshot.schemas,
+        fetchedAt: cached.fetchedAt,
+        stale: false,
+        state: empty ? 'empty' : 'ready',
+      });
     }
-    return ok(c, { datalakeId, schemas: cached.snapshot.schemas, fetchedAt: cached.fetchedAt, stale: false });
+    const state = endpoint.status !== 'running' ? 'provisioning' : 'unreachable';
+    return ok(c, { datalakeId, schemas: [], fetchedAt: null, stale: true, state });
   }),
 );
 
@@ -809,7 +831,10 @@ datalakes.post('/:id/catalog/refresh', (c) =>
     if (!snap) {
       return err(c, 'gateway_unreachable', 503, 'could not fetch catalog (gateway cold or stopped)');
     }
-    return ok(c, { datalakeId, schemas: snap.snapshot.schemas });
+    const empty =
+      snap.snapshot.schemas.length === 0 ||
+      snap.snapshot.schemas.every((s) => (s.tables?.length ?? 0) === 0);
+    return ok(c, { datalakeId, schemas: snap.snapshot.schemas, state: empty ? 'empty' : 'ready' });
   }),
 );
 
