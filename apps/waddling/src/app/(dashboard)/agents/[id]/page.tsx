@@ -33,7 +33,7 @@ import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { fetchCp, cpPatch, cpDelete } from '@/components/dashboard/fetch';
-import { GrantsSection } from '@/components/dashboard/agent/grants-section';
+import { AccessManager } from '@/components/dashboard/access/access-manager';
 import { OverviewSection } from '@/components/dashboard/agent/overview-section';
 import { KeysSection } from '@/components/dashboard/agent/keys-section';
 import { SessionsSection } from '@/components/dashboard/agent/sessions-section';
@@ -277,8 +277,9 @@ export default function AgentDetailPage() {
     {
       id: 'access',
       label: 'Access',
-      // The literal GRANT/DENY SQL governing this key — the headline surface.
-      content: <GrantsSection agentId={agentId} />,
+      // Schema-aware, picker-first access authoring over the key's literal
+      // GRANT/DENY SQL — the headline surface.
+      content: <AccessManager mode="detail" agentId={agentId} />,
     },
     {
       id: 'keys',

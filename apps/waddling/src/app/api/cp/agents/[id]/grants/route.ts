@@ -1,18 +1,20 @@
-import { makeFixtureKeyGrants } from '@/lab/fixtures/grants';
+import { makeResolvedGrants } from '@/lab/fixtures/grants';
 
 /**
  * GET /api/cp/agents/:id/grants?datalakeId=…
  *
- * Lab MOCK for the agent-detail Grant SQL panel. Returns the key's LITERAL
- * GRANT/DENY SQL for a datalake — the subject's own rows ∪ PUBLIC ∪ transitive
- * roles — verbatim, exactly as control-api's `grantsForKey` resolves them.
+ * Lab MOCK for the AccessManager. Returns the key's RESOLVED statements — the
+ * subject's own rows ∪ PUBLIC ∪ transitive roles — each DECOMPOSED server-side:
+ *
+ *   { statements: Array<{ sql, parsed: ParsedStatement | null,
+ *                         inherited: null | {via:'role',role} | {via:'public'} }> }
+ *
+ * The Picker renders from `parsed` (parsed===null → Advanced bucket) and reads
+ * `inherited` to split own (editable) from role/PUBLIC (read-only).
  *
  * In production these `/api/cp/*` handlers do NOT run: the browser calls the
- * standalone control-api Worker directly (fetchCp → cpUrl → control-api origin),
- * and this route 404s the moment NEXT_PUBLIC_CONTROL_API_URL is set. It only
- * serves the local/UX-lab single-origin dev where control-api is unconfigured.
- *
- * Mirrors the sibling mock at `keys/route.ts` (guard + fixture).
+ * standalone control-api Worker directly and this route 404s once
+ * NEXT_PUBLIC_CONTROL_API_URL is set. Local/UX-lab single-origin dev only.
  */
 export async function GET(
   request: Request,
@@ -29,6 +31,6 @@ export async function GET(
       { status: 400 },
     );
   }
-  const statements = makeFixtureKeyGrants(id, datalakeId);
+  const statements = makeResolvedGrants(id, datalakeId);
   return Response.json({ agentId: id, datalakeId, statements });
 }

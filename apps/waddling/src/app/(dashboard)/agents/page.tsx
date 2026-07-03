@@ -60,7 +60,7 @@ import { EmptyState } from '@/components/waddling/empty-state';
 import { StatusDot } from '@/components/waddling/status-dot';
 import { ModeChip } from '@/components/waddling/agent-chips';
 import { agentSemanticStatus, formatRelative } from '@/components/waddling/agent-status';
-import { AccessEditorDialog } from '@/components/dashboard/access-editor-dialog';
+import { CreateAgentDialog } from '@/components/dashboard/access/create-agent-dialog';
 import { NoAccessFlag, needsAccess } from '@/components/dashboard/agent/kit';
 import { DelegationsTab } from '@/components/dashboard/agent/delegations-tab';
 
@@ -582,8 +582,7 @@ export default function AgentsPage() {
       </div>
 
       {/* Create dialog */}
-      <AccessEditorDialog
-        mode="create"
+      <CreateAgentDialog
         datalakes={datalakes}
         open={createOpen}
         onOpenChange={setCreateOpen}
