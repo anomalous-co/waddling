@@ -69,6 +69,12 @@ async function main() {
       version      BIGINT DEFAULT 0
     );
   `);
+  // §12d freshness signal: the single-row store epoch. In table mode birdshot reads
+  // this on EVERY authorize (over the SAME postgres wire), and any unreadable epoch is
+  // fail-closed DENY — so it must exist before the first authorize. Mutated out-of-band
+  // (directly on pglite, below) to drive the freshness assertions; the DuckDB ATTACH is
+  // READ_ONLY, exactly as a gateway would consume it.
+  await db.exec(`CREATE TABLE __birdshot_meta (epoch BIGINT); INSERT INTO __birdshot_meta VALUES (0);`);
   // alice: a direct subject grant.
   await db.exec(
     `INSERT INTO __birdshot_grants (grantee_kind, grantee, stmt)
@@ -216,6 +222,48 @@ async function main() {
   check(
     "wire DENIED: SELECT * FROM __birdshot_grants (bare, non-resolution)",
     (await authz(duck, "s-alice", "SELECT * FROM __birdshot_grants")) === false,
+  );
+
+  // ---- 7. FRESHNESS GATE (§12d): strong per-query epoch, cross-session ------
+  // The decisive proof the local sqllogictest cannot give: a store-side REVOKE bumps
+  // the epoch, and on the NEXT query birdshot flushes its WHOLE hydrated cache GLOBALLY
+  // and re-hydrates each subject lazily — so the revoked subject is denied while every
+  // OTHER live session is re-populated (NOT stranded by the global flush). All mutations
+  // land directly on pglite (the store authority); no re-authenticate, no config reload.
+  console.log("\n[freshness gate: store REVOKE takes effect on next query]");
+
+  // alice and bob are BOTH hydrated at epoch 0 (both read main.hyd: alice via her direct
+  // grant, bob via role r1). Revoke ONLY alice, at a higher version (append-only writer).
+  await db.exec(
+    `INSERT INTO __birdshot_grants (grantee_kind, grantee, stmt, version)
+     VALUES ('subject', 'alice', 'REVOKE SELECT ON main.hyd FROM alice', 1);`,
+  );
+  await db.exec(`UPDATE __birdshot_meta SET epoch = 1;`);
+
+  // (a) alice's next query DENIES: epoch advanced -> global flush -> alice re-hydrates
+  //     GRANT(v0) then REVOKE(v1) in version order -> revoked. No re-authenticate.
+  const aliceDenied = (await authz(duck, "s-alice", "SELECT id FROM main.hyd")) === false;
+  check("alice DENIED on main.hyd after store REVOKE + epoch bump", aliceDenied);
+  console.log(`    alice authorize(SELECT id FROM main.hyd) -> ${!aliceDenied}`);
+
+  // (b) THE cross-session stranding check: bob is a DIFFERENT still-live session whose
+  //     grant was untouched. The flush was global (it cleared bob's role key too), but
+  //     re-hydrate is per-authorize, so bob is re-populated on his own next query and
+  //     STILL ALLOWED — he must NOT be collateral-denied by alice's bump.
+  const bobStillAllowed = await authz(duck, "s-bob", "SELECT id FROM main.hyd");
+  check("bob STILL ALLOWED on main.hyd (not stranded by alice's global flush)", bobStillAllowed);
+  console.log(`    bob authorize(SELECT id FROM main.hyd)   -> ${bobStillAllowed}`);
+
+  // A fresh GRANT added to the store also becomes visible after an epoch bump: dave had
+  // NO rows (default-deny on main.hyd above). Grant him, bump, and his next query ALLOWS.
+  await db.exec(
+    `INSERT INTO __birdshot_grants (grantee_kind, grantee, stmt, version)
+     VALUES ('subject', 'dave', 'GRANT SELECT ON main.hyd TO dave', 2);`,
+  );
+  await db.exec(`UPDATE __birdshot_meta SET epoch = 2;`);
+  check(
+    "dave now ALLOWED on main.hyd (fresh store GRANT + epoch bump becomes visible)",
+    await authz(duck, "s-dave", "SELECT id FROM main.hyd"),
   );
 
   // ---- teardown ------------------------------------------------------------
