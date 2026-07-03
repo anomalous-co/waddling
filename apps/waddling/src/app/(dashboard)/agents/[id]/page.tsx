@@ -1,7 +1,7 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo } from 'react';
-import { useParams, useRouter, useSearchParams } from 'next/navigation';
+import { useEffect, useState, useCallback } from 'react';
+import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
   ChevronLeft,
@@ -33,9 +33,7 @@ import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { fetchCp, cpPatch, cpDelete } from '@/components/dashboard/fetch';
-import { AgentAccess } from '@/components/dashboard/agent-access';
-import { decodeProposal } from '@/lib/access-diff';
-import { NoAccessBanner, needsAccess } from '@/components/dashboard/agent/kit';
+import { GrantsSection } from '@/components/dashboard/agent/grants-section';
 import { OverviewSection } from '@/components/dashboard/agent/overview-section';
 import { KeysSection } from '@/components/dashboard/agent/keys-section';
 import { SessionsSection } from '@/components/dashboard/agent/sessions-section';
@@ -63,11 +61,6 @@ interface ApiKeyRow {
 interface AgentDetailEnvelope {
   agent: AgentSummary & { apiKeys?: ApiKeyRow[] };
   apiKeys?: ApiKeyRow[];
-}
-
-interface AclRuleRow {
-  id: string;
-  capability: string;
 }
 
 // ── Memory section ───────────────────────────────────────────────────────────────
@@ -168,22 +161,12 @@ function PageSkeleton() {
 export default function AgentDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
-  const searchParams = useSearchParams();
 
-  // Deep-link support for the `waddling_request_access` MCP tool: ?section= jumps to a
-  // section (handled natively by DetailLayout), ?propose= carries a base64url access
-  // proposal that the Access editor overlays as a pending diff. A proposal with no
-  // explicit section opens straight on Access (via defaultSection).
-  const proposeParam = searchParams.get('propose');
-  const proposed = useMemo(
-    () => (proposeParam ? decodeProposal(proposeParam) : null),
-    [proposeParam],
-  );
+  // ?section= deep-links jump to a section (handled natively by DetailLayout).
 
   // Page-level agent data
   const [agent, setAgent] = useState<AgentSummary | null>(null);
   const [keyCount, setKeyCount] = useState(0);
-  const [grantCount, setGrantCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -199,11 +182,7 @@ export default function AgentDetailPage() {
   useBreadcrumbLabel(agentId, agent?.name);
 
   const load = useCallback(async () => {
-    const [agentRes, aclRes, polRes] = await Promise.all([
-      fetchCp<AgentDetailEnvelope>(`/api/cp/agents/${agentId}`),
-      fetchCp<{ rules: AclRuleRow[] }>(`/api/cp/acl?agentId=${agentId}`),
-      fetchCp<{ policies: { id: string }[] }>(`/api/cp/acl-policy?agentId=${agentId}`),
-    ]);
+    const agentRes = await fetchCp<AgentDetailEnvelope>(`/api/cp/agents/${agentId}`);
 
     if (!agentRes.ok) {
       setError(agentRes.error);
@@ -220,12 +199,6 @@ export default function AgentDetailPage() {
     setAgent(agentData);
     setKeyCount(apiKeys.length);
     setError(null);
-
-    if (aclRes.ok && polRes.ok) {
-      const filteredRules = aclRes.data.rules.filter((r) => r.capability);
-      setGrantCount(filteredRules.length + polRes.data.policies.length);
-    }
-
     setLoading(false);
   }, [agentId]);
 
@@ -289,7 +262,6 @@ export default function AgentDetailPage() {
     );
   }
 
-  const showBanner = needsAccess(agent.status, grantCount);
   const isActive = agent.status === 'active';
   const isSuspended = agent.status === 'suspended';
 
@@ -305,14 +277,8 @@ export default function AgentDetailPage() {
     {
       id: 'access',
       label: 'Access',
-      badge: grantCount > 0 ? grantCount : undefined,
-      // The Access editor owns its own internal scroll (`h-full min-h-0`), so it
-      // needs a bounded-height parent — DetailLayout renders in normal page flow.
-      content: (
-        <div className="h-[calc(100vh-16rem)] min-h-[28rem]">
-          <AgentAccess agentId={agentId} proposed={proposed} />
-        </div>
-      ),
+      // The literal GRANT/DENY SQL governing this key — the headline surface.
+      content: <GrantsSection agentId={agentId} />,
     },
     {
       id: 'keys',
@@ -341,25 +307,10 @@ export default function AgentDetailPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      {/* No-access banner (active + 0 grants, only after data loaded). The CTA is a
-          link because DetailLayout is URL-driven (?section=) — no controlled state. */}
-      {showBanner && (
-        <NoAccessBanner
-          action={
-            <Button size="sm" asChild>
-              <Link href="?section=access" scroll={false}>
-                Grant access
-              </Link>
-            </Button>
-          }
-        />
-      )}
-
       <DetailLayout
         title={agent.name}
         status={agentSemanticStatus(agent)}
-        // A proposal deep-link opens straight on Access; otherwise Overview.
-        defaultSection={proposeParam ? 'access' : 'overview'}
+        defaultSection="overview"
         meta={
           <>
             <span className="flex items-center gap-1">

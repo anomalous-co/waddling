@@ -1,6 +1,7 @@
 /**
  * DELETE /api/cp/acl/:id
- * Revokes a single ACL grant by id. The UI removes it optimistically.
+ * Removes a single literal GRANT/DENY statement row by id (spec §13). The UI
+ * removes it optimistically. Mirrors control-api's `{ success, id }` envelope.
  * Guards against serving when the real control-api is configured.
  */
 export async function DELETE(
@@ -10,6 +11,6 @@ export async function DELETE(
   if (process.env.NEXT_PUBLIC_CONTROL_API_URL) {
     return new Response(null, { status: 404 });
   }
-  await params; // validate presence; mock always succeeds
-  return Response.json({ ok: true });
+  const { id } = await params;
+  return Response.json({ success: true, id });
 }
