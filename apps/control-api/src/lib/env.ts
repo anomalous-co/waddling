@@ -177,4 +177,11 @@ export interface Env {
   // Unset ⇒ cloudSqlConfigured() is false and managed-catalog provisioning degrades.
   PG_HOST?: string;
   PG_PORT?: string;
+
+  // Read-only, narrowly-scoped Postgres DSN the GATEWAY uses to ATTACH the birdshot grant
+  // store (`public.__birdshot_grants` / `__birdshot_meta` in the control DB). Plumbed
+  // through the config-only gateway boot payload; the login is provisioned separately
+  // (see credops.sh) — control-api only forwards the value. Unset ⇒ no grant-store ATTACH
+  // is pushed (the gateway keeps whatever store it has / stays in-memory).
+  BIRDSHOT_STORE_DSN?: string;
 }

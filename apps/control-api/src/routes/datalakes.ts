@@ -21,9 +21,8 @@ import { getCrypto } from '../lib/secret-crypto';
 import { gatewayClientFor, GatewayError } from '../lib/gateway-client';
 import { getCachedCatalog, refreshCatalog } from '../lib/catalog-cache';
 import { recompileAndPush } from '../lib/gateway-push';
-import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
-import { compileEndpointPolicy } from '../lib/effective-policy';
-import { grantVersionFor, authVersionFor, bumpPolicyVersion } from '../lib/policy-version';
+import { grantsForKey, agentSubject, listStatements, epochFor } from '../lib/grant-store';
+import { authVersionFor, bumpPolicyVersion } from '../lib/policy-version';
 import { loadSigningKey } from '../lib/session-jwt';
 import { provisionOrgCatalog } from '../lib/catalog-provision';
 import { provisionGateway, provisionQuackboard, type ProvisionableDatalake } from '../lib/provisioner';
@@ -469,21 +468,19 @@ datalakes.post('/:id/refresh-policy', (c) =>
       [
         caller.orgId,
         id,
-        `pushed=${compiled.pushed ?? false} grants=${compiled.snapshot.roleGrants.length} agents=${compiled.activeAgentIds.length}`,
+        `pushed=${compiled.pushed ?? false} epoch=${compiled.epoch ?? 0}`,
         caller.callerId,
       ],
     );
 
+    // Config-only re-arm (spec §13): grants live in the store; nothing compiled here. `epoch`
+    // is the datalake's grant-store version (the freshness signal birdshot re-reads).
     return ok(c, {
       datalakeId: id,
       pushed: compiled.pushed ?? false,
       pushSkipped: compiled.pushSkipped ?? false,
       pushError: compiled.pushError,
-      grants: compiled.snapshot.roleGrants.length,
-      userRoles: compiled.snapshot.userRoles.length,
-      constraints: (compiled.snapshot.roleConstraints ?? []).length,
-      activeAgents: compiled.activeAgentIds.length,
-      snapshot: compiled.snapshot,
+      epoch: compiled.epoch ?? 0,
     });
   }),
 );
@@ -512,8 +509,10 @@ datalakes.get('/:id/policy', (c) =>
     const u = new URL(c.req.url);
     const includeJwks = u.searchParams.get('includeJwks') === 'true';
 
-    const compiled = await compileEndpointPolicy(id, new Date());
-    const snapshot = compiled.snapshot;
+    // Pull-model (spec §13): the "policy" is the datalake's literal GRANT/DENY SQL statements
+    // (rendered verbatim by the UI) + a `version` = the store epoch mixed with the JWKS version.
+    const statements = await listStatements(id);
+    const epoch = await epochFor(id);
 
     // Load the current signing key (kid/n/e) for the auth version + the optional
     // includeJwks payload. Best-effort: a missing JWKS (jwt plugin not yet minted)
@@ -528,21 +527,21 @@ datalakes.get('/:id/policy', (c) =>
     }
     const jwksArr = jwks ? [jwks] : undefined;
 
-    // Bump the cached policy_version column (migration 013) so the refresh alarm
-    // can poll one column. bumpPolicyVersion returns the version string.
-    const version = await bumpPolicyVersion(id, snapshot, jwksArr);
+    // Bump the cached policy_version column (migration 013) so the refresh alarm can poll one
+    // column. The grant version IS the store epoch now (a mutation bumps it in the same txn).
+    const version = await bumpPolicyVersion(id, epoch, jwksArr);
     return ok(c, {
       datalakeId: id,
       version,
-      grantVersion: grantVersionFor(snapshot),
+      grantVersion: String(epoch),
       authVersion: authVersionFor(jwksArr),
       compiledAt: new Date().toISOString(),
       auth: jwks
         ? { issuer: c.env.JWT_ISSUER, audience: `gw:${id}`, mode: 'rs256' as const }
         : undefined,
       jwks: includeJwks ? jwksArr : undefined,
-      snapshot,
-      activeAgents: compiled.activeAgentIds.length,
+      statements: statements.map((s) => ({ id: s.id, granteeKind: s.grantee_kind, grantee: s.grantee, stmt: s.stmt, version: Number(s.version) })),
+      epoch,
     });
   }),
 );
@@ -735,57 +734,19 @@ datalakes.get('/:id/describe', (c) =>
       assertOrg(caller, target.org_id);
     }
 
-    // Compile the agent's grants (tables + per-table column allow-lists).
-    const ruleRows = await query<AclRuleRow>(
-      `SELECT * FROM waddling.acl_rule
-        WHERE datalake_id = $1 AND (agent_id = $2 OR agent_id IS NULL)`,
-      [datalakeId, agentId],
-    );
-    const compiled = compilePolicy(ruleRows.rows, new Date());
-    const granted = grantsForAgent(compiled, agentId);
-    if (granted.tables.length === 0) {
+    // Pull-model (spec §13): the agent's grants are literal GRANT/DENY SQL, not a compiled
+    // table/column structure. An agent with zero statements has nothing to introspect.
+    const statements = await grantsForKey(datalakeId, agentSubject(agentId));
+    if (statements.length === 0) {
       return ok<DescribeResult>(c, { datalakeId, tables: [] });
     }
-    if (endpoint.status !== 'running') {
-      // Can't introspect a stopped gateway; grants are known but types aren't.
-      return ok<DescribeResult>(c, { datalakeId, tables: [] });
-    }
-
-    // Ask the gateway for columns/types of just the granted tables.
-    // e2e-gated on Stage D gateway reachability — GATEWAY_INTERNAL_URL is a
-    // localhost placeholder unreachable from workerd until the gateway lands on
-    // a CF Container/Durable Object. A failed probe degrades to no-schema so it
-    // never breaks the editor (the original swallowed GatewayError identically).
-    let described: { tables: { schema: string; table: string; columns: { name: string; type: string; nullable?: boolean }[] }[] };
-    try {
-      described = await gatewayClientFor(endpoint).describe(
-        granted.tables.map((t) => ({ schema: t.schema, table: t.table })),
-      );
-    } catch (e) {
-      if (e instanceof GatewayError) return ok<DescribeResult>(c, { datalakeId, tables: [] });
-      throw e;
-    }
-
-    const describedByRef = new Map(
-      described.tables.map((t) => [`${t.schema}.${t.table}`.toLowerCase(), t]),
-    );
-
-    // Intersect introspected columns with the grant (non-leak guarantee).
-    const tables: TableInfo[] = [];
-    for (const g of granted.tables) {
-      if (schemaFilter && g.schema !== schemaFilter) continue;
-      if (tableFilter && g.table !== tableFilter) continue;
-      const d = describedByRef.get(`${g.schema}.${g.table}`.toLowerCase());
-      if (!d) continue; // granted but not present in the lake — omit
-      // Allow-list defined ⇒ keep only those columns; undefined ⇒ all columns.
-      const allow = g.columns ? new Set(g.columns.map((col) => col.toLowerCase())) : null;
-      const columns = (allow ? d.columns.filter((col) => allow.has(col.name.toLowerCase())) : d.columns).map(
-        (col) => ({ name: col.name, type: col.type, nullable: col.nullable }),
-      );
-      tables.push({ schema: g.schema, table: g.table, columns });
-    }
-
-    return ok<DescribeResult>(c, { datalakeId, tables });
+    // Grant-scoped COLUMN introspection (intersecting gateway catalog types with each grant's
+    // ref/column allow-list) needs a re-implementation that parses the literal statements +
+    // reads the gateway catalog. Deferred with the read/display path (§13 FOLLOW-UP); until
+    // then this returns no typed columns (the gateway `describe` surface is 501-gated anyway).
+    // The literal statements themselves are available via GET /:id/policy + GET /acl.
+    void schemaFilter; void tableFilter; void GatewayError;
+    return ok<DescribeResult>(c, { datalakeId, tables: [] as TableInfo[] });
   }),
 );
 
@@ -818,16 +779,38 @@ datalakes.get('/:id/catalog', (c) =>
       return err(c, 'forbidden', 403, 'Only org owners and admins may browse the catalog');
     }
 
+    // Distinct, non-error states for the picker's schema browser:
+    //   ready        — a populated snapshot (fresh or cached) is served.
+    //   empty        — the gateway introspected the lake and it has no tables (real, not an error).
+    //   provisioning — the endpoint isn't 'running' yet, so there is no gateway to introspect.
+    //   unreachable  — endpoint is running but the gateway is cold/stopped and nothing is cached.
+    // The cache is always served when present (never blocked on a live fetch); boot-on-demand
+    // only fires when nothing is cached AND the endpoint is live. `stale` is kept for the
+    // existing UI (true iff we're returning an empty tree we couldn't populate).
     let cached = await getCachedCatalog(datalakeId);
-    if (!cached) {
-      // Boot-on-demand: nothing cached yet — try to populate once (may cold-boot).
+    let reachable = true;
+    if (!cached && endpoint.status === 'running') {
+      // Boot-on-demand: nothing cached yet — try to populate once (may cold-boot). A null
+      // result means the gateway was unreachable; refreshCatalog otherwise caches even an
+      // empty lake, so a subsequent read serves it as the 'empty' state.
       const snap = await refreshCatalog(endpoint);
-      if (snap) cached = await getCachedCatalog(datalakeId);
+      if (snap === null) reachable = false;
+      cached = await getCachedCatalog(datalakeId);
     }
-    if (!cached) {
-      return ok(c, { datalakeId, schemas: [], fetchedAt: null, stale: true });
+    if (cached) {
+      const empty =
+        cached.snapshot.schemas.length === 0 ||
+        cached.snapshot.schemas.every((s) => (s.tables?.length ?? 0) === 0);
+      return ok(c, {
+        datalakeId,
+        schemas: cached.snapshot.schemas,
+        fetchedAt: cached.fetchedAt,
+        stale: false,
+        state: empty ? 'empty' : 'ready',
+      });
     }
-    return ok(c, { datalakeId, schemas: cached.snapshot.schemas, fetchedAt: cached.fetchedAt, stale: false });
+    const state = endpoint.status !== 'running' ? 'provisioning' : 'unreachable';
+    return ok(c, { datalakeId, schemas: [], fetchedAt: null, stale: true, state });
   }),
 );
 
@@ -848,7 +831,10 @@ datalakes.post('/:id/catalog/refresh', (c) =>
     if (!snap) {
       return err(c, 'gateway_unreachable', 503, 'could not fetch catalog (gateway cold or stopped)');
     }
-    return ok(c, { datalakeId, schemas: snap.snapshot.schemas });
+    const empty =
+      snap.snapshot.schemas.length === 0 ||
+      snap.snapshot.schemas.every((s) => (s.tables?.length ?? 0) === 0);
+    return ok(c, { datalakeId, schemas: snap.snapshot.schemas, state: empty ? 'empty' : 'ready' });
   }),
 );
 

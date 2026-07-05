@@ -43,11 +43,25 @@ export async function getCachedCatalog(datalakeId: string): Promise<CachedCatalo
   return { snapshot: row.snapshot, contentHash: row.content_hash, fetchedAt: row.fetched_at };
 }
 
+/** True when a fetched catalog carries no schemas (or no tables under any schema). */
+function isEmptyCatalog(cat: GatewayCatalog): boolean {
+  const schemas = cat?.schemas ?? [];
+  return schemas.length === 0 || schemas.every((s) => (s.tables?.length ?? 0) === 0);
+}
+
 /**
  * Fetch the live catalog from the gateway and upsert the cache iff the content
  * changed (cheap content_hash compare avoids a write on every tick). Returns the
  * fresh snapshot, or null if the gateway was unreachable (cold/stopped/unconfigured)
  * — callers degrade to the cached snapshot or an empty catalog.
+ *
+ * NEVER-WIPE-TO-EMPTY guard: a gateway that answers 200 mid-boot (before the DuckLake
+ * ATTACH completes) returns `{ schemas: [] }`. Blindly upserting that would clobber a
+ * good cached snapshot and blank the authoring picker. So when the FRESH result is empty
+ * but a NON-EMPTY snapshot is already cached, we keep the cached one (no write, fetched_at
+ * unchanged) and return it with changed:false. A genuinely empty lake (nothing cached yet,
+ * or the cache is already empty) still caches the empty result — that is a real state, not
+ * a regression.
  */
 export async function refreshCatalog(
   endpoint: CatalogEndpoint,
@@ -60,10 +74,16 @@ export async function refreshCatalog(
     throw e;
   }
   const hash = await sha256Hex(JSON.stringify(cat));
-  const existing = await queryOne<{ content_hash: string }>(
-    `SELECT content_hash FROM waddling.datalake_catalog WHERE datalake_id = $1`,
+  const existing = await queryOne<{ content_hash: string; snapshot: GatewayCatalog }>(
+    `SELECT content_hash, snapshot FROM waddling.datalake_catalog WHERE datalake_id = $1`,
     [endpoint.id],
   );
+
+  // Never wipe a populated cache with a transient empty read (gateway still warming up).
+  if (existing && isEmptyCatalog(cat) && !isEmptyCatalog(existing.snapshot)) {
+    return { snapshot: existing.snapshot, changed: false };
+  }
+
   const changed = !existing || existing.content_hash !== hash;
   if (changed) {
     await query(

@@ -8,7 +8,6 @@
 
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import type { GatewayConfig } from "./config";
-import type { BirdshotSnapshot } from "@waddling/control-schema";
 
 /** Single-quote escape for inlining a string into a DuckDB SQL literal. */
 function q(s: string): string {
@@ -506,77 +505,77 @@ export async function describeTables(
 
 // ── birdshot control-plane wrappers (applied by the ctrl server) ───────────────
 
+/** CONFIG-ONLY gateway push (spec §13 pull model). No grant tuples — birdshot PULLS literal
+ *  GRANT/DENY SQL from the ATTACHed Postgres store and freshness-validates it itself. */
+export interface GatewayConfigPush {
+  auth?: { issuer: string; audience: string; jwks?: { kid: string; n: string; e: string }[] };
+  /** Read-only Postgres DSN to ATTACH as the protected `__birdshot` catalog. */
+  grantStoreDsn?: string;
+  /** Per-datalake scope for the shared store (birdshot_set_grant_scope). */
+  datalakeId?: string;
+}
+
+/** Idempotent grant-store ATTACH: DETACH-if-exists then ATTACH READ_ONLY, with a short retry
+ *  (mirrors the ducklake ATTACH style) so a briefly-unreachable Postgres store doesn't wedge. */
+async function attachGrantStore(rt: DuckRuntime, dsn: string): Promise<void> {
+  const c = rt.connection;
+  try {
+    await c.run("DETACH DATABASE IF EXISTS __birdshot");
+  } catch {
+    /* not attached / in use — best-effort; the ATTACH below is the source of truth */
+  }
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 15; attempt++) {
+    try {
+      await c.run(`ATTACH ${q(dsn)} AS __birdshot (TYPE postgres, READ_ONLY)`);
+      return;
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  throw lastErr;
+}
+
 /**
- * Apply a full birdshot policy snapshot atomically (reset → set → commit).
- * Mirrors the compiler output in ARCHITECTURE.md §3e. Auth config (issuer,
- * audience, JWKS) is pulled from the gateway config / JWKS endpoint.
+ * Apply the gateway's CONFIG atomically (reset → set → commit), then wire the pull store.
+ * Auth (issuer/audience/JWKS) arm JWT verification; the grant store ATTACH + set_grant_store +
+ * set_grant_scope point birdshot at the literal-SQL store it lazy-pulls + freshness-checks.
  */
-export async function applySnapshot(
-  rt: DuckRuntime,
-  snapshot: BirdshotSnapshot,
-  auth?: { issuer: string; audience: string; jwks?: { kid: string; n: string; e: string }[] },
-): Promise<void> {
+export async function applySnapshot(rt: DuckRuntime, cfg: GatewayConfigPush): Promise<void> {
   const c = rt.connection;
 
-  // Build the ENTIRE birdshot config as one ';'-separated program and apply it in a
-  // single connection.run() round-trip. Previously every jwk/role/grant/constraint/policy
-  // was its own awaited c.run(), so a wildcard-expanded snapshot over a large catalog ×
-  // many agents meant hundreds of serial round-trips on every re-arm — the dominant
-  // apply-side cost when access/url rules change. @duckdb/node-api run(sql) without bind
-  // params executes multiple ';'-separated statements in one native query (the same path
-  // already used for "INSTALL quack; LOAD quack"), and birdshot stages every setter under
-  // one mutex then promotes staging→live on commit, so a single program is still atomic.
+  // Build the CONFIG as one ';'-separated program and apply it in a single run() round-trip
+  // (birdshot stages every setter under one mutex then promotes staging→live on commit, so a
+  // single program is still atomic).
   const stmts: string[] = ["SELECT birdshot_reset_config()"];
 
-  // The lake catalog ALIAS (gateway-local config). birdshot installs it as the
-  // default catalog search path when binding agent SQL on the transient authz-hook
-  // connection — where `USE <alias>` does NOT carry — so bare/unqualified table refs
-  // (form-A push-down) still resolve to the lake. Part of the staged config, so it
-  // is re-set on every snapshot (reset_config above cleared it).
+  // The lake catalog ALIAS (gateway-local config). birdshot installs it as the default catalog
+  // search path when binding agent SQL on the transient authz-hook connection — where
+  // `USE <alias>` does NOT carry — so bare/unqualified table refs (form-A push-down) still
+  // resolve to the lake. Re-set on every push (reset_config above cleared it).
   if (rt.config.lakeAlias) {
     stmts.push(`SELECT birdshot_set_lake_catalog(${q(rt.config.lakeAlias)})`);
   }
-  if (auth) {
-    stmts.push(`SELECT birdshot_set_auth(${q(auth.issuer)}, ${q(auth.audience)}, 'rs256')`);
-    for (const k of auth.jwks ?? []) {
+  if (cfg.auth) {
+    stmts.push(`SELECT birdshot_set_auth(${q(cfg.auth.issuer)}, ${q(cfg.auth.audience)}, 'rs256')`);
+    for (const k of cfg.auth.jwks ?? []) {
       stmts.push(`SELECT birdshot_add_jwk(${q(k.kid)}, ${q(k.n)}, ${q(k.e)})`);
     }
-  }
-  for (const ur of snapshot.userRoles) {
-    stmts.push(`SELECT birdshot_add_user_role(${q(ur.userId)}, ${q(ur.role)})`);
-  }
-  for (const g of snapshot.roleGrants) {
-    stmts.push(`SELECT birdshot_add_role_grant(${q(g.role)}, ${q(g.tableRef)}, ${q(g.action)})`);
-  }
-  // Column allow-lists + time-of-day windows (Phase 2). birdshot enforces these at
-  // the quack authz hook via bind-and-walk; without this push it holds table grants
-  // ONLY and a granted table leaks every column. columns → CSV; absent window → ''.
-  for (const rc of snapshot.roleConstraints ?? []) {
-    const cols = (rc.columns ?? []).join(",");
-    const ws = rc.window?.start ?? "";
-    const we = rc.window?.end ?? "";
-    stmts.push(
-      `SELECT birdshot_add_grant_constraint(${q(rc.role)}, ${q(rc.tableRef)}, ${q(cols)}, ${q(ws)}, ${q(we)})`,
-    );
-  }
-  // Per-role allowlists for NON-catalog resources (Phase 3). Each `kind` maps to a
-  // distinct birdshot policy function; the role can then run an already-CONSTANT
-  // read_source/copy/attach/install whose literal matches the pattern. Without
-  // these, every such capability default-denies (an empty allowlist grants nothing).
-  for (const p of snapshot.policies ?? []) {
-    const fn =
-      p.kind === "source"
-        ? "birdshot_add_source_policy"
-        : p.kind === "dest"
-          ? "birdshot_add_dest_policy"
-          : p.kind === "extension"
-            ? "birdshot_add_ext_policy"
-            : "birdshot_add_attach_policy";
-    stmts.push(`SELECT ${fn}(${q(p.role)}, ${q(p.pattern)})`);
   }
   stmts.push("SELECT birdshot_commit_config()");
 
   await c.run(stmts.join(";\n"));
+
+  // Wire the grant store (OUTSIDE the reset/commit config): ATTACH read-only + point birdshot at
+  // it + scope. birdshot then lazy-pulls + freshness-validates literal GRANT/DENY SQL.
+  if (cfg.grantStoreDsn) {
+    await attachGrantStore(rt, cfg.grantStoreDsn);
+    await c.run(`SELECT birdshot_set_grant_store('table', ${q(cfg.grantStoreDsn)})`);
+    if (cfg.datalakeId) {
+      await c.run(`SELECT birdshot_set_grant_scope(${q(cfg.datalakeId)})`);
+    }
+  }
 
   // Re-expose lake tables as read-through views. The per-replica `memory.main` views
   // quack serves are created at boot (restoreLakeViews in bootDuckRuntime), so a table

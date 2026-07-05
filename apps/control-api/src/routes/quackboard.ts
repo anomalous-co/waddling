@@ -32,7 +32,7 @@ import { Hono } from 'hono';
 import { importJWK, SignJWT, type JWK } from 'jose';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
-import type { BirdshotSnapshot } from '../lib/types';
+import { grant, applyStatement } from '../lib/grant-store';
 import {
   gatewayClientFor,
   GatewayError,
@@ -63,25 +63,26 @@ function lit(s: string): string {
   return "'" + String(s).replace(/'/g, "''") + "'";
 }
 
-/** Build the FULL org birdshot snapshot: every active agent gets RW on the shared tables.
- *  The QuackboardDO is shared per org and applySnapshot does reset→add→commit, so pushing
- *  only the connecting agent would wipe the others — we always push the whole org. */
-async function buildOrgQuackboardSnapshot(orgId: string): Promise<BirdshotSnapshot> {
-  const agents = await query<{ id: string }>(
-    `SELECT id FROM waddling.agent WHERE org_id = $1 AND status = 'active'`,
-    [orgId],
-  );
-  const userRoles: BirdshotSnapshot['userRoles'] = [];
-  const roleGrants: BirdshotSnapshot['roleGrants'] = [];
-  for (const a of agents.rows) {
-    const role = `agent_${a.id}`;
-    userRoles.push({ userId: `agent:${a.id}`, role });
-    for (const t of QB_SHARED_TABLES) {
-      roleGrants.push({ role, tableRef: `main.${t}`, action: 'read' });
-      roleGrants.push({ role, tableRef: `main.${t}`, action: 'write' });
-    }
+/** Ensure the quackboard's shared-table grants exist in the store (spec §13 pull model).
+ *  A quackboard is a SHARED board: every active agent gets RW on the shared tables — which is
+ *  exactly `TO PUBLIC` (reaches every authenticated identity), so no per-agent fan-out and no
+ *  per-connect re-push. RW → the granular DML set (SELECT/INSERT/UPDATE/DELETE). Idempotent:
+ *  each PUBLIC grant is written ONCE (the store is append-only, so we skip an identical row).
+ *  Scoped to the quackboard datalake so birdshot pulls it under set_grant_scope(datalakeId). */
+async function ensureQuackboardGrants(datalakeId: string): Promise<void> {
+  for (const t of QB_SHARED_TABLES) {
+    const stmt = grant({
+      privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'],
+      on: `main.${t}`,
+      to: 'public',
+    });
+    const exists = await queryOne<{ one: number }>(
+      `SELECT 1 AS one FROM public.__birdshot_grants
+        WHERE datalake = $1 AND grantee_kind = 'public' AND stmt = $2 LIMIT 1`,
+      [datalakeId, stmt],
+    );
+    if (!exists) await applyStatement(datalakeId, stmt);
   }
-  return { userRoles, roleGrants };
 }
 
 interface JwksRow {
@@ -115,8 +116,9 @@ interface QbContext {
   gatewayUrl: string | null;
   jwt: string;
   gatewayBoot: GatewayBoot;
-  snapshot: BirdshotSnapshot;
   auth: { issuer: string; audience: string; mode: 'rs256'; jwks: { kid: string; n: string; e: string }[] };
+  /** Read-only grant-store DSN pushed to the QB gateway (config-only §13). */
+  grantStoreDsn?: string;
 }
 
 /** Resolve the org's quackboard + acting agent, build the snapshot, mint the agent's JWT. */
@@ -152,7 +154,7 @@ async function prepareQbContext(c: Parameters<typeof resolveCaller>[0], env: Env
     throw new AuthError('not_a_quackboard', 500, 'resolved boot config is not a quackboard');
   }
 
-  const snapshot = await buildOrgQuackboardSnapshot(orgId);
+  await ensureQuackboardGrants(ep.id);
   const { kid, publicJwk, privateJwk } = await loadSigningKey();
   const audience = `qb:${orgId}`;
   const auth = {
@@ -174,7 +176,7 @@ async function prepareQbContext(c: Parameters<typeof resolveCaller>[0], env: Env
     .setExpirationTime(`${QB_JWT_TTL_SECONDS}s`)
     .sign(key);
 
-  return { orgId, datalakeId: ep.id, agentId, agentRole: agentId, gatewayUrl: ep.gateway_url, jwt, gatewayBoot: boot.gatewayBoot, snapshot, auth };
+  return { orgId, datalakeId: ep.id, agentId, agentRole: agentId, gatewayUrl: ep.gateway_url, jwt, gatewayBoot: boot.gatewayBoot, auth, grantStoreDsn: env.BIRDSHOT_STORE_DSN };
 }
 
 /** Resolve the acting agent: API-key agents are themselves; delegated OAuth callers get a
@@ -213,8 +215,8 @@ async function configureQb(ctx: QbContext): Promise<GatewayAck> {
       return await gw(ctx).pushSnapshot({
         datalakeId: ctx.datalakeId,
         auth: ctx.auth,
-        snapshot: ctx.snapshot,
         lakeCatalog: 'quackboard',
+        grantStoreDsn: ctx.grantStoreDsn,
         gatewayBoot: ctx.gatewayBoot,
       });
     } catch (e) {

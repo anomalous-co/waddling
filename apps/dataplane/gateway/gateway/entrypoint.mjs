@@ -207,13 +207,13 @@ async function main() {
       const prevAlias = rt.config.lakeAlias;
       if (parsed.lakeCatalog) rt.config.lakeAlias = parsed.lakeCatalog;
       try {
-        await applySnapshot(rt, parsed.snapshot, parsed.auth);
+        await applySnapshot(rt, { auth: parsed.auth, grantStoreDsn: parsed.grantStoreDsn, datalakeId: parsed.endpointId });
       } finally {
         rt.config.lakeAlias = prevAlias;
       }
-      lastSnapshot = { snapshot: parsed.snapshot, auth: parsed.auth, lakeCatalog: parsed.lakeCatalog };
+      lastSnapshot = { auth: parsed.auth, grantStoreDsn: parsed.grantStoreDsn, datalakeId: parsed.endpointId, lakeCatalog: parsed.lakeCatalog };
       bootSnapshotVersion = Number(process.env.GW_BOOT_SNAPSHOT_VERSION || 0);
-      log(`boot-armed birdshot snapshot v${bootSnapshotVersion} (${parsed.snapshot?.roleGrants?.length ?? 0} grants) — no /ctrl/snapshot round-trip needed`);
+      log(`boot-armed birdshot config v${bootSnapshotVersion} (grants pulled from store) — no /ctrl/snapshot round-trip needed`);
     } catch (e) {
       log(`boot snapshot apply failed (director will push via /ctrl/snapshot): ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -326,11 +326,6 @@ async function main() {
     // ── Control channel (in-process birdshot, trusted connection) ──────────────
     if (path === "/ctrl/snapshot" && method === "POST") {
       const body = await readJson(req);
-      if (!body.snapshot) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "missing snapshot" }));
-        return;
-      }
       // applySnapshot wires birdshot_set_auth(...,'rs256') + birdshot_add_jwk for
       // each JWK when `auth` is present → birdshot runs in PRODUCTION RS256 mode.
       // applySnapshot calls birdshot_set_lake_catalog(rt.config.lakeAlias) so the
@@ -341,14 +336,14 @@ async function main() {
       const prevAlias = rt.config.lakeAlias;
       if (body.lakeCatalog) rt.config.lakeAlias = body.lakeCatalog;
       try {
-        await applySnapshot(rt, body.snapshot, body.auth);
+        await applySnapshot(rt, { auth: body.auth, grantStoreDsn: body.grantStoreDsn, datalakeId: body.endpointId });
       } finally {
         rt.config.lakeAlias = prevAlias;
       }
       // Cache for /ctrl/reapply (restore the alias override the re-apply needs).
-      lastSnapshot = { snapshot: body.snapshot, auth: body.auth, lakeCatalog: body.lakeCatalog };
+      lastSnapshot = { auth: body.auth, grantStoreDsn: body.grantStoreDsn, datalakeId: body.endpointId, lakeCatalog: body.lakeCatalog };
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, grants: body.snapshot.roleGrants.length }));
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
 
@@ -378,12 +373,12 @@ async function main() {
       const prevAlias = rt.config.lakeAlias;
       if (lastSnapshot.lakeCatalog) rt.config.lakeAlias = lastSnapshot.lakeCatalog;
       try {
-        await applySnapshot(rt, lastSnapshot.snapshot, lastSnapshot.auth);
+        await applySnapshot(rt, { auth: lastSnapshot.auth, grantStoreDsn: lastSnapshot.grantStoreDsn, datalakeId: lastSnapshot.datalakeId });
       } finally {
         rt.config.lakeAlias = prevAlias;
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, reapplied: true, grants: lastSnapshot.snapshot.roleGrants.length }));
+      res.end(JSON.stringify({ ok: true, reapplied: true }));
       return;
     }
 

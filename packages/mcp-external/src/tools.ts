@@ -302,10 +302,11 @@ export function registerTools(
     "waddling_whoami",
     {
       description:
-        "Orient yourself: returns your agent identity, org, active grants (tables/verbs/row-limits), " +
-        "remaining session TTL, and rate-limit headroom. Call this any time to understand exactly what " +
-        "you can do — no trial-and-error denials needed. Pass `session_id` for live session TTL, or omit " +
-        "for your standing identity + default grants.",
+        "Orient yourself: returns your agent identity, org, and your active access as the LITERAL " +
+        "GRANT/DENY SQL governing your key — `grants.statements` for the session/datalake in scope, plus " +
+        "`grantsByDatalake[]` (the same grant SQL in every datalake you can reach) so a bare call still " +
+        "shows exactly what you can do — no trial-and-error denials needed. Pass `session_id` for live " +
+        "session TTL, or omit for your standing identity + grants.",
       inputSchema: {
         session_id: z.string().optional().describe("Optional open session to report live TTL for."),
       },

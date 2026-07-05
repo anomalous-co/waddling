@@ -11,20 +11,13 @@
 
 // ── Session / Connect ──────────────────────────────────────────────────────────
 export interface SessionGrant {
-  tables: {
-    schema: string;
-    table: string;
-    verbs: ('read' | 'write')[];
-    columns?: string[];
-    rowLimit?: number;
-  }[];
   /**
-   * Non-read/write catalog capabilities the agent holds on this lake
-   * (create/drop/alter/detach). Surfaced so an agent connected to an EMPTY lake —
-   * which has no read/write tables to list — still knows it can bootstrap tables.
-   * Omitted when empty.
+   * The literal GRANT/DENY SQL statements governing this key (spec §13 — the SINGLE
+   * representation, rendered verbatim by the UI): the subject's own rows ∪ PUBLIC ∪
+   * transitive roles, as pulled from `public.__birdshot_grants`. This replaces the old
+   * compiled table/verb view — there is no compiler.
    */
-  capabilities?: ('create' | 'drop' | 'alter' | 'detach')[];
+  statements: string[];
 }
 
 // A workspace HANDLE — what connect returns in the Cloudflare data-plane model. The
@@ -214,11 +207,25 @@ export interface ExplainResult {
   tableGrants?: { schema: string; table: string; verbs: ('read' | 'write')[] }[];
 }
 
+/** An agent's literal grant SQL in one datalake (whoami surfaces these across all datalakes). */
+export interface DatalakeGrants {
+  datalakeId: string;
+  datalakeName?: string;
+  /** The literal GRANT/DENY SQL for this key in this datalake (subject ∪ PUBLIC ∪ roles). */
+  statements: string[];
+}
+
 export interface WhoamiResult {
   agentId: string;
   orgId: string;
   name: string;
+  /** Grants for the session/datalake in scope (empty when none is specified). */
   grants: SessionGrant;
+  /**
+   * The agent's literal grant SQL in EVERY datalake it has access in — so a bare
+   * `waddling_whoami` (no session) always shows what the key can do, verbatim.
+   */
+  grantsByDatalake?: DatalakeGrants[];
   remainingTtlSeconds?: number;
   rateLimitHeadroom?: number;
 }
@@ -281,8 +288,10 @@ export interface SessionSummary {
 }
 
 export interface GrantResult {
-  ruleId: string;
-  compiledGrants: BirdshotSnapshot;
+  /** The id of the appended `public.__birdshot_grants` row. */
+  grantId: string;
+  /** The literal statement that was written (echoed back for the UI). */
+  statement: string;
 }
 
 export interface RevokeResult {

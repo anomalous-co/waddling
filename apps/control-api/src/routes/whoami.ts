@@ -15,8 +15,8 @@ import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
 import { resolveCaller, handle, ok, err, assertOrg } from '../lib/cp-shared';
-import { compilePolicy, grantsForAgent, type AclRuleRow } from '../lib/policy-compiler';
-import type { SessionGrant, WhoamiResult } from '../lib/types';
+import { grantsForKey, agentSubject } from '../lib/grant-store';
+import type { SessionGrant, WhoamiResult, DatalakeGrants } from '../lib/types';
 
 export const whoami = new Hono<{ Bindings: Env }>();
 
@@ -28,7 +28,7 @@ interface SessionRow {
   expires_at: string;
 }
 
-const EMPTY_GRANT: SessionGrant = { tables: [] };
+const EMPTY_GRANT: SessionGrant = { statements: [] };
 
 whoami.get('/', (c) =>
   handle(c, async () => {
@@ -69,16 +69,38 @@ whoami.get('/', (c) =>
       name = a.name;
     }
 
-    // Grants are per-(datalake, agent): only meaningful when both are known.
+    // Grants are the agent's literal GRANT/DENY SQL (subject ∪ PUBLIC ∪ transitive roles),
+    // verbatim. `grants` is the resolved session/datalake in scope; `grantsByDatalake` is the
+    // key's grant SQL in EVERY datalake it has access in — so a bare whoami (no session) still
+    // shows what the agent can do. Both come from the same store, no compiler.
     let grants: SessionGrant = EMPTY_GRANT;
-    if (agentId && datalakeId) {
-      const ruleRows = await query<AclRuleRow>(
-        `SELECT * FROM waddling.acl_rule
-          WHERE datalake_id = $1 AND (agent_id = $2 OR agent_id IS NULL)`,
-        [datalakeId, agentId],
+    let grantsByDatalake: DatalakeGrants[] | undefined;
+    if (agentId) {
+      const subject = agentSubject(agentId);
+      if (datalakeId) {
+        grants = { statements: await grantsForKey(datalakeId, subject) };
+      }
+      // Every datalake (in the caller's org) where this key has grant rows.
+      const dls = await query<{ datalake: string; name: string | null }>(
+        `SELECT DISTINCT g.datalake, d.name
+           FROM public.__birdshot_grants g
+           JOIN waddling.datalake d ON d.id = g.datalake
+          WHERE g.grantee = $1 AND d.org_id = $2
+          ORDER BY d.name`,
+        [subject, caller.orgId],
       );
-      const compiled = compilePolicy(ruleRows.rows, new Date());
-      grants = grantsForAgent(compiled, agentId);
+      grantsByDatalake = [];
+      for (const dl of dls.rows) {
+        grantsByDatalake.push({
+          datalakeId: dl.datalake,
+          datalakeName: dl.name ?? undefined,
+          statements: await grantsForKey(dl.datalake, subject),
+        });
+      }
+      // No explicit datalake but the agent lives in exactly one → surface it as the primary grants.
+      if (!datalakeId && grantsByDatalake.length === 1) {
+        grants = { statements: grantsByDatalake[0].statements };
+      }
     }
 
     const result: WhoamiResult = {
@@ -86,6 +108,7 @@ whoami.get('/', (c) =>
       orgId: caller.orgId,
       name,
       grants,
+      grantsByDatalake,
       remainingTtlSeconds,
     };
     return ok<WhoamiResult>(c, result);

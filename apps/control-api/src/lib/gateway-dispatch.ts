@@ -25,8 +25,6 @@
  */
 import { query, runInDbScope } from './db';
 import { recompileAndPush } from './gateway-push';
-import { compileEndpointPolicy } from './effective-policy';
-import type { CompileResult } from './policy-compiler';
 import { gatewayClientFor, initDataplane } from './gateway-client';
 import { refreshCatalog, type CatalogEndpoint } from './catalog-cache';
 import type { Env } from './env';
@@ -38,25 +36,20 @@ import type { Env } from './env';
  * per-replica apply), then ENQUEUES delivery and kicks an immediate drain. The expensive
  * gateway push happens off the request path and coalesces with any concurrent edit.
  *
- * Mirrors recompileAndPush's signature/return so callers swap one import + one call.
- * A null datalake (global-scope delegation) has no gateway to reach: compile-empty, no
- * enqueue (a later per-endpoint connect/recompile picks it up).
+ * Pull-model cutover (spec §13): there is nothing to COMPILE anymore — grants live in the
+ * literal-SQL store and the gateway pulls them. This now just ENQUEUES a durable CONFIG
+ * dispatch (auth/JWKS/lakeCatalog/grantStoreDsn) and kicks an immediate drain. Kept on the
+ * edit paths so a JWKS/lake change re-arms the gateway; grant edits (acl.ts) don't need it
+ * at all (they write the store + bump the epoch, and the gateway re-pulls on next authorize).
+ * A null datalake has no gateway to reach: no-op.
  */
 export async function recompileAndEnqueue(
   c: { env: Env; executionCtx: ExecutionContext },
   datalakeId: string | null,
-): Promise<CompileResult> {
-  if (!datalakeId) {
-    return {
-      snapshot: { roleGrants: [], userRoles: [], roleConstraints: [] },
-      constraints: [],
-      activeAgentIds: [],
-    };
-  }
-  const compiled = await compileEndpointPolicy(datalakeId, new Date());
+): Promise<void> {
+  if (!datalakeId) return;
   await enqueueSnapshotDispatch(datalakeId);
   kickDispatch(c, datalakeId);
-  return compiled;
 }
 
 /**
@@ -92,19 +85,27 @@ export async function refreshCatalogAndEnqueue(
 }
 
 /**
- * Periodic backstop for tables created/dropped/renamed OUT-OF-BAND (not via governed ETL):
- * for every running datalake whose gateway is currently WARM, pull the live catalog and
- * enqueue a recompile when it changed. Gated on `/gw/status` (which derives state WITHOUT
- * waking the pool) so a sleeping gateway is never cold-booted — an asleep gateway has no
- * held session to serve stale grants to, and its next connect refreshes the catalog anyway.
+ * Periodic catalog-freshness pass: for every running datalake whose gateway is currently
+ * WARM, pull the live catalog and upsert `waddling.datalake_catalog` so the authoring
+ * picker always reads a fresh schema/table/column tree. Gated on `/gw/status` (which
+ * derives state WITHOUT waking the pool) so a sleeping gateway is never cold-booted — a
+ * cold gateway keeps its last snapshot and refreshes lazily on the next connect / on-demand
+ * picker read. `refreshCatalog` itself never wipes a populated cache to empty (see its
+ * never-wipe guard), so a mid-boot warm gateway can't blank the picker.
  *
- * Runs in the caller's DB scope; assumes initDataplane already ran (the cron does it). Pass
- * a context WITHOUT executionCtx so kickDispatch is a no-op here — the cron's own drain pass
- * (which runs right after this) delivers the freshly-enqueued snapshots in the same tick.
+ * DECOUPLED from grant compilation (spec §13 pull model): this runs PURELY to keep the
+ * catalog cache fresh. It no longer enqueues a snapshot dispatch on change — grants are
+ * literal GRANT/DENY SQL that birdshot pulls + evaluates live against the lake catalog at
+ * authorize time, so a wildcard grant auto-covers a new/renamed table with no recompile or
+ * re-push. (Previously it called refreshCatalogAndEnqueue, coupling catalog freshness to a
+ * now-vestigial gateway push.)
+ *
+ * Runs in the caller's DB scope; assumes initDataplane already ran (the cron does it).
  */
 export async function refreshWarmCatalogs(
   env: Env,
 ): Promise<{ scanned: number; warm: number; changed: number }> {
+  void env;
   const { rows } = await query<CatalogEndpoint>(
     `SELECT id, org_id, status, server_token, gateway_url
        FROM waddling.datalake WHERE status = 'running'`,
@@ -116,8 +117,8 @@ export async function refreshWarmCatalogs(
       const st = await gatewayClientFor(ep).status(ep.id); // no wake
       if (st.state !== 'running') continue;
       warm++;
-      const r = await refreshCatalogAndEnqueue({ env }, ep.id, ep);
-      if (r.changed) changed++;
+      const r = await refreshCatalog(ep); // pure cache refresh — no dispatch enqueue
+      if (r?.changed) changed++;
     } catch {
       /* best-effort per datalake; keep scanning the rest */
     }

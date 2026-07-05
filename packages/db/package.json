@@ -10,6 +10,9 @@
   },
   "scripts": {
     "boot": "node --experimental-strip-types src/boot.ts",
+    "hydration:pg": "node --experimental-strip-types src/birdshot-hydration-pg.test.ts",
+    "grant-store:e2e": "node --experimental-strip-types src/grant-store-e2e.test.ts",
+    "grant-store:scoped": "node --experimental-strip-types src/grant-store-scoped.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -222,7 +222,10 @@ export const gateway = actor({
      * Reuses the exact gateway wrapper used by the real ctrl server.
      */
     applyPolicy: async (c, snapshot: BirdshotSnapshot, auth: AuthConfig) => {
-      await applySnapshot(await ensure(c), snapshot, auth);
+      // Pull-model (spec §13): applySnapshot is CONFIG-only now — birdshot pulls grants from the
+      // store. The legacy `snapshot` arg is ignored (kept for the PoC action's signature).
+      void snapshot;
+      await applySnapshot(await ensure(c), { auth });
       return { applied: true };
     },
   },

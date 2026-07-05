@@ -88,3 +88,52 @@ export interface Dialect {
   keywords: DialectKeyword[];
   functions: DialectFunction[];
 }
+
+// ── Per-agent grants / ACL ───────────────────────────────────────────────
+// The control plane authors access as literal GRANT/DENY SQL. Two surfaces:
+//  - GET /api/cp/agents/:id/grants → the key's verbatim statements (display).
+//  - GET/POST/DELETE /api/cp/acl   → the editable, id-bearing rule set.
+
+/** Verbatim statements the agent key resolves to (incl. role-inherited). */
+export interface AgentGrants {
+  statements: string[];
+}
+
+export type AclPrivilege =
+  | "SELECT"
+  | "INSERT"
+  | "UPDATE"
+  | "DELETE"
+  | "TRUNCATE"
+  | "CREATE"
+  | "DROP"
+  | "ALTER"
+  | "USAGE"
+  | "EXECUTE";
+
+export type AclEffect = "allow" | "deny";
+
+/** One editable ACL rule. `id` is required for DELETE; `statement` (if the
+ * backend renders it) is preferred verbatim, else the row is synthesized. */
+export interface AclRule {
+  id: string;
+  datalakeId?: string;
+  agentId?: string;
+  privilege: AclPrivilege;
+  columns?: string[] | null;
+  schema: string;
+  table: string;
+  effect: AclEffect;
+  statement?: string;
+}
+
+/** POST /api/cp/acl body. `table: "*"` = all tables in the schema. */
+export interface CreateAclInput {
+  datalakeId: string;
+  agentId: string;
+  privilege: AclPrivilege;
+  columns?: string[];
+  schema: string;
+  table: string;
+  effect: AclEffect;
+}

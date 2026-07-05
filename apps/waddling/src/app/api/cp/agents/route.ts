@@ -1,4 +1,5 @@
 import { makeFixtureAgents } from '@/lab/fixtures/agents';
+import { authorFromBody, type AclPostBody } from '@/lab/fixtures/grants';
 import type { AgentSummary } from '@/lib/types';
 
 /**
@@ -20,8 +21,13 @@ export function GET() {
  * `sk_agent_…` API key. The key is generated here and never stored; in
  * production this would be hashed server-side and returned once.
  *
- * Expected body: { name: string; description?: string; mode?: 'read-only' | 'read-write' }
- * Response: { agent: AgentSummary; key: string }
+ * Expected body: { name, description?, mode?, defaultRole?, grants?: AclAuthorBody[] }
+ * where each grant mirrors the POST /api/cp/acl author body (target defaults to
+ * the new agent). Response: { agent: AgentSummary; key: string }.
+ *
+ * The lab mock creates the agent and echoes it back; granted access is not
+ * persisted here (no store), but the shape is accepted so the create flow can post
+ * the draft's statements in one call exactly as production control-api fans them out.
  */
 export async function POST(request: Request) {
   if (process.env.NEXT_PUBLIC_CONTROL_API_URL) {
@@ -32,10 +38,14 @@ export async function POST(request: Request) {
     name?: string;
     description?: string;
     mode?: string;
+    defaultRole?: string;
+    grants?: unknown[];
   };
 
   const name = (body.name ?? 'unnamed-agent').trim();
   const description = body.description?.trim();
+  const agentMode = body.mode === 'delegated' ? 'delegated' : 'autonomous';
+  const defaultRole = body.defaultRole ?? 'reader';
 
   // Generate a believable reveal-once key
   const randomHex = () =>
@@ -47,13 +57,26 @@ export async function POST(request: Request) {
     orgId: 'org_01j8k9m2n3p4q5r6s7t8u9v0w',
     name,
     description,
-    defaultRole: 'reader',
-    mode: 'autonomous',
+    defaultRole,
+    mode: agentMode,
     status: 'active',
     lastSeenAt: undefined,
     owner: 'mirri@anomalous.computer',
     activeSessions: 0,
   };
 
-  return Response.json({ agent, key }, { status: 201 });
+  // Fan out the draft's grants best-effort (per-grant result, not transactional).
+  const grants = Array.isArray(body.grants)
+    ? (body.grants as AclPostBody[]).map((g) => {
+        const withDefaults: AclPostBody = {
+          ...g,
+          target: g.membership ? undefined : g.target ?? { kind: 'agent', agentId: agent.id },
+          membership: g.membership ? { ...g.membership, agentId: g.membership.agentId ?? agent.id } : undefined,
+        };
+        const row = authorFromBody(withDefaults);
+        return { datalakeId: g.datalakeId ?? null, sql: row.sql, ok: true as const };
+      })
+    : [];
+
+  return Response.json({ agent, key, grants }, { status: 201 });
 }

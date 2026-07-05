@@ -17,34 +17,39 @@ import { query, queryOne } from '../lib/db';
 import { getEntitlements } from '../lib/entitlements';
 import type { Env } from '../lib/env';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err, AuthError } from '../lib/cp-shared';
+import {
+  grantsForKeyDetailed, agentSubject, granteeFromInput,
+  grant, deny, applyStatement, GRANULAR_PRIVILEGES,
+} from '../lib/grant-store';
+import { parseStatement } from '../lib/grant-parse';
 import { makePostHog } from '../lib/posthog';
 import { buildAuth } from '../lib/auth';
 import {
-  recompileAndEnqueue,
   enqueueRevokeDispatch,
   enqueueSnapshotDispatch,
   kickDispatch,
 } from '../lib/gateway-dispatch';
 import type { AgentSummary } from '../lib/types';
 
-const CAPABILITY_VALUES = [
-  'read', 'write', 'create', 'drop', 'alter',
-  'read_source', 'copy_to', 'copy_from',
-  'attach', 'detach', 'install', 'load', 'etl',
-] as const;
+// The discriminated grantee for a create-time grant (defaults to the NEW agent when omitted).
+const CreateTargetSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('agent'), agentId: z.string().min(1) }),
+  z.object({ kind: z.literal('role'), role: z.string().min(1) }),
+  z.object({ kind: z.literal('public') }),
+]);
 
-// One initial grant authored in the create-and-scope wizard. Each maps 1:1 to an
-// agent-subject acl_rule on a datalake. A concrete table → {schema,table}; an "entire
-// schema" → {schema, table:'*'}; "entire lake" → {schema:'*', table:'*'} (the compiler
-// expands read/write wildcards against the cached catalog).
+// One initial GRANULAR grant authored at agent creation (grant-ux-plan §5/§8.2). Each is
+// applied through the literal GRANT/DENY-SQL store (lib/grant-store.applyStatement), NOT the
+// retired coarse acl_rule+compiler path. `target` defaults to the new agent's subject.
 const GrantInputSchema = z.object({
   datalakeId: z.string().min(1),
-  capability: z.enum(CAPABILITY_VALUES).default('read'),
+  target: CreateTargetSchema.optional(),
+  privilege: z.enum(GRANULAR_PRIVILEGES).optional(),
+  privileges: z.array(z.enum(GRANULAR_PRIVILEGES)).optional(),
+  columns: z.array(z.string()).optional(),
   schema: z.string().default('*'),
   table: z.string().default('*'),
-  columns: z.array(z.string()).optional(),
-  rowLimit: z.number().int().positive().optional(),
-  ttlSeconds: z.number().int().positive().optional(),
+  allTablesInSchema: z.boolean().optional(),
   effect: z.enum(['allow', 'deny']).default('allow'),
 });
 
@@ -212,27 +217,45 @@ agents.post('/', (c) =>
           groups: { organization: caller.orgId },
         });
       }
-      // Create-and-scope: insert the agent's initial grants (agent-subject acl_rule
-      // rows) + a single recompile/push per datalake. Datalakes were validated up-front,
-      // so this can't orphan; it runs after the agent row exists so agent_id is set.
-      const grantedScope: { datalakeId: string; capability: string; schema: string; table: string }[] = [];
+      // Create-and-scope (granular): apply the initial grants through the literal GRANT/DENY-SQL
+      // store — the SAME path as POST /api/cp/acl. The agent + key are already minted (returned
+      // once), so a grant failure must NOT fail the whole create: apply best-effort and report
+      // per-grant success/failure. `target` defaults to the new agent's own subject.
+      const grantResults: { datalakeId: string; sql: string | null; ok: boolean; error?: string }[] = [];
       if (agentRow?.id && input.grants?.length) {
-        const datalakeIds = new Set<string>();
-        for (const g of input.grants) {
-          const verb = g.capability === 'write' ? 'write' : 'read';
-          const expiresAt = g.ttlSeconds ? new Date(Date.now() + g.ttlSeconds * 1000).toISOString() : null;
-          await query(
-            `INSERT INTO waddling.acl_rule
-               (org_id, datalake_id, agent_id, subject_kind, capability,
-                schema_name, table_name, columns, verb, effect, row_limit, ttl_seconds, expires_at, created_by)
-             VALUES ($1,$2,$3,'agent',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-            [caller.orgId, g.datalakeId, agentRow.id, g.capability, g.schema, g.table,
-             g.columns ?? null, verb, g.effect, g.rowLimit ?? null, g.ttlSeconds ?? null, expiresAt, caller.callerId],
+        // Mirror POST /api/cp/acl's owner/admin gate: a create-time grant to a role or PUBLIC
+        // (org-wide) requires owner/admin — the agent-target default (common path) does not.
+        const wantsAdmin = input.grants.some((g) => g.target && g.target.kind !== 'agent');
+        let isAdmin = false;
+        if (wantsAdmin) {
+          const member = await queryOne<{ role: string }>(
+            `SELECT role FROM "member" WHERE "userId" = $1 AND "organizationId" = $2`,
+            [caller.callerId, caller.orgId],
           );
-          datalakeIds.add(g.datalakeId);
-          grantedScope.push({ datalakeId: g.datalakeId, capability: g.capability, schema: g.schema, table: g.table });
+          isAdmin = !!member && ['owner', 'admin'].includes(member.role);
         }
-        for (const dlId of datalakeIds) await recompileAndEnqueue(c, dlId);
+        for (const g of input.grants) {
+          let sql: string | null = null;
+          try {
+            if (g.target && g.target.kind !== 'agent' && !isAdmin) {
+              throw new Error('Only org owners and admins may author role/PUBLIC grants');
+            }
+            const privileges = g.privileges && g.privileges.length
+              ? g.privileges
+              : (g.privilege ? [g.privilege] : []);
+            if (privileges.length === 0) throw new Error('a privilege (or non-empty privileges[]) is required');
+            const to = granteeFromInput(g.target ?? { kind: 'agent', agentId: agentRow.id });
+            const on = (g.allTablesInSchema || g.table === '*')
+              ? `ALL TABLES IN SCHEMA ${g.schema}`
+              : `${g.schema}.${g.table}`;
+            const opts = { privileges, columns: g.columns, on, to };
+            sql = g.effect === 'deny' ? deny(opts) : grant(opts);
+            await applyStatement(g.datalakeId, sql);
+            grantResults.push({ datalakeId: g.datalakeId, sql, ok: true });
+          } catch (e) {
+            grantResults.push({ datalakeId: g.datalakeId, sql, ok: false, error: (e as Error).message });
+          }
+        }
       }
 
       // agent + key: additive fields for the dashboard (backward-compatible with
@@ -259,7 +282,7 @@ agents.post('/', (c) =>
           // additive fields (dashboard + future consumers):
           agent,
           key: created.key, // alias for apiKey — shown once
-          grants: grantedScope, // initial scope created in the same action (may be empty)
+          grants: grantResults, // per-grant apply result (best-effort; may be empty)
         },
         201,
       );
@@ -353,6 +376,43 @@ agents.get('/:id', (c) =>
       sessions,
     };
     return ok(c, { agent });
+  }),
+);
+
+// GET /:id/grants — the agent key's LITERAL GRANT/DENY SQL for a datalake (spec §13). Returns
+// grantsForKeyDetailed(datalake, 'agent:<id>'): the subject's own rows ∪ PUBLIC ∪ transitive
+// roles, each as { sql, parsed, inherited } so the UI can render + mark inherited rows read-only
+// (grant-ux-plan §4.1). Org-scoped; ?datalakeId= required.
+agents.get('/:id/grants', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    const id = c.req.param('id');
+    const url = new URL(c.req.url);
+    const datalakeId = url.searchParams.get('datalakeId');
+    if (!datalakeId) return err(c, 'datalakeId_required', 400, 'datalakeId query param is required');
+
+    const agent = await load(id);
+    if (!agent) return err(c, 'agent_not_found', 404);
+    assertOrg(caller, agent.org_id);
+
+    // Tenant-isolate the datalake too.
+    const ep = await queryOne<{ org_id: string }>(
+      `SELECT org_id FROM waddling.datalake WHERE id = $1`,
+      [datalakeId],
+    );
+    if (!ep) return err(c, 'endpoint_not_found', 404);
+    assertOrg(caller, ep.org_id);
+
+    // Resolved own ∪ PUBLIC ∪ transitive-role statements, each carrying its `parsed`
+    // decomposition + `inherited` provenance (own rows → null; role/PUBLIC rows → read-only in
+    // the UI). See grant-ux-plan §4.1.
+    const resolved = await grantsForKeyDetailed(datalakeId, agentSubject(id));
+    const statements = resolved.map((r) => ({
+      sql: r.stmt,
+      parsed: parseStatement(r.stmt),
+      inherited: r.inherited,
+    }));
+    return ok(c, { agentId: id, datalakeId, statements });
   }),
 );
 

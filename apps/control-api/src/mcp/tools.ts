@@ -490,10 +490,12 @@ export const TOOLS: McpTool[] = [
   {
     name: 'waddling_whoami',
     description:
-      'Orient yourself: returns your agent identity, org, active grants (tables/verbs), and remaining ' +
-      'session TTL. Call any time to understand exactly what you can do — no trial-and-error denials. ' +
-      'Pass `session_id` for live grants + TTL, or omit for your standing identity. Also the way to ' +
-      'confirm a waddling_request_access approval: poll this until the requested grants show in `granted`.',
+      'Orient yourself: returns your agent identity, org, and your active access as the LITERAL ' +
+      'GRANT/DENY SQL governing your key — `grants.statements` for the session/datalake in scope, and ' +
+      '`grantsByDatalake[]` (the same grant SQL in every datalake you can reach) so a bare call still ' +
+      'shows exactly what you can do — no trial-and-error denials. Pass `session_id` for live grants + ' +
+      'remaining TTL, or omit for your standing identity. Also the way to confirm a ' +
+      'waddling_request_access approval: poll this until the requested grants appear in the statements.',
     inputSchema: {
       type: 'object',
       properties: { session_id: { type: 'string', description: 'Optional open session to report live grants + TTL for.' } },

@@ -12,7 +12,6 @@
 //   POST /gw/query       RETIRED → 410 { error:'use_mcp_session' } (data path is /mcp)
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { BirdshotSnapshot } from "@waddling/control-schema";
 import {
   applySnapshot,
   birdshotRevoke,
@@ -23,8 +22,13 @@ import {
 } from "./duck";
 
 interface SnapshotBody {
-  snapshot: BirdshotSnapshot;
+  // CONFIG-ONLY (spec §13): no grant tuples — birdshot pulls literal GRANT/DENY SQL from the
+  // ATTACHed store. `endpointId` (the datalakeId) scopes that pull; `grantStoreDsn` is the
+  // read-only Postgres DSN the gateway ATTACHes as the protected `__birdshot` catalog.
+  endpointId?: string;
   auth?: { issuer: string; audience: string; jwks?: { kid: string; n: string; e: string }[] };
+  lakeCatalog?: string;
+  grantStoreDsn?: string;
 }
 
 interface RevokeBody {
@@ -86,9 +90,12 @@ export function startCtrlServer(port: number, deps: CtrlServerDeps): ReturnType<
 
     if (method === "POST" && url === "/gw/snapshot") {
       const body = await readJson<SnapshotBody>(req);
-      if (!body.snapshot) return send(res, 400, { error: "bad_request", reason: "missing snapshot" });
-      await applySnapshot(runtime, body.snapshot, body.auth);
-      return send(res, 200, { ok: true, grants: body.snapshot.roleGrants.length });
+      await applySnapshot(runtime, {
+        auth: body.auth,
+        grantStoreDsn: body.grantStoreDsn,
+        datalakeId: body.endpointId,
+      });
+      return send(res, 200, { ok: true });
     }
 
     if (method === "POST" && url === "/gw/revoke") {

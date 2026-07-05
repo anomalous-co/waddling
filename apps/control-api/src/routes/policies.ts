@@ -174,9 +174,9 @@ policies.post('/', (c) =>
     // Recompile only the affected datalake. A global (datalake-less) policy can
     // touch every endpoint; recompiling all of them on one insert is deferred —
     // the next per-endpoint connect/recompile picks it up.
-    const compiled = input.datalakeId
-      ? await recompileAndEnqueue(c, input.datalakeId)
-      : null;
+    // Config-only re-arm (spec §13). NOTE: acl_policy → literal grant-store SQL is not yet
+    // wired; these rows no longer feed birdshot's pull store.
+    if (input.datalakeId) await recompileAndEnqueue(c, input.datalakeId);
 
     await query(
       `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, datalake_id, decision, actor)
@@ -189,7 +189,6 @@ policies.post('/', (c) =>
       {
         policy: created ? mapPolicy(created) : null,
         policyId: created?.id,
-        compiledGrants: compiled?.snapshot ?? null,
       },
       201,
     );
@@ -208,9 +207,7 @@ policies.delete('/:id', (c) =>
     assertOrg(caller, row.org_id);
 
     await query(`DELETE FROM waddling.acl_policy WHERE id = $1`, [id]);
-    const compiled = row.datalake_id
-      ? await recompileAndEnqueue(c, row.datalake_id)
-      : null;
+    if (row.datalake_id) await recompileAndEnqueue(c, row.datalake_id);
 
     await query(
       `INSERT INTO waddling.audit_event (org_id, source, event, agent_id, datalake_id, decision, actor)
@@ -218,7 +215,7 @@ policies.delete('/:id', (c) =>
       [row.org_id, row.agent_id, row.datalake_id, caller.callerId],
     );
 
-    return ok(c, { success: true, policyId: id, compiledGrants: compiled?.snapshot ?? null });
+    return ok(c, { success: true, policyId: id });
   }),
 );
 
