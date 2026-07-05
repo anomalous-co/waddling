@@ -226,6 +226,63 @@ async function main() {
   const rt = await bootDuckRuntime(config);
   log("gateway booted — quack_serve up, birdshot hooks installed pre-serve");
 
+  // ── Workspace/board durability (persist writes to GCS) ───────────────────────
+  // The durable .duckdb is opened from an ATTACH of a GCS-restored file; a write only becomes
+  // durable once we CHECKPOINT (fold the WAL into the file) and re-upload it. Nothing did that
+  // on the normal path — /ctrl/checkpoint only ran on an admin /destroy — so an idle-out or a
+  // fresh-boot-then-idle silently dropped every write (the file often never even landed in GCS).
+  // Fix: persist after each successful write, and flush once more on the way down.
+  const wsDurable = (workspaceMode || quackboard) && wsBucket && wsObject && config.databasePath !== ":memory:";
+
+  // Coalescing writer: CHECKPOINT + push the file to GCS. While an upload is in flight, further
+  // calls just re-arm a trailing flush (dirty) instead of queueing N uploads, so a burst of
+  // writes collapses to at most one in-flight + one trailing upload. Non-blocking on the query
+  // path (fire-and-forget) so it never adds latency; the SIGTERM flush is the final backstop.
+  let flushInFlight = null;
+  let flushDirty = false;
+  const persistWorkspace = () => {
+    if (!wsDurable) return Promise.resolve();
+    if (flushInFlight) { flushDirty = true; return flushInFlight; }
+    const run = (async () => {
+      try {
+        do {
+          flushDirty = false;
+          await rt.run("CHECKPOINT");
+          await gcsUpload(wsBucket, wsObject, config.databasePath);
+        } while (flushDirty);
+      } catch (e) {
+        log(`workspace persist failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        flushInFlight = null;
+      }
+    })();
+    flushInFlight = run;
+    return run;
+  };
+  // Statements that mutate the durable workspace catalog and therefore need a persist. Reads
+  // (SELECT/DESCRIBE/…) don't. COPY is a write only in its `COPY … TO` (export) form; a plain
+  // read never matches the leading-keyword test.
+  const WRITE_STMT = /^\s*(?:create|insert|update|delete|drop|alter|truncate|merge|replace|comment|vacuum|copy)\b/i;
+
+  let shuttingDown = false;
+  const flushAndExit = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (wsDurable) {
+      try {
+        if (flushInFlight) await flushInFlight; // let any in-flight upload settle first
+        await rt.run("CHECKPOINT");
+        await gcsUpload(wsBucket, wsObject, config.databasePath); // authoritative final flush
+        log(`${signal}: flushed durable db to gs://${wsBucket}/${wsObject} before shutdown`);
+      } catch (e) {
+        log(`${signal}: shutdown flush failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => { void flushAndExit("SIGTERM"); });
+  process.on("SIGINT", () => { void flushAndExit("SIGINT"); });
+
   // ── Cold-boot snapshot arming (folds the /ctrl/snapshot round-trip into boot) ──────
   // The director (GatewayPoolDO.doArm) normally pushes the birdshot ACL snapshot over a
   // SEPARATE /ctrl/snapshot call AFTER healthz goes green — one extra container round-trip
@@ -960,6 +1017,10 @@ async function main() {
           relayError = msg;
         }
       }
+      // A successful WRITE mutated the durable workspace catalog — persist it to GCS so it
+      // survives scale-to-zero. Fire-and-forget (coalesced): the agent's response is not held
+      // on the upload, and a burst of writes collapses to a single trailing flush.
+      if (relayResult != null && WRITE_STMT.test(sql)) void persistWorkspace();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         ok: relayResult != null,

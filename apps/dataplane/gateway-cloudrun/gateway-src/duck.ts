@@ -6,6 +6,8 @@
 // server (snapshot / constraints / revoke / status). See repo.md for the
 // birdshot fn signatures and ducklake.md for ATTACH syntax.
 
+import { dirname } from "node:path";
+
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import type { GatewayConfig } from "./config";
 
@@ -399,6 +401,42 @@ export async function bootDuckRuntime(
     mark("restore-lake-views");
   }
   } // end if (!config.quackboard && !config.workspaceMode) — no-lake modes skip this section
+
+  // ── Workspace filesystem scoping (agent-facing local FS) ─────────────────────
+  // A workspace container is single-tenant and, now that its quack_serve token is derived
+  // per-(workspace, agent) rather than the datalake-wide server_token, holds no cross-tenant
+  // secret. Local file access stays ON so agents can load/unload files under the workspace dir
+  // (CTAS / COPY over read_csv/read_parquet), which then ride the encrypted .duckdb → GCS
+  // snapshot. home_directory points `~` at the workspace dir so relative paths land somewhere
+  // durable rather than in the container root. home_directory is ergonomics, NOT a boundary —
+  // DuckDB still honors absolute paths; the boundary (when enabled) is the jail below.
+  if (config.workspaceMode) {
+    const wsDir = dirname(config.databasePath);
+    await connection.run(`SET home_directory=${q(wsDir)}`);
+
+    // Optional hard jail (WORKSPACE_FS_JAIL): confine ALL DuckDB file access to the workspace
+    // + extension dirs. `allowed_directories` is the allow-list DuckDB honors when external
+    // access is off, so with `enable_external_access=false` a read_csv/read_blob/COPY can only
+    // touch these paths — /proc, /etc, and the gateway source become unreadable, a chroot-
+    // equivalent needing no OS capability. Applied AFTER all boot-time external access
+    // (extension loads + the encrypted ATTACH) and BEFORE quack_serve. Flag-gated until it is
+    // verified live that this does not disturb quack's wire transport or the lake relay's
+    // outbound ATTACH (both ride httpfs's network layer, which external access also gates).
+    if (/^(1|true|yes|on)$/i.test(process.env.WORKSPACE_FS_JAIL ?? "")) {
+      const extDir = process.env.DUCKDB_EXTENSION_DIR || "/opt/duckdb-extensions";
+      const birdshotDir = dirname(config.birdshotExtensionPath);
+      // DuckDB home-state dir (~/.duckdb): stored_secrets — where quack persists the lake ATTACH
+      // TOKEN secret — plus extension install metadata. Must be reachable or the lake relay ATTACH
+      // fails "Cannot access .../stored_secrets". Single-tenant + self-scoped (only this agent's own
+      // session secrets live here), so allowing it does not widen the blast radius: /proc, /etc, and
+      // the gateway source stay unreachable.
+      const duckHome = `${process.env.HOME || "/root"}/.duckdb`;
+      const allowed = [wsDir, extDir, birdshotDir, duckHome].map(q).join(", ");
+      await connection.run(`SET allowed_directories=[${allowed}]`);
+      await connection.run("SET enable_external_access=false");
+      console.log(`[gateway] workspace FS jail ON — file access confined to ${wsDir} (+ ext/home state)`);
+    }
+  }
 
   if (serveQuack) {
     // Hand quack's auth/authz hooks to birdshot BEFORE the server starts listening.

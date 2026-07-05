@@ -186,6 +186,15 @@ const connect: McpTool['handler'] = async (args, ctx) => {
       agent_id: d.agentId,
       ttl_seconds: d.ttlSeconds,
       granted: d.granted,
+      // What the workspace sandbox permits, so an agent knows its filesystem/egress bounds
+      // up front instead of discovering them through denials. The gateway jails DuckDB file
+      // access to this directory and blocks network egress; durable state is the `main` schema.
+      workspace: {
+        local_dir: '/tmp/workspace',
+        local_files: 'allowed within /tmp/workspace only — you may COPY … TO and read_csv/read_parquet/read_json/read_blob files under this dir',
+        durable: 'Tables you CREATE in the `main` schema persist across scale-to-zero (saved to encrypted object storage). Loose files under /tmp/workspace are scratch and are NOT persisted — materialize anything you need to keep as a `main` table.',
+        network: 'blocked — no http/https/s3 access from the workspace; reads outside /tmp/workspace are denied',
+      },
     });
   } catch (e) {
     return failErr(e);
@@ -438,9 +447,12 @@ export const TOOLS: McpTool[] = [
     name: 'waddling_connect',
     description:
       'Open a governed session on a datalake. Returns { session_id, workspace_id, agent_id, ' +
-      'ttl_seconds, granted }. This provisions your durable, encrypted, private workspace and ' +
+      'ttl_seconds, granted, workspace }. This provisions your durable, encrypted, private workspace and ' +
       'attaches the governed lake server-side — you do NOT run any ATTACH yourself. Then call ' +
-      'waddling_query with the returned session_id. `granted` tells you which tables/verbs you have. ' +
+      'waddling_query with the returned session_id. `granted` tells you which tables/verbs you have; ' +
+      '`workspace` tells you your filesystem sandbox: you may read/write local files ONLY under ' +
+      '/tmp/workspace (COPY … TO, read_csv/read_parquet/read_json/read_blob), network egress ' +
+      '(http/https/s3) is blocked, and only tables in the `main` schema persist across scale-to-zero. ' +
       'Sessions are short-lived (~15m); if a later query returns { error:\'needs_configure\' }, call ' +
       'waddling_connect again to refresh.',
     inputSchema: { type: 'object', properties: { ...datalakeIdProp } },
@@ -454,7 +466,11 @@ export const TOOLS: McpTool[] = [
       'qualified as `lake.<schema>.<table>` (e.g. `SELECT * FROM lake.sales.orders LIMIT 5`). Column ' +
       'projection and row limits are enforced server-side by birdshot. On a denial you get ' +
       "{ error:'authorization_denied', reason } — read `reason` and adjust. If { error:'needs_configure' }, " +
-      'your session went cold — call waddling_connect again, then retry.',
+      'your session went cold — call waddling_connect again, then retry. Local filesystem: you may read ' +
+      'and write files under /tmp/workspace only (e.g. `COPY (…) TO \'/tmp/workspace/out.csv\'`, ' +
+      '`read_csv(\'/tmp/workspace/in.parquet\')`); paths outside it and all network access (http/https/s3) ' +
+      'are blocked by configuration. Persist anything durable as a table in the `main` schema — loose ' +
+      'files in /tmp/workspace are scratch and vanish on scale-to-zero.',
     inputSchema: {
       type: 'object',
       properties: {

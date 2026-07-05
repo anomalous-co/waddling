@@ -20,7 +20,7 @@
  * module-singleton import; signatures are unchanged. Current logic is preserved
  * faithfully — the per-team-R2 rework is Stage C (see the marker below).
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { query, queryOne } from './db';
 import { getCrypto, type SealedSecret } from './secret-crypto';
 import { getDatalakeGatewayConfig } from './datalake-secrets';
@@ -135,6 +135,22 @@ export async function ensureWorkspaceKey(workspaceId: string, agentId: string): 
     [workspaceId, agentId, s.iv, s.authTag, s.ciphertext],
   );
   return key;
+}
+
+/**
+ * Derive the workspace's quack_serve token from its per-(workspace, agent) encryption key.
+ *
+ * The workspace's loopback quack_serve requires a token argument, but birdshot's RS256 auth
+ * hook (quack_authentication_function) is the real gate — the in-container client ATTACHes with
+ * the agent's session JWT, and the router mints an OIDC id-token for the private hop, so nothing
+ * ever presents this token. Historically the datalake-wide `server_token` was injected here,
+ * which put ONE shared secret in every agent's reachable container env. Deriving it per-(workspace,
+ * agent) instead means a workspace holds NO cross-tenant secret: a local file read inside a session
+ * can only surface this agent's own values. SHA-256 so the at-rest key can't be recovered from the
+ * token; deterministic so a reconnect reuses the same value (no Cloud Run revision churn).
+ */
+export function deriveWorkspaceServerToken(workspaceKey: string): string {
+  return 'ws_' + createHash('sha256').update(`${workspaceKey}:quack-serve`).digest('hex');
 }
 
 /** Build the actor's S3 persistence coords from the endpoint's storage config. */

@@ -58,7 +58,11 @@ import {
   type RelayQueryResult,
   type GovernedLoadResult,
 } from '../lib/gateway-client';
-import { resolveWorkspaceForSession, ensureWorkspaceKey } from '../lib/workspace-keys';
+import {
+  resolveWorkspaceForSession,
+  ensureWorkspaceKey,
+  deriveWorkspaceServerToken,
+} from '../lib/workspace-keys';
 import { provisionWorkspace, workspaceSlug, workspaceGatewayUrl } from '../lib/provisioner';
 import { hasCredit, debitQueryFloor } from '../lib/credits';
 import { makePostHog } from '../lib/posthog';
@@ -472,7 +476,11 @@ sessions.post('/', (c) =>
         workspaceId: ws.workspaceId,
         agentId,
         encryptionKey: workspaceKey,
-        serverToken: endpoint.server_token,
+        // Per-(workspace, agent) derived token — NOT the datalake-wide endpoint.server_token — so a
+        // workspace container holds no cross-tenant secret (see deriveWorkspaceServerToken). The
+        // workspace's quack_serve is loopback-only and birdshot RS256 is the real auth gate, so this
+        // value is never presented on the wire; it only satisfies quack_serve's required token arg.
+        serverToken: deriveWorkspaceServerToken(workspaceKey),
       });
       wsUrl = prov.url;
     } catch (e) {

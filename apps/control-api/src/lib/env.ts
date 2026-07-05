@@ -160,6 +160,12 @@ export interface Env {
   // per-(workspace,agent) workspace service by deterministic name without persisting its URL.
   CLOUD_RUN_URL_SUFFIX?: string;
 
+  // Workspace filesystem-jail rollout gate. When a workspace is provisioned, control-api injects
+  // WORKSPACE_FS_JAIL=1 into its env (confining DuckDB file access to the workspace dir) iff this
+  // matches: a global toggle ('1'/'true'/'all') jails every workspace; otherwise a comma-separated
+  // list of agentIds jails only those agents (staged rollout / canary). Unset ⇒ no jail.
+  WORKSPACE_FS_JAIL?: string;
+
   // SendGrid API key (Node/Cloud Run transactional email path). When set, email.ts
   // sends via SendGrid HTTP before falling back to the CF EMAIL binding.
   SENDGRID_API_KEY?: string;

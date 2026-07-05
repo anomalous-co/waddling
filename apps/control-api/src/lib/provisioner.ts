@@ -182,6 +182,15 @@ export async function provisionWorkspace(env: Env, input: ProvisionWorkspaceInpu
   const gcsBucket = input.gcsBucket ?? LAKE_BUCKET;
   const gcsObject = input.gcsObject ?? `workspace/${input.workspaceId}/db/${input.agentId}.duckdb`;
 
+  // Filesystem-jail rollout gate (see Env.WORKSPACE_FS_JAIL). A global toggle jails every workspace;
+  // otherwise the agentId must be in the comma-separated allowlist (canary). The gateway reads
+  // WORKSPACE_FS_JAIL from its env and, when set, confines DuckDB file access to the workspace dir.
+  const jailCfg = (env.WORKSPACE_FS_JAIL ?? '').trim();
+  const fsJail =
+    jailCfg !== '' &&
+    (/^(1|true|yes|on|all)$/i.test(jailCfg) ||
+      jailCfg.split(',').map((s) => s.trim()).includes(input.agentId));
+
   const envMap: Record<string, string> = {
     WORKSPACE_MODE: '1',
     DUCKDB_DATABASE_PATH: '/tmp/workspace/ws.duckdb',
@@ -189,6 +198,7 @@ export async function provisionWorkspace(env: Env, input: ProvisionWorkspaceInpu
     WORKSPACE_GCS_OBJECT: gcsObject,
     WORKSPACE_ENCRYPTION_KEY: input.encryptionKey,
     GW_SERVER_TOKEN: input.serverToken,
+    ...(fsJail ? { WORKSPACE_FS_JAIL: '1' } : {}),
   };
 
   // OIDC: mint a Google identity token for the provisioner (audience = its URL), same pattern as
