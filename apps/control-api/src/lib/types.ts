@@ -207,11 +207,25 @@ export interface ExplainResult {
   tableGrants?: { schema: string; table: string; verbs: ('read' | 'write')[] }[];
 }
 
+/** An agent's literal grant SQL in one datalake (whoami surfaces these across all datalakes). */
+export interface DatalakeGrants {
+  datalakeId: string;
+  datalakeName?: string;
+  /** The literal GRANT/DENY SQL for this key in this datalake (subject ∪ PUBLIC ∪ roles). */
+  statements: string[];
+}
+
 export interface WhoamiResult {
   agentId: string;
   orgId: string;
   name: string;
+  /** Grants for the session/datalake in scope (empty when none is specified). */
   grants: SessionGrant;
+  /**
+   * The agent's literal grant SQL in EVERY datalake it has access in — so a bare
+   * `waddling_whoami` (no session) always shows what the key can do, verbatim.
+   */
+  grantsByDatalake?: DatalakeGrants[];
   remainingTtlSeconds?: number;
   rateLimitHeadroom?: number;
 }
