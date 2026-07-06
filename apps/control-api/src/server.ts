@@ -93,6 +93,9 @@ const config: Env = {
   PG_PORT: process.env.PG_PORT,
 
   PROVISIONER_URL: process.env.PROVISIONER_URL,
+  EMBEDDINGS_URL: process.env.EMBEDDINGS_URL,
+  EMBED_QUEUE: process.env.EMBED_QUEUE,
+  EMBED_DRAIN_SA: process.env.EMBED_DRAIN_SA,
   ROUTER_HOST_SUFFIX: process.env.ROUTER_HOST_SUFFIX,
   CLOUD_RUN_URL_SUFFIX: process.env.CLOUD_RUN_URL_SUFFIX,
   WORKSPACE_FS_JAIL: process.env.WORKSPACE_FS_JAIL,

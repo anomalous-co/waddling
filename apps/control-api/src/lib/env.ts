@@ -158,6 +158,13 @@ export interface Env {
   // OIDC token for it. Unset ⇒ the context-graph embed pipeline is a no-op.
   EMBEDDINGS_URL?: string;
 
+  // Cloud Tasks queue that drives the async embedding drain. EMBED_QUEUE is the full resource path
+  // (projects/<p>/locations/<r>/queues/embed-drain); EMBED_DRAIN_SA is the OIDC identity the task
+  // presents to the private board gateway (control-api-run@, which holds run.invoker). Either unset
+  // ⇒ enqueue is a no-op (local dev) and the backstop sweep is the only trigger.
+  EMBED_QUEUE?: string;
+  EMBED_DRAIN_SA?: string;
+
   // Public router host suffix (e.g. 'getwaddling.com'). A workspace ATTACHes the lake via quack at
   // gw-<lakeslug>.<ROUTER_HOST_SUFFIX>:443 — the public router forwards /quack to the private lake
   // gateway (quack carries no OIDC header; the router mints it). Default 'getwaddling.com'.

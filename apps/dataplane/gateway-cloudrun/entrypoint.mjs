@@ -92,6 +92,8 @@ const qlit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
 const EMBED_DIM = 2560; // Qwen3-Embedding-4B native dim — must match embeddings.vec FLOAT[2560].
 const EMBED_MODEL = "qwen3-embed-4b";
 const EMBED_CHUNK = 32; // TEI's max_client_batch_size — chunk /embed requests to this size.
+const EMBED_CONCURRENCY = 8; // max simultaneous /embed requests → lets a backlog scale the GPU service out.
+let qbDrainInFlight = false; // in-process single-flight guard for /ctrl/qb-drain (see handler).
 
 /** Mint a Google OIDC identity token for a PRIVATE Cloud Run service (audience = its URL) from
  *  the instance metadata server — the gateway SA's own token, no key file. Used to reach the
@@ -110,20 +112,37 @@ async function metadataIdToken(audience) {
  *  given, is prepended per Qwen3's asymmetric-retrieval format (queries only; docs pass raw). */
 async function embedTexts(embeddingsUrl, texts, instruction) {
   const token = await metadataIdToken(embeddingsUrl);
-  const out = [];
+  // Split into fixed-size chunks (TEI's max_client_batch_size), then fire them with BOUNDED
+  // CONCURRENCY. A sequential loop keeps exactly one /embed request in flight, which pins the
+  // scale-to-zero embeddings service to a SINGLE Cloud Run instance no matter how large the
+  // backlog is (Cloud Run autoscales on concurrent requests). Issuing EMBED_CONCURRENCY requests
+  // at once lets a big drain recruit multiple GPU instances — this is the horizontal-scale lever.
+  const chunks = [];
   for (let i = 0; i < texts.length; i += EMBED_CHUNK) {
-    const chunk = texts.slice(i, i + EMBED_CHUNK).map((t) =>
-      instruction ? `Instruct: ${instruction}\nQuery:${t}` : String(t),
+    chunks.push(
+      texts.slice(i, i + EMBED_CHUNK).map((t) =>
+        instruction ? `Instruct: ${instruction}\nQuery:${t}` : String(t),
+      ),
     );
-    const r = await fetch(`${embeddingsUrl}/embed`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ inputs: chunk }),
-    });
-    if (!r.ok) throw new Error(`embed ${r.status}: ${(await r.text()).slice(0, 200)}`);
-    const vecs = await r.json();
-    for (const v of vecs) out.push(v);
   }
+  const results = new Array(chunks.length); // indexed → output order preserved despite concurrency
+  let next = 0;
+  const worker = async () => {
+    for (let idx = next++; idx < chunks.length; idx = next++) {
+      const r = await fetch(`${embeddingsUrl}/embed`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ inputs: chunks[idx] }),
+      });
+      if (!r.ok) throw new Error(`embed ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      results[idx] = await r.json();
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(EMBED_CONCURRENCY, chunks.length) }, worker),
+  );
+  const out = [];
+  for (const vecs of results) for (const v of vecs) out.push(v);
   return out;
 }
 
@@ -136,6 +155,77 @@ const VEC_ARRAY = `::FLOAT[${EMBED_DIM}]`; // query-time cast for a stored LIST 
 function vecLiteral(v) {
   if (!Array.isArray(v) || v.length !== EMBED_DIM) return null;
   return `[${v.map((x) => Number(x)).join(",")}]`;
+}
+
+// Embed ONE batch of currently-pending nodes (observations + agent_memory rows lacking an
+// embeddings row) and return { embedded, remaining }. Shared by /ctrl/qb-embed-batch (single
+// batch) and /ctrl/qb-drain (loops until drained). Idempotent: only UN-embedded rows are
+// selected, so a retry/re-run never double-inserts — the un-embedded set IS the queue.
+async function embedPendingBatch(rt, embeddingsUrl, cap) {
+  const pendReader = await rt.connection.runAndReadAll(
+    `SELECT 'observation' AS node_kind, id AS node_id, content FROM observations o
+       WHERE content IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='observation' AND e.node_id=o.id)
+     UNION ALL
+     SELECT 'memory' AS node_kind, id AS node_id, content FROM agent_memory m
+       WHERE content IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='memory' AND e.node_id=m.id)
+     ORDER BY node_kind, node_id LIMIT ${cap}`,
+  );
+  const pending = normalize(pendReader.getRowObjects());
+  if (pending.length === 0) return { embedded: 0, remaining: 0 };
+  const vectors = await embedTexts(embeddingsUrl, pending.map((p) => p.content)); // docs: raw, no instruction
+  let embedded = 0;
+  for (let i = 0; i < pending.length; i++) {
+    const lit = vecLiteral(vectors[i]);
+    if (!lit) continue; // wrong-length vector → skip (stays pending for a retry)
+    await rt.run(
+      `INSERT INTO embeddings(node_kind, node_id, vec, model)
+         VALUES (${qlit(pending[i].node_kind)}, ${Number(pending[i].node_id)}, ${lit}, ${qlit(EMBED_MODEL)})`,
+    );
+    embedded++;
+  }
+  const remReader = await rt.connection.runAndReadAll(
+    `SELECT (SELECT count(*) FROM observations o WHERE content IS NOT NULL AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='observation' AND e.node_id=o.id))
+          + (SELECT count(*) FROM agent_memory m WHERE content IS NOT NULL AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='memory' AND e.node_id=m.id)) AS remaining`,
+  );
+  const remaining = Number(normalize(remReader.getRowObjects())[0]?.remaining ?? 0);
+  return { embedded, remaining };
+}
+
+// Rebuild the DERIVED edge kinds (semantic + structural); agent-declared edges are preserved.
+// Delete-then-insert (DuckLake has no PK/ON CONFLICT). Returns per-kind counts.
+async function recomputeEdges(rt) {
+  await rt.run(`DELETE FROM edges WHERE kind IN ('semantic','structural')`);
+  // Semantic: top-5 cosine neighbours (sim > 0.5) per embedded node — brute-force O(n²). The
+  // stored LIST vectors are cast to fixed ARRAY for array_cosine_similarity (same-size operands).
+  // Dedup embeddings to ONE vector per node first: a transient duplicate row (from a rare
+  // concurrent drain that outran the single-flight guard) would otherwise self-join into
+  // spurious 1.0-similarity edges and inflate the graph. GROUP BY makes duplicates harmless.
+  await rt.run(
+    `INSERT INTO edges(src_kind, src_id, dst_kind, dst_id, kind, weight)
+       SELECT sk, sid, dk, did, 'semantic', sim FROM (
+         SELECT sk, sid, dk, did, sim,
+                row_number() OVER (PARTITION BY sk, sid ORDER BY sim DESC) AS rn FROM (
+           SELECT a.node_kind sk, a.node_id sid, b.node_kind dk, b.node_id did,
+                  array_cosine_similarity(a.vec${VEC_ARRAY}, b.vec${VEC_ARRAY}) AS sim
+             FROM (SELECT node_kind, node_id, any_value(vec) AS vec FROM embeddings GROUP BY node_kind, node_id) a
+             JOIN (SELECT node_kind, node_id, any_value(vec) AS vec FROM embeddings GROUP BY node_kind, node_id) b
+               ON NOT (a.node_kind = b.node_kind AND a.node_id = b.node_id)
+         ) WHERE sim > 0.5
+       ) WHERE rn <= 5`,
+  );
+  // Structural: observations sharing a (non-null) topic (one edge per unordered pair).
+  await rt.run(
+    `INSERT INTO edges(src_kind, src_id, dst_kind, dst_id, kind, weight)
+       SELECT 'observation', o1.id, 'observation', o2.id, 'structural', 1.0
+         FROM observations o1 JOIN observations o2
+           ON o1.topic = o2.topic AND o1.topic IS NOT NULL AND o1.id < o2.id`,
+  );
+  const cReader = await rt.connection.runAndReadAll(
+    `SELECT kind, count(*) AS n FROM edges GROUP BY kind`,
+  );
+  return normalize(cReader.getRowObjects());
 }
 
 // Strip the lake ATTACH-alias catalog qualifier from 3-part refs so Form-B relay SQL
@@ -703,85 +793,70 @@ async function main() {
         return;
       }
       const cap = Math.min(Math.max(Number(limit) || 128, 1), 512);
-      // Un-embedded nodes = observations + agent_memory rows with no embeddings row yet.
-      const pendReader = await rt.connection.runAndReadAll(
-        `SELECT 'observation' AS node_kind, id AS node_id, content FROM observations o
-           WHERE content IS NOT NULL
-             AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='observation' AND e.node_id=o.id)
-         UNION ALL
-         SELECT 'memory' AS node_kind, id AS node_id, content FROM agent_memory m
-           WHERE content IS NOT NULL
-             AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='memory' AND e.node_id=m.id)
-         ORDER BY node_kind, node_id LIMIT ${cap}`,
-      );
-      const pending = normalize(pendReader.getRowObjects());
-      if (pending.length === 0) {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, embedded: 0, remaining: 0 }));
-        return;
-      }
-      let vectors;
+      let out;
       try {
-        vectors = await embedTexts(embeddingsUrl, pending.map((p) => p.content)); // docs: raw, no instruction
+        out = await embedPendingBatch(rt, embeddingsUrl, cap);
       } catch (e) {
         res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "embed_failed", reason: e instanceof Error ? e.message : String(e) }));
         return;
       }
-      let embedded = 0;
-      for (let i = 0; i < pending.length; i++) {
-        const lit = vecLiteral(vectors[i]);
-        if (!lit) continue; // wrong-length vector → skip (stays pending for a retry)
-        await rt.run(
-          // Plain INSERT — only UN-embedded nodes were selected, so there's no existing row to
-          // upsert (DuckLake has no PK/ON CONFLICT anyway). vec is stored as a LIST literal.
-          `INSERT INTO embeddings(node_kind, node_id, vec, model)
-             VALUES (${qlit(pending[i].node_kind)}, ${Number(pending[i].node_id)}, ${lit}, ${qlit(EMBED_MODEL)})`,
-        );
-        embedded++;
-      }
-      // Count still-pending so a caller can loop until drained.
-      const remReader = await rt.connection.runAndReadAll(
-        `SELECT (SELECT count(*) FROM observations o WHERE content IS NOT NULL AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='observation' AND e.node_id=o.id))
-              + (SELECT count(*) FROM agent_memory m WHERE content IS NOT NULL AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='memory' AND e.node_id=m.id)) AS remaining`,
-      );
-      const remaining = Number(normalize(remReader.getRowObjects())[0]?.remaining ?? 0);
-      log(`qb-embed-batch: embedded ${embedded}, ${remaining} remaining`);
+      log(`qb-embed-batch: embedded ${out.embedded}, ${out.remaining} remaining`);
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, embedded, remaining }));
+      res.end(JSON.stringify({ ok: true, ...out }));
+      return;
+    }
+
+    // Full drain: the queue consumer (Cloud Tasks → this endpoint, OIDC-authed). Loops the embed
+    // batch until the board's un-embedded backlog is empty (or a wrong-length vector stalls it),
+    // then recomputes derived edges once. This is what a coalesced write-triggered drain task
+    // invokes — one HTTP call embeds everything that accumulated in the debounce window, and
+    // embedTexts fans the GPU requests out concurrently so a large backlog scales the service out.
+    if (path === "/ctrl/qb-drain" && method === "POST") {
+      const { embeddingsUrl } = await readJson(req);
+      if (!embeddingsUrl) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing embeddingsUrl" }));
+        return;
+      }
+      // SINGLE-FLIGHT. A cold-GPU drain blocks tens of seconds, so the next debounce-bucket task
+      // can arrive mid-drain. Two concurrent drains would `NOT EXISTS`-select the SAME pending set
+      // → duplicate embedding INSERTs (DuckLake has no PK) + a racing edge DELETE/INSERT. A drain
+      // loops until the backlog is empty, so a second concurrent task is redundant: skip it, the
+      // in-flight drain covers its nodes. This gateway is per-board with default containerConcurrency
+      // (~80), so concurrent drains land on THIS instance — an in-process guard is sufficient.
+      if (qbDrainInFlight) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, embedded: 0, skipped: "drain already in flight" }));
+        return;
+      }
+      qbDrainInFlight = true;
+      let embedded = 0;
+      try {
+        for (let i = 0; i < 40; i++) {
+          const r = await embedPendingBatch(rt, embeddingsUrl, 256);
+          embedded += r.embedded;
+          if (r.remaining === 0 || r.embedded === 0) break; // drained, or stalled on bad vectors
+        }
+        let byKind;
+        if (embedded > 0) byKind = await recomputeEdges(rt); // only re-derive edges if the graph changed
+        log(`qb-drain: embedded ${embedded}${embedded > 0 ? ", edges recomputed" : ""}`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, embedded, byKind }));
+      } catch (e) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "embed_failed", reason: e instanceof Error ? e.message : String(e) }));
+      } finally {
+        qbDrainInFlight = false;
+      }
       return;
     }
 
     // Rebuild derived edges (semantic + structural); agent-declared edges are preserved.
     if (path === "/ctrl/qb-edges-recompute" && method === "POST") {
-      // Delete-then-insert the derived kinds (no PK/ON CONFLICT on DuckLake); declared edges stay.
-      await rt.run(`DELETE FROM edges WHERE kind IN ('semantic','structural')`);
-      // Semantic: top-5 cosine neighbours (sim > 0.5) per embedded node — brute-force O(n²). The
-      // stored LIST vectors are cast to fixed ARRAY for array_cosine_similarity (same-size operands).
-      await rt.run(
-        `INSERT INTO edges(src_kind, src_id, dst_kind, dst_id, kind, weight)
-           SELECT sk, sid, dk, did, 'semantic', sim FROM (
-             SELECT sk, sid, dk, did, sim,
-                    row_number() OVER (PARTITION BY sk, sid ORDER BY sim DESC) AS rn FROM (
-               SELECT a.node_kind sk, a.node_id sid, b.node_kind dk, b.node_id did,
-                      array_cosine_similarity(a.vec${VEC_ARRAY}, b.vec${VEC_ARRAY}) AS sim
-                 FROM embeddings a JOIN embeddings b
-                   ON NOT (a.node_kind = b.node_kind AND a.node_id = b.node_id)
-             ) WHERE sim > 0.5
-           ) WHERE rn <= 5`,
-      );
-      // Structural: observations sharing a (non-null) topic (one edge per unordered pair).
-      await rt.run(
-        `INSERT INTO edges(src_kind, src_id, dst_kind, dst_id, kind, weight)
-           SELECT 'observation', o1.id, 'observation', o2.id, 'structural', 1.0
-             FROM observations o1 JOIN observations o2
-               ON o1.topic = o2.topic AND o1.topic IS NOT NULL AND o1.id < o2.id`,
-      );
-      const cReader = await rt.connection.runAndReadAll(
-        `SELECT kind, count(*) AS n FROM edges GROUP BY kind`,
-      );
+      const byKind = await recomputeEdges(rt);
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, byKind: normalize(cReader.getRowObjects()) }));
+      res.end(JSON.stringify({ ok: true, byKind }));
       return;
     }
 
@@ -884,9 +959,9 @@ async function main() {
                FROM embeddings e WHERE ${allow("e.node_kind", "e.node_id")}
              ORDER BY sim DESC LIMIT ${cap}
            ) s JOIN (
-             SELECT 'observation' node_kind, id node_id, agent_role, topic, substr(content,1,100) label, ts FROM observations
+             SELECT 'observation' AS node_kind, id AS node_id, agent_role, topic, substr(content,1,100) AS label, ts FROM observations
              UNION ALL
-             SELECT 'memory' node_kind, id node_id, agent_role, NULL topic, substr(content,1,100) label, ts FROM agent_memory
+             SELECT 'memory' AS node_kind, id AS node_id, agent_role, NULL AS topic, substr(content,1,100) AS label, ts FROM agent_memory
            ) n ON n.node_kind=s.node_kind AND n.node_id=s.node_id
            ORDER BY s.sim DESC`,
         );
@@ -894,9 +969,9 @@ async function main() {
       } else {
         const r = await rt.connection.runAndReadAll(
           `SELECT node_kind, node_id, agent_role, topic, label, ts FROM (
-             SELECT 'observation' node_kind, id node_id, agent_role, topic, substr(content,1,100) label, ts FROM observations
+             SELECT 'observation' AS node_kind, id AS node_id, agent_role, topic, substr(content,1,100) AS label, ts FROM observations
              UNION ALL
-             SELECT 'memory' node_kind, id node_id, agent_role, NULL topic, substr(content,1,100) label, ts FROM agent_memory
+             SELECT 'memory' AS node_kind, id AS node_id, agent_role, NULL AS topic, substr(content,1,100) AS label, ts FROM agent_memory
            ) WHERE ${allow("node_kind", "node_id")} ORDER BY ts DESC LIMIT ${cap}`,
         );
         nodes = normalize(r.getRowObjects());

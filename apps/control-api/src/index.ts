@@ -27,6 +27,7 @@ import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
 import { initDataplane, gatewayClientFor } from "./lib/gateway-client";
 import { drainGatewayDispatch, refreshWarmCatalogs } from "./lib/gateway-dispatch";
+import { enqueueEmbedDrain } from "./lib/embed-queue";
 import { resolveCaller, AuthError } from "./lib/cp-shared";
 import { handleMcp } from "./mcp/server";
 import type { LoopbackResult } from "./mcp/tools";
@@ -710,40 +711,37 @@ export function startupInit(config: Env): void {
  * Each tick: (1) sweeps expired sessions + debits wall-clock COGS, (2) resets monthly
  * tier-credit allotments (idempotent per period), (3) reconciles billed debits for drift.
  */
-// Context-graph maintenance pass: for each WARM quackboard, drain any un-embedded nodes through
-// the private embeddings service, then rebuild derived edges IF new vectors landed. Status-gated
-// (never cold-boots a sleeping board just to embed) and cheap when quiescent (embed-batch returns
-// 0 immediately once a board is fully embedded, so no edge recompute fires). Embedding stays off
-// the agent write path — this is the async drain the two graph invariants require.
-async function drainQuackboardEmbeddings(env: Env): Promise<{ boards: number; embedded: number; recomputed: number }> {
-  const embeddingsUrl = env.EMBEDDINGS_URL;
-  if (!embeddingsUrl) return { boards: 0, embedded: 0, recomputed: 0 };
+// Context-graph maintenance pass: for each quackboard whose org has a recently-active agent, drain
+// any un-embedded nodes through the private embeddings service, then rebuild derived edges IF new
+// vectors landed. Gated on recent agent activity (not a gateway probe) so it embeds warm boards
+// without cold-booting idle ones, and is cheap when quiescent (embed-batch returns 0 once a board
+// is fully embedded, so no edge recompute fires). Embedding stays OFF the agent write path — this
+// is the async drain the two graph invariants require.
+// BACKSTOP ONLY. The primary embed trigger is write-driven: every board write enqueues a coalescing
+// Cloud Tasks drain (enqueueEmbedDrain), and Cloud Tasks retries delivery failures itself. This
+// sweep exists solely to recover a LOST enqueue (control-api died between the write and createTask)
+// — it re-enqueues each warm board with a COARSE debounce so running every tick collapses to at
+// most one recovery drain per window, never a per-minute poller. It does NOT embed inline: no
+// gateway calls here, no GPU wakes on empty boards. A drain that finds nothing pending is a cheap
+// gateway no-op. Warm = an agent wrote recently (last_seen_at, control-plane signal — a Cloud Run
+// gateway has no no-wake readiness probe), so we never touch fully-idle boards.
+const BACKSTOP_DEBOUNCE_SECONDS = 600;
+async function drainQuackboardEmbeddings(env: Env): Promise<{ boards: number }> {
+  if (!env.EMBED_QUEUE || !env.EMBEDDINGS_URL) return { boards: 0 };
   const { rows } = await query<{ id: string; gateway_url: string | null }>(
-    `SELECT id, gateway_url FROM waddling.datalake WHERE kind = 'quackboard' AND status = 'running'`,
+    `SELECT d.id, d.gateway_url FROM waddling.datalake d
+       WHERE d.kind = 'quackboard' AND d.status = 'running'
+         AND EXISTS (SELECT 1 FROM waddling.agent a
+                      WHERE a.org_id = d.org_id AND a.last_seen_at > now() - interval '15 minutes')`,
   );
-  let boards = 0, embedded = 0, recomputed = 0;
   for (const ep of rows) {
-    try {
-      const gwc = gatewayClientFor({ gateway_url: ep.gateway_url });
-      const st = await gwc.status(ep.id); // no-wake probe: skip sleeping boards
-      if (st.state !== 'running') continue;
-      boards++;
-      let boardEmbedded = 0;
-      for (let i = 0; i < 20; i++) {
-        const r = await gwc.qbEmbedBatch({ embeddingsUrl });
-        boardEmbedded += r.embedded;
-        if (r.remaining === 0 || r.embedded === 0) break;
-      }
-      embedded += boardEmbedded;
-      if (boardEmbedded > 0) {
-        await gwc.qbEdgesRecompute({});
-        recomputed++;
-      }
-    } catch (e) {
-      console.log(`[cron] qb-embed ${ep.id} failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+    await enqueueEmbedDrain(env, {
+      datalakeId: ep.id,
+      gatewayUrl: ep.gateway_url,
+      debounceSeconds: BACKSTOP_DEBOUNCE_SECONDS,
+    });
   }
-  return { boards, embedded, recomputed };
+  return { boards: rows.length };
 }
 
 export async function scheduledHandler(env: Env): Promise<void> {
@@ -774,8 +772,8 @@ export async function scheduledHandler(env: Env): Promise<void> {
     console.log(`[cron] drainGatewayDispatch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   try {
-    const { boards, embedded, recomputed } = await drainQuackboardEmbeddings(env);
-    if (embedded > 0 || recomputed > 0) console.log(`[cron] qb-embed: ${embedded} node(s) across ${boards} board(s), ${recomputed} edge recompute(s)`);
+    const { boards } = await drainQuackboardEmbeddings(env);
+    if (boards > 0) console.log(`[cron] qb-embed backstop: re-enqueued drains for ${boards} warm board(s)`);
   } catch (e) {
     console.log(`[cron] drainQuackboardEmbeddings failed: ${e instanceof Error ? e.message : String(e)}`);
   }

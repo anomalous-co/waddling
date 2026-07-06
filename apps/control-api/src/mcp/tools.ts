@@ -673,7 +673,7 @@ export const TOOLS: McpTool[] = [
     handler: qbPost('inbox'),
   },
   {
-    name: 'waddling_qb_graph',
+    name: 'waddling_board_graph',
     description:
       'Retrieve context from the quackboard KNOWLEDGE GRAPH, scoped to what YOU may see: all shared ' +
       'observations plus your OWN private memories (never another agent\'s memory). With a `query`, ' +
@@ -692,12 +692,12 @@ export const TOOLS: McpTool[] = [
     handler: qbPost('graph-query'),
   },
   {
-    name: 'waddling_qb_link',
+    name: 'waddling_board_link',
     description:
       'Declare a relationship edge in the quackboard context graph between two nodes — an observation ' +
       'or your own memory. Use to assert that two pieces of context are related (e.g. a finding that ' +
       'supports a decision). These agent-declared edges are preserved across the nightly semantic ' +
-      'recompute. Identify nodes by { kind: observation|memory, id } (ids come from waddling_qb_graph ' +
+      'recompute. Identify nodes by { kind: observation|memory, id } (ids come from waddling_board_graph ' +
       'or waddling_board_query). Returns { ok }.',
     inputSchema: {
       type: 'object',

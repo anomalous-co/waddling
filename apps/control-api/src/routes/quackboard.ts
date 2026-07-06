@@ -42,6 +42,7 @@ import {
 } from '../lib/gateway-client';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
 import { ensureMemoryLake } from '../lib/memory-lake';
+import { enqueueEmbedDrain } from '../lib/embed-queue';
 import { resolveCaller, handle, ok, err, parseBody, AuthError, type Caller } from '../lib/cp-shared';
 
 const QB_JWT_TTL_SECONDS = 15 * 60;
@@ -323,10 +324,16 @@ async function recordAuditSafe(ctx: QbContext): Promise<void> {
  *  Cloud Run there is no waitUntil and a fire-and-forget would race scale-to-zero and lose the
  *  flush. The promise swallows its own failure so a checkpoint error never fails the mutation. */
 async function checkpointBoard(c: any, ctx: QbContext): Promise<void> {
-  const run = gw(ctx).checkpointWorkspace().then(
-    () => {},
-    (e) => console.log(`[quackboard] checkpoint failed: ${e instanceof Error ? e.message : String(e)}`),
-  );
+  // Two after-write side effects, both off the response path: persist the board .duckdb, and
+  // enqueue a coalescing embedding drain (async — the GPU never touches the write path). enqueue
+  // never throws; checkpoint swallows its own error. Fire them together under one waitUntil.
+  const run = Promise.all([
+    gw(ctx).checkpointWorkspace().then(
+      () => {},
+      (e) => console.log(`[quackboard] checkpoint failed: ${e instanceof Error ? e.message : String(e)}`),
+    ),
+    enqueueEmbedDrain(c.env, { datalakeId: ctx.datalakeId, gatewayUrl: ctx.gatewayUrl }),
+  ]).then(() => {});
   let exCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
   try { exCtx = c.executionCtx; } catch { exCtx = undefined; }
   if (exCtx) { exCtx.waitUntil(run); return; }
@@ -633,7 +640,7 @@ quackboard.post('/mine', (c) =>
   }),
 );
 
-// Agent-declared graph edge (waddling_qb_link). agentRole is bound for auditing, but the edge is
+// Agent-declared graph edge (waddling_board_link). agentRole is bound for auditing, but the edge is
 // a relation the agent asserts between two nodes — the write goes to the trusted /ctrl/qb-link.
 const LinkSchema = z.object({
   srcKind: z.enum(['observation', 'memory']),
@@ -657,7 +664,7 @@ quackboard.post('/link', (c) =>
   }),
 );
 
-// Agent-scoped context graph (waddling_qb_graph). The gateway enforces the privacy invariant:
+// Agent-scoped context graph (waddling_board_graph). The gateway enforces the privacy invariant:
 // the agent sees shared observations + its OWN memory only. With a `query`, returns the top-k
 // semantically-nearest allowed nodes (Qwen3 query embedding); without, the allowed subgraph.
 const GraphQuerySchema = z.object({
