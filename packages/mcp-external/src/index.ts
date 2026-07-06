@@ -13,11 +13,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { WaddlingClient } from "./client";
+import { WaddlingClient, type ClientConfig } from "./client";
 import { registerTools } from "./tools";
+import { registerProfileTools } from "./profiles";
+import { registerAccessTools } from "./access";
 import { registerOnboardingTools, type LinkState } from "./onboarding";
 import { createTelemetry, type Telemetry } from "./telemetry";
-import { getOrCreateDeviceId, resolveCredentials, onboardingBaseUrl } from "./credentials";
+import { getOrCreateDeviceId, resolveCredentials, resolveProfile, onboardingBaseUrl } from "./credentials";
 
 // Process-wide telemetry (flushed on exit). Bound to the stable device id.
 const DEVICE_ID = getOrCreateDeviceId();
@@ -35,7 +37,7 @@ function buildServer(reqApiKey?: string): McpServer {
   // has no per-request header, so it falls back to env (resolveCredentials).
   const envCreds = resolveCredentials();
   const creds = reqApiKey
-    ? { apiKey: reqApiKey, baseUrl: envCreds?.baseUrl ?? onboardingBaseUrl(), source: "env" as const }
+    ? { apiKey: reqApiKey, baseUrl: envCreds?.baseUrl ?? onboardingBaseUrl(), profile: "request", source: "env" as const }
     : envCreds;
   const state: LinkState = { creds, deviceId: DEVICE_ID };
 
@@ -46,10 +48,26 @@ function buildServer(reqApiKey?: string): McpServer {
     TELEMETRY.capture("mcp_onboarding_started", {});
   }
 
-  // Client resolves {baseUrl, apiKey} live from LinkState on every request.
-  const client = new WaddlingClient(() => {
-    if (!state.creds) throw new Error("not linked — run waddling_signup first");
-    return { baseUrl: state.creds.baseUrl, apiKey: state.creds.apiKey };
+  // Client resolves {baseUrl, apiKey} live on every request for the requested
+  // profile. Over HTTP the per-request key (state.creds) takes precedence; over
+  // stdio a named profile resolves from the on-disk store (or the env fallback).
+  const client = new WaddlingClient((profile?: string): ClientConfig => {
+    // Over remote HTTP the ONLY credential is the per-request Bearer key — a
+    // `profile` arg is ignored so a tenant can never select the server's on-disk
+    // keys (cross-tenant key confusion). Named profiles are a stdio/npx feature.
+    if (reqApiKey) {
+      if (!state.creds) throw new Error("not linked — provide Authorization: Bearer <sk_agent_ key>");
+      return { baseUrl: state.creds.baseUrl, apiKey: state.creds.apiKey };
+    }
+    const resolved =
+      resolveProfile(profile) ??
+      (state.creds && (!profile || state.creds.profile === profile) ? state.creds : null);
+    if (!resolved) {
+      throw new Error(
+        profile ? `profile "${profile}" is not linked — run waddling_signup { profile }` : "not linked — run waddling_signup first",
+      );
+    }
+    return { baseUrl: resolved.baseUrl, apiKey: resolved.apiKey };
   });
 
   const server = new McpServer(
@@ -58,17 +76,22 @@ function buildServer(reqApiKey?: string): McpServer {
       instructions:
         "waddling governs AI-agent access to analytics lakehouses. If a tool returns " +
         "{ error:'not_linked' }, run waddling_signup (show the human the link + code), then poll " +
-        "waddling_signup_status until connected — then retry. Once connected: waddling_list_endpoints, " +
+        "waddling_signup_status until connected — then retry. Once connected: waddling_list_datalakes, " +
         "waddling_describe to learn the catalog you're allowed to see, waddling_connect to open a " +
-        "session, waddling_query to run governed SQL. Use waddling_whoami / waddling_explain to check " +
-        "permissions WITHOUT triggering denials. Denials are structured { error, table, reason } — read " +
-        "`reason` and self-correct.",
+        "session, waddling_query to run governed SQL (it auto-refreshes an expired session — you never " +
+        "hit a 15-minute cutoff). Use waddling_whoami / waddling_explain to check permissions WITHOUT " +
+        "triggering denials. When you lack access, waddling_request_access returns a link a human approves " +
+        "and waddling_await_access waits for it — the grant is then permanent on your key. Hold multiple " +
+        "identities with waddling_profiles_list / _add / _default and pass `profile` on any tool. Denials " +
+        "are structured { error, table, reason } — read `reason` and self-correct.",
     },
   );
 
-  // Onboarding tools are always present (idempotent once linked); the 8 data
-  // tools self-gate via state.creds.
+  // Onboarding + profile + access tools are always present (idempotent once
+  // linked); the data tools self-gate on the requested profile.
   registerOnboardingTools(server, state);
+  registerProfileTools(server, client);
+  registerAccessTools(server, client);
   registerTools(server, client, { state, telemetry: TELEMETRY });
   return server;
 }

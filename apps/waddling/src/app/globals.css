@@ -250,13 +250,6 @@
   }
 }
 
-/* Agent carousel — infinite horizontal marquee (items duplicated, so -50%
-   lands exactly on the seam). Adapted from the anomalous agent ticker. */
-@keyframes ticker-scroll {
-  0% { transform: translateX(0); }
-  100% { transform: translateX(-50%); }
-}
-
 @theme inline {
   --font-heading: var(--font-sans);
   --font-sans: var(--font-sans);

@@ -12,6 +12,8 @@ export interface LinkState {
     /** poll_token of the in-flight link, set by waddling_signup. */
     pollToken?: string;
     verifyUrl?: string;
+    /** Profile name the in-flight signup will persist the claimed key into. */
+    profileName?: string;
 }
 /** The structured payload every gated data tool returns while unlinked. */
 export declare function notLinked(): CallToolResult;

@@ -1,24 +1,47 @@
 {
   "name": "@waddling/mcp",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
+  "description": "Local MCP server for waddling — governed data-lake access for AI agents, with multi-profile bearer credentials and durable scoped access requests.",
+  "license": "MIT",
   "type": "module",
   "bin": {
-    "waddling-mcp": "./src/index.ts"
+    "waddling-mcp": "dist/index.js"
   },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "waddling",
+    "duckdb",
+    "data-lake",
+    "ai-agents"
+  ],
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "tsc",
+    "build": "node scripts/build.mjs && tsc --emitDeclarationOnly --outDir dist",
+    "prepublishOnly": "pnpm run build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@waddling/control-schema": "workspace:*",
     "@modelcontextprotocol/sdk": "^1",
     "posthog-node": "^5.38.3",
     "zod": "^4"
   },
   "devDependencies": {
+    "@waddling/control-schema": "workspace:*",
     "@types/node": "^20",
+    "esbuild": "^0.24",
     "tsx": "^4",
     "typescript": "^5"
   }
