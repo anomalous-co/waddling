@@ -20,7 +20,7 @@ import type { Plan } from './types';
 export type PlanName = Plan['name'];
 
 /** Plan tiers in increasing order of capability. Index = rank for `requirePlan`. */
-export const PLAN_ORDER: readonly PlanName[] = ['free', 'pro', 'scale', 'enterprise'];
+export const PLAN_ORDER: readonly PlanName[] = ['free', 'starter', 'pro', 'scale', 'enterprise'];
 
 /**
  * Build the plan table (entitlement limits per tier). Functioned (not a frozen
@@ -38,6 +38,27 @@ export function getPlans(): Plan[] {
         dynamicAcl: false,
         adminMcp: false,
         auditRetentionDays: 7,
+      },
+    },
+    {
+      // 'starter' is the $15/mo entry tier — the personal data store. One data
+      // lake plus the org's memory lake (kind='quackboard', exempt from the
+      // endpoint quota — see datalakes.ts), 3 agents. `free` above stays as the
+      // implicit default/lapsed floor; starter is the cheapest PURCHASABLE tier.
+      // dynamicAcl MUST be true here: per-agent access control is the product's
+      // core mechanic (advertised on the pricing page), not a Pro upsell — a
+      // Starter org that can't grant its own agent anything is a broken product,
+      // not a paywall. acl.ts's requirePlan('pro') gate only matters once
+      // billingOn is true; before that this bug was silently dormant.
+      name: 'starter',
+      priceId: '',
+      monthlyCreditUsd: 15,
+      entitlements: {
+        endpoints: 1,
+        agents: 3,
+        dynamicAcl: true,
+        adminMcp: false,
+        auditRetentionDays: 30,
       },
     },
     {

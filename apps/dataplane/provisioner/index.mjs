@@ -44,10 +44,12 @@ async function api(method, url, body) {
 // PEM secrets and the cloudsql-instances annotation. kind 'gateway' (default) is unchanged.
 function serviceBody(envMap, secretEnvMap, kind = "gateway") {
   const isWorkspace = kind === "workspace";
+  // Quackboards need Cloud SQL for the birdshot grant store (attachGrantStore).
+  const needsCloudSql = !isWorkspace || String(envMap?.QUACKBOARD ?? '') === '1';
   const env = [
     ...Object.entries(envMap ?? {}).map(([name, value]) => ({ name, value: String(value) })),
-    // Workspaces have no libpq client cert; only inject the shared PEM secrets for gateways.
-    ...Object.entries({ ...(isWorkspace ? {} : PEM_SECRETS), ...(secretEnvMap ?? {}) }).map(([name, secret]) => ({
+    // Quackboards need the shared PEM secrets for Cloud SQL mTLS; pure workspaces skip them.
+    ...Object.entries({ ...(needsCloudSql ? PEM_SECRETS : {}), ...(secretEnvMap ?? {}) }).map(([name, secret]) => ({
       name,
       valueSource: { secretKeyRef: { secret, version: "latest" } },
     })),
@@ -57,8 +59,8 @@ function serviceBody(envMap, secretEnvMap, kind = "gateway") {
       scaling: { minInstanceCount: 0, maxInstanceCount: 1 },
       serviceAccount: GATEWAY_SA,
       executionEnvironment: "EXECUTION_ENVIRONMENT_GEN2",
-      // Workspaces don't reach Cloud SQL, so they get no cloudsql-instances annotation.
-      ...(isWorkspace ? {} : { annotations: { "run.googleapis.com/cloudsql-instances": CLOUDSQL_INSTANCE } }),
+      // Quackboards need Cloud SQL for the grant store; pure workspaces don't.
+      ...(needsCloudSql ? { annotations: { "run.googleapis.com/cloudsql-instances": CLOUDSQL_INSTANCE } } : {}),
       containers: [
         {
           image: GATEWAY_IMAGE,

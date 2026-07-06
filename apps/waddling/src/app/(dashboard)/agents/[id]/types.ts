@@ -3,18 +3,16 @@
 // settles a real contract.
 
 /**
- * A private agent-memory entry surfaced read-only for oversight.
- *
- * The control-api memory endpoint is not wired in production yet (the fetch
- * 404s and the section renders empty), so this shape mirrors what the Memory
- * section renders rather than a committed server contract.
+ * A private agent-memory entry surfaced read-only for oversight. Shape of the
+ * rows returned by GET /api/cp/quackboard/memory (the memory lake's
+ * /ctrl/qb-memory-all: agent_role/key/content/ts, plus the agentName the
+ * control plane joins on).
  */
 export interface QbMemoryEntry {
-  id: string;
-  agentId: string;
-  key: string;
-  valuePreview: string;
-  /** ISO timestamp of the last write. */
-  updatedAt: string;
-  sizeBytes: number;
+  agent_role: string;
+  key: string | null;
+  content: string;
+  /** ISO timestamp of the write. */
+  ts: string;
+  agentName?: string;
 }

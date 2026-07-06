@@ -54,9 +54,8 @@ interface EndpointCatalogRow {
 }
 
 const LAKE_ALIAS = 'lake';
-const QUACKBOARD_ALIAS = 'quackboard';
 
-/** R2 object key for an org's durable quackboard .duckdb file. */
+/** R2 object key for an org's durable quackboard .duckdb file (legacy local-file board). */
 export function quackboardR2Key(orgId: string): string {
   return `quackboard/${orgId}/quackboard.duckdb`;
 }
@@ -79,20 +78,15 @@ export async function resolveGatewayBoot(env: Env, datalakeId: string): Promise<
   );
   if (!ep) return { lakeCatalog: 'memory' };
 
-  // Quackboard: no DuckLake, no object store. The served DuckDB IS the durable store; the
-  // data plane restores/persists it from R2 at `r2Key`. birdshot still boots + enforces, so
-  // birdshot resolves agent table refs against the served db's own catalog (QUACKBOARD_ALIAS).
-  if (ep.kind === 'quackboard') {
-    return {
-      lakeCatalog: QUACKBOARD_ALIAS,
-      gatewayBoot: {
-        serverToken: ep.server_token,
-        alias: QUACKBOARD_ALIAS,
-        quackboard: true,
-        r2Key: quackboardR2Key(ep.org_id),
-      },
-    };
-  }
+  // The org's memory lake (kind='quackboard') is now a REAL managed DuckLake, not the legacy
+  // local-file board: its 8 coordination namespaces are governed tables in `lake.main`. So it
+  // resolves through the managed-postgres path below like any lake (lakeCatalog='lake', real
+  // catalog DSN + metadata schema), with `memoryLake: true` stamped on the boot so control-api's
+  // prepareQbContext recognizes it. The gateway itself bootstraps the board schema off its own
+  // MEMORY_LAKE deploy-env flag (set by the provisioner) — that flag, not this wire field, is
+  // what drives the bootstrap. (QUACKBOARD_ALIAS / quackboardR2Key remain for a not-yet-migrated
+  // legacy board.)
+  const isMemoryLake = ep.kind === 'quackboard';
 
   const cfg = await getDatalakeGatewayConfig(datalakeId);
   if (!cfg) return { lakeCatalog: 'memory' };
@@ -133,7 +127,7 @@ export async function resolveGatewayBoot(env: Env, datalakeId: string): Promise<
     if (cfg.s3 && cfg.s3.keyId && cfg.s3.secret) {
       return {
         lakeCatalog: LAKE_ALIAS,
-        gatewayBoot: { ...base, catalogDsn: dsn, metadataSchema: schema },
+        gatewayBoot: { ...base, catalogDsn: dsn, metadataSchema: schema, memoryLake: isMemoryLake || undefined },
       };
     }
 
@@ -146,7 +140,7 @@ export async function resolveGatewayBoot(env: Env, datalakeId: string): Promise<
     if (!faucet) {
       return {
         lakeCatalog: LAKE_ALIAS,
-        gatewayBoot: { ...base, catalogDsn: dsn, metadataSchema: schema },
+        gatewayBoot: { ...base, catalogDsn: dsn, metadataSchema: schema, memoryLake: isMemoryLake || undefined },
       };
     }
     const slug = await orgSlugFor(ep.org_id);
@@ -169,6 +163,7 @@ export async function resolveGatewayBoot(env: Env, datalakeId: string): Promise<
         encrypted: cfg.encrypted,
         catalogDsn: dsn,
         metadataSchema: schema,
+        memoryLake: isMemoryLake || undefined,
         s3: {
           endpoint: s3host,
           keyId: creds.accessKeyId,

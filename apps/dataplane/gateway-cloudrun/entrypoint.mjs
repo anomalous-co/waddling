@@ -89,6 +89,55 @@ const log = (...a) => console.log("[gw-entry]", ...a);
  *  memory ops only — see /ctrl/qb-remember). */
 const qlit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
 
+const EMBED_DIM = 2560; // Qwen3-Embedding-4B native dim — must match embeddings.vec FLOAT[2560].
+const EMBED_MODEL = "qwen3-embed-4b";
+const EMBED_CHUNK = 32; // TEI's max_client_batch_size — chunk /embed requests to this size.
+
+/** Mint a Google OIDC identity token for a PRIVATE Cloud Run service (audience = its URL) from
+ *  the instance metadata server — the gateway SA's own token, no key file. Used to reach the
+ *  private embeddings service. Returns the raw JWT for an `Authorization: Bearer` header. */
+async function metadataIdToken(audience) {
+  const r = await fetch(
+    `http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${encodeURIComponent(audience)}`,
+    { headers: { "Metadata-Flavor": "Google" } },
+  );
+  if (!r.ok) throw new Error(`metadata id token ${r.status}`);
+  return (await r.text()).trim();
+}
+
+/** Embed texts via the private embeddings service (Qwen3-Embedding-4B on TEI). Chunks to TEI's
+ *  client-batch limit and returns one 2560-float vector per input, in order. `instruction`, if
+ *  given, is prepended per Qwen3's asymmetric-retrieval format (queries only; docs pass raw). */
+async function embedTexts(embeddingsUrl, texts, instruction) {
+  const token = await metadataIdToken(embeddingsUrl);
+  const out = [];
+  for (let i = 0; i < texts.length; i += EMBED_CHUNK) {
+    const chunk = texts.slice(i, i + EMBED_CHUNK).map((t) =>
+      instruction ? `Instruct: ${instruction}\nQuery:${t}` : String(t),
+    );
+    const r = await fetch(`${embeddingsUrl}/embed`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ inputs: chunk }),
+    });
+    if (!r.ok) throw new Error(`embed ${r.status}: ${(await r.text()).slice(0, 200)}`);
+    const vecs = await r.json();
+    for (const v of vecs) out.push(v);
+  }
+  return out;
+}
+
+// The embeddings.vec column is a LIST (FLOAT[]) — DuckLake has no fixed-ARRAY type. So vectors are
+// STORED as a plain list literal `[...]`, and CAST to a fixed array `::FLOAT[EMBED_DIM]` only at
+// query time, where `array_cosine_similarity` (core DuckDB) needs same-sized ARRAY operands.
+const VEC_ARRAY = `::FLOAT[${EMBED_DIM}]`; // query-time cast for a stored LIST or an inlined vector
+
+/** A DuckDB LIST literal `[...]` from a numeric vector, or null if the wrong length. */
+function vecLiteral(v) {
+  if (!Array.isArray(v) || v.length !== EMBED_DIM) return null;
+  return `[${v.map((x) => Number(x)).join(",")}]`;
+}
+
 // Strip the lake ATTACH-alias catalog qualifier from 3-part refs so Form-B relay SQL
 // runs against the remote gateway's served tables without the workspace client-side alias
 // prefix. Rewrites `lake.<schema>.<table>` → `<schema>.<table>` (global, all occurrences);
@@ -155,6 +204,10 @@ async function main() {
   // but bootstrap EMPTY schema (agent DDL creates its own tables). GCS provides persistence.
   // Mutually exclusive with quackboard; quackboard takes precedence if both are set.
   const workspaceMode = !quackboard && /^(1|true|yes|on)$/i.test(process.env.WORKSPACE_MODE ?? "");
+  // Memory-lake mode: a REAL managed DuckLake (real catalog + s3 data, like a normal lake) that
+  // ALSO bootstraps the agent-coordination tables into lake.main. NOT no-lake, NOT file-durable —
+  // durability is the DuckLake catalog/object store, and board reads+writes ride /qb-query.
+  const memoryLake = !quackboard && !workspaceMode && /^(1|true|yes|on)$/i.test(process.env.MEMORY_LAKE ?? "");
   const seedDemo =
     !quackboard && !workspaceMode &&
     (process.env.GW_SELFTEST_SEED === "1" ||
@@ -196,6 +249,7 @@ async function main() {
     // quackboard bootstraps coordination schema; workspace boots with empty schema.
     quackboard,
     workspaceMode,
+    memoryLake,
     // Workspace-at-rest encryption key (64 hex). When set in workspace mode, bootDuckRuntime
     // opens ':memory:' and ATTACHes the durable file ENCRYPTED before it is persisted to GCS.
     // Empty ⇒ plaintext open (back-compat). Ignored outside workspace mode.
@@ -206,7 +260,7 @@ async function main() {
   const catalogDesc = config.ducklakeCatalogFile
     ? `file:${config.ducklakeCatalogFile}`
     : `postgres(schema=${config.metadataSchema || "main"})`;
-  log(`booting gateway: quack:${QUACK_PORT}, mode=${quackboard ? `quackboard(db=${config.databasePath})` : workspaceMode ? `workspace(db=${config.databasePath})` : seedDemo ? "selftest-demo" : "real-lake"}, catalog=${catalogDesc}, dataPath=${config.ducklakeDataPath}`);
+  log(`booting gateway: quack:${QUACK_PORT}, mode=${quackboard ? `quackboard(db=${config.databasePath})` : workspaceMode ? `workspace(db=${config.databasePath})` : memoryLake ? `memory-lake(schema=${config.metadataSchema})` : seedDemo ? "selftest-demo" : "real-lake"}, catalog=${catalogDesc}, dataPath=${config.ducklakeDataPath}`);
   // ── Workspace GCS restore (workspace mode only, before DuckDB opens the file) ──────────
   // Download the durable .duckdb from GCS so DuckDB opens an already-populated file.
   // On first boot (404) we skip the download and let DuckDB create a fresh empty database.
@@ -368,11 +422,6 @@ async function main() {
     return client;
   }
 
-  // FTS recall (quackboard): the BM25 index is rebuilt lazily — only when the observations
-  // table has grown since the last build — so recall never pays an O(N) rebuild per write
-  // (plan req 3) and reads stay fresh within one observe→recall hop. -1 forces a rebuild on
-  // the first recall after a (cold) boot, folding in any observes since bootstrap.
-  let lastFtsCount = -1;
   async function attach(token) {
     const c = await ensureClient();
     if (attachedTokens.has(token)) return;
@@ -544,8 +593,11 @@ async function main() {
         res.end(JSON.stringify({ error: "missing agentRole/content" }));
         return;
       }
+      // id is supplied inline (DuckLake has no sequences); agent_memory lives in lake.main
+      // under the control connection's USE lake, so the bare name resolves there.
       await rt.run(
-        `INSERT INTO agent_memory(agent_role, key, content) VALUES (${qlit(agentRole)}, ${key ? qlit(key) : "NULL"}, ${qlit(content)})`,
+        `INSERT INTO agent_memory(id, agent_role, key, content)
+           SELECT (SELECT coalesce(max(id),0)+1 FROM agent_memory), ${qlit(agentRole)}, ${key ? qlit(key) : "NULL"}, ${qlit(content)}`,
       );
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
@@ -580,19 +632,281 @@ async function main() {
         return;
       }
       const cap = Math.min(Math.max(Number(limit) || 20, 1), 100);
-      const cntReader = await rt.connection.runAndReadAll("SELECT count(*) AS n FROM observations");
-      const cnt = Number(cntReader.getRowObjects()[0]?.n ?? 0);
-      if (cnt !== lastFtsCount) {
-        await rt.run("PRAGMA create_fts_index('observations', 'id', 'content', stemmer = 'porter', overwrite = 1)");
-        lastFtsCount = cnt;
-      }
+      // ILIKE substring recall over the shared observations corpus. DuckLake does not support a
+      // persistent FTS index (create_fts_index fails to commit the DuckLake transaction), so the
+      // BM25 path is replaced by a case-insensitive substring match ranked by recency — the same
+      // matcher the pub/sub fan-out uses. Runs on the control connection (USE lake ⇒ lake.main).
       const reader = await rt.connection.runAndReadAll(
-        `SELECT agent_role, content, topic, ts, score FROM (
-           SELECT *, fts_main_observations.match_bm25(id, ${qlit(term)}) AS score FROM observations
-         ) sq WHERE score IS NOT NULL ORDER BY score DESC LIMIT ${cap}`,
+        `SELECT agent_role, content, topic, ts FROM observations
+           WHERE content ILIKE '%' || ${qlit(term)} || '%' ORDER BY ts DESC LIMIT ${cap}`,
       );
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, rows: normalize(reader.getRowObjects()) }));
+      return;
+    }
+
+    // ── Owner-oversight reads (TRUSTED, read-only) ──────────────────────────────
+    // These power the control-plane's human /quackboard browse UI. They run on the
+    // trusted control connection (bypassing birdshot) and are NOT agent-scoped: an
+    // org owner authenticated at control-api sees the whole board, including every
+    // agent's private memory (agent_memory carries no birdshot grant, so this trusted
+    // path is the ONLY cross-agent read). Owner authz is enforced upstream at
+    // control-api (resolveCaller + requireOrg, no agent binding) — never call these
+    // from an agent-facing surface.
+    if (path === "/ctrl/qb-observations" && method === "POST") {
+      const { topic, limit } = await readJson(req);
+      const cap = Math.min(Math.max(Number(limit) || 100, 1), 500);
+      const where = topic ? ` WHERE topic = ${qlit(topic)}` : "";
+      const reader = await rt.connection.runAndReadAll(
+        `SELECT id, agent_role, content, refs, topic, ts FROM observations${where} ORDER BY ts DESC LIMIT ${cap}`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, rows: normalize(reader.getRowObjects()) }));
+      return;
+    }
+    if (path === "/ctrl/qb-topics" && method === "POST") {
+      // Topics are agent-managed and fluid — there is no topics registry. Derive them
+      // from observation activity; ORDER BY last_ts is the seam a future relevance
+      // re-rank / nightly analytics job replaces.
+      const reader = await rt.connection.runAndReadAll(
+        `SELECT topic, count(*) AS n, max(ts) AS last_ts FROM observations
+           WHERE topic IS NOT NULL GROUP BY topic ORDER BY last_ts DESC`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, rows: normalize(reader.getRowObjects()) }));
+      return;
+    }
+    if (path === "/ctrl/qb-memory-all" && method === "POST") {
+      const { limit } = await readJson(req);
+      const cap = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+      const reader = await rt.connection.runAndReadAll(
+        `SELECT agent_role, key, content, ts FROM agent_memory ORDER BY ts DESC LIMIT ${cap}`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, rows: normalize(reader.getRowObjects()) }));
+      return;
+    }
+
+    // ── Context graph: async embedding + edge recompute + graph reads (TRUSTED) ──────
+    // These run on the un-gated control connection. Embedding is ASYNC (never in an agent write
+    // path): a node is un-embedded until qb-embed-batch fills its vector. The embeddings service
+    // is PRIVATE Cloud Run — reached with a metadata-minted OIDC token (gateway SA has invoker);
+    // its URL is passed by control-api, which holds EMBEDDINGS_URL. Owner authz is enforced
+    // upstream at control-api for the owner reads; the agent-scoped graph enforces the privacy
+    // invariant HERE in SQL (an agent sees shared observations + its OWN memory, never another
+    // agent's private memory).
+    if (path === "/ctrl/qb-embed-batch" && method === "POST") {
+      const { embeddingsUrl, limit } = await readJson(req);
+      if (!embeddingsUrl) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing embeddingsUrl" }));
+        return;
+      }
+      const cap = Math.min(Math.max(Number(limit) || 128, 1), 512);
+      // Un-embedded nodes = observations + agent_memory rows with no embeddings row yet.
+      const pendReader = await rt.connection.runAndReadAll(
+        `SELECT 'observation' AS node_kind, id AS node_id, content FROM observations o
+           WHERE content IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='observation' AND e.node_id=o.id)
+         UNION ALL
+         SELECT 'memory' AS node_kind, id AS node_id, content FROM agent_memory m
+           WHERE content IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='memory' AND e.node_id=m.id)
+         ORDER BY node_kind, node_id LIMIT ${cap}`,
+      );
+      const pending = normalize(pendReader.getRowObjects());
+      if (pending.length === 0) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, embedded: 0, remaining: 0 }));
+        return;
+      }
+      let vectors;
+      try {
+        vectors = await embedTexts(embeddingsUrl, pending.map((p) => p.content)); // docs: raw, no instruction
+      } catch (e) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "embed_failed", reason: e instanceof Error ? e.message : String(e) }));
+        return;
+      }
+      let embedded = 0;
+      for (let i = 0; i < pending.length; i++) {
+        const lit = vecLiteral(vectors[i]);
+        if (!lit) continue; // wrong-length vector → skip (stays pending for a retry)
+        await rt.run(
+          // Plain INSERT — only UN-embedded nodes were selected, so there's no existing row to
+          // upsert (DuckLake has no PK/ON CONFLICT anyway). vec is stored as a LIST literal.
+          `INSERT INTO embeddings(node_kind, node_id, vec, model)
+             VALUES (${qlit(pending[i].node_kind)}, ${Number(pending[i].node_id)}, ${lit}, ${qlit(EMBED_MODEL)})`,
+        );
+        embedded++;
+      }
+      // Count still-pending so a caller can loop until drained.
+      const remReader = await rt.connection.runAndReadAll(
+        `SELECT (SELECT count(*) FROM observations o WHERE content IS NOT NULL AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='observation' AND e.node_id=o.id))
+              + (SELECT count(*) FROM agent_memory m WHERE content IS NOT NULL AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.node_kind='memory' AND e.node_id=m.id)) AS remaining`,
+      );
+      const remaining = Number(normalize(remReader.getRowObjects())[0]?.remaining ?? 0);
+      log(`qb-embed-batch: embedded ${embedded}, ${remaining} remaining`);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, embedded, remaining }));
+      return;
+    }
+
+    // Rebuild derived edges (semantic + structural); agent-declared edges are preserved.
+    if (path === "/ctrl/qb-edges-recompute" && method === "POST") {
+      // Delete-then-insert the derived kinds (no PK/ON CONFLICT on DuckLake); declared edges stay.
+      await rt.run(`DELETE FROM edges WHERE kind IN ('semantic','structural')`);
+      // Semantic: top-5 cosine neighbours (sim > 0.5) per embedded node — brute-force O(n²). The
+      // stored LIST vectors are cast to fixed ARRAY for array_cosine_similarity (same-size operands).
+      await rt.run(
+        `INSERT INTO edges(src_kind, src_id, dst_kind, dst_id, kind, weight)
+           SELECT sk, sid, dk, did, 'semantic', sim FROM (
+             SELECT sk, sid, dk, did, sim,
+                    row_number() OVER (PARTITION BY sk, sid ORDER BY sim DESC) AS rn FROM (
+               SELECT a.node_kind sk, a.node_id sid, b.node_kind dk, b.node_id did,
+                      array_cosine_similarity(a.vec${VEC_ARRAY}, b.vec${VEC_ARRAY}) AS sim
+                 FROM embeddings a JOIN embeddings b
+                   ON NOT (a.node_kind = b.node_kind AND a.node_id = b.node_id)
+             ) WHERE sim > 0.5
+           ) WHERE rn <= 5`,
+      );
+      // Structural: observations sharing a (non-null) topic (one edge per unordered pair).
+      await rt.run(
+        `INSERT INTO edges(src_kind, src_id, dst_kind, dst_id, kind, weight)
+           SELECT 'observation', o1.id, 'observation', o2.id, 'structural', 1.0
+             FROM observations o1 JOIN observations o2
+               ON o1.topic = o2.topic AND o1.topic IS NOT NULL AND o1.id < o2.id`,
+      );
+      const cReader = await rt.connection.runAndReadAll(
+        `SELECT kind, count(*) AS n FROM edges GROUP BY kind`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, byKind: normalize(cReader.getRowObjects()) }));
+      return;
+    }
+
+    // Agent-declared edge (TRUSTED — control-api binds the caller; agentRole is not trusted from
+    // the wire for authz here, the edge just records a relation the agent asserts).
+    if (path === "/ctrl/qb-link" && method === "POST") {
+      const { srcKind, srcId, dstKind, dstId, weight } = await readJson(req);
+      const kinds = new Set(["observation", "memory"]);
+      if (!kinds.has(srcKind) || !kinds.has(dstKind) || srcId == null || dstId == null) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "need srcKind/srcId/dstKind/dstId (kinds: observation|memory)" }));
+        return;
+      }
+      const w = Number.isFinite(Number(weight)) ? Number(weight) : 1.0;
+      // Delete-then-insert for idempotent re-linking (DuckLake has no PK/ON CONFLICT).
+      await rt.run(
+        `DELETE FROM edges WHERE kind='declared'
+           AND src_kind=${qlit(srcKind)} AND src_id=${Number(srcId)}
+           AND dst_kind=${qlit(dstKind)} AND dst_id=${Number(dstId)}`,
+      );
+      await rt.run(
+        `INSERT INTO edges(src_kind, src_id, dst_kind, dst_id, kind, weight)
+           VALUES (${qlit(srcKind)}, ${Number(srcId)}, ${qlit(dstKind)}, ${Number(dstId)}, 'declared', ${w})`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // Owner oversight graph: ALL nodes + ALL edges (owner sees everything). Read-only.
+    if (path === "/ctrl/qb-graph-owner" && method === "POST") {
+      const { limit } = await readJson(req);
+      const cap = Math.min(Math.max(Number(limit) || 500, 1), 2000);
+      const nodesReader = await rt.connection.runAndReadAll(
+        `SELECT node_kind, node_id, agent_role, topic, label, ts, embedded FROM (
+           SELECT 'observation' AS node_kind, id AS node_id, agent_role, topic,
+                  substr(content, 1, 100) AS label, ts,
+                  (id IN (SELECT node_id FROM embeddings WHERE node_kind='observation')) AS embedded
+             FROM observations
+           UNION ALL
+           SELECT 'memory' AS node_kind, id AS node_id, agent_role, NULL AS topic,
+                  substr(content, 1, 100) AS label, ts,
+                  (id IN (SELECT node_id FROM embeddings WHERE node_kind='memory')) AS embedded
+             FROM agent_memory
+         ) ORDER BY ts DESC LIMIT ${cap}`,
+      );
+      const edgesReader = await rt.connection.runAndReadAll(
+        `SELECT src_kind, src_id, dst_kind, dst_id, kind, weight FROM edges LIMIT ${cap * 8}`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        nodes: normalize(nodesReader.getRowObjects()),
+        edges: normalize(edgesReader.getRowObjects()),
+      }));
+      return;
+    }
+
+    // Agent-scoped graph: PRIVACY INVARIANT enforced here. Allowed nodes = ALL shared
+    // observations + ONLY this agent's own memory. Edges returned only when BOTH endpoints are
+    // allowed, so traversal never reaches another agent's private memory. If `query` is given,
+    // embed it (Qwen3 query-instruction form) and return the top-k allowed nodes by similarity.
+    if (path === "/ctrl/qb-graph-agent" && method === "POST") {
+      const { agentRole, query, embeddingsUrl, limit } = await readJson(req);
+      if (!agentRole) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing agentRole" }));
+        return;
+      }
+      const cap = Math.min(Math.max(Number(limit) || 100, 1), 500);
+      // The allow predicate, reused for nodes and both edge endpoints.
+      const allow = (k, idcol) =>
+        `((${k}='observation') OR (${k}='memory' AND ${idcol} IN (SELECT id FROM agent_memory WHERE agent_role=${qlit(agentRole)})))`;
+      let nodes;
+      if (query) {
+        if (!embeddingsUrl) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "query given but missing embeddingsUrl" }));
+          return;
+        }
+        let qvec;
+        try {
+          qvec = (await embedTexts(embeddingsUrl, [String(query)],
+            "Retrieve memories and observations relevant to the query"))[0];
+        } catch (e) {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "embed_failed", reason: e instanceof Error ? e.message : String(e) }));
+          return;
+        }
+        const qlitv = vecLiteral(qvec);
+        if (!qlitv) {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "bad_query_vector" }));
+          return;
+        }
+        // kNN over allowed embedded nodes, joined back to node metadata.
+        const r = await rt.connection.runAndReadAll(
+          `SELECT n.node_kind, n.node_id, n.agent_role, n.topic, n.label, n.ts, s.sim FROM (
+             SELECT e.node_kind, e.node_id, array_cosine_similarity(e.vec${VEC_ARRAY}, ${qlitv}${VEC_ARRAY}) AS sim
+               FROM embeddings e WHERE ${allow("e.node_kind", "e.node_id")}
+             ORDER BY sim DESC LIMIT ${cap}
+           ) s JOIN (
+             SELECT 'observation' node_kind, id node_id, agent_role, topic, substr(content,1,100) label, ts FROM observations
+             UNION ALL
+             SELECT 'memory' node_kind, id node_id, agent_role, NULL topic, substr(content,1,100) label, ts FROM agent_memory
+           ) n ON n.node_kind=s.node_kind AND n.node_id=s.node_id
+           ORDER BY s.sim DESC`,
+        );
+        nodes = normalize(r.getRowObjects());
+      } else {
+        const r = await rt.connection.runAndReadAll(
+          `SELECT node_kind, node_id, agent_role, topic, label, ts FROM (
+             SELECT 'observation' node_kind, id node_id, agent_role, topic, substr(content,1,100) label, ts FROM observations
+             UNION ALL
+             SELECT 'memory' node_kind, id node_id, agent_role, NULL topic, substr(content,1,100) label, ts FROM agent_memory
+           ) WHERE ${allow("node_kind", "node_id")} ORDER BY ts DESC LIMIT ${cap}`,
+        );
+        nodes = normalize(r.getRowObjects());
+      }
+      const edgesReader = await rt.connection.runAndReadAll(
+        `SELECT src_kind, src_id, dst_kind, dst_id, kind, weight FROM edges
+           WHERE ${allow("src_kind", "src_id")} AND ${allow("dst_kind", "dst_id")} LIMIT ${cap * 8}`,
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, nodes, edges: normalize(edgesReader.getRowObjects()) }));
       return;
     }
 

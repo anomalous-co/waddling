@@ -2,8 +2,9 @@ import { NextResponse, type NextRequest } from 'next/server';
 
 /**
  * Host-based split of the single render plane across two custom domains:
- *   • getwaddling.com      — marketing (landing, docs, blog, customers, pricing,
- *                            enterprise, memory).
+ *   • getwaddling.com      — marketing (landing, docs, blog, pricing; retired
+ *                            paths like /customers stay marketing-owned so they
+ *                            404 here instead of bouncing to the app host).
  *   • app.getwaddling.com  — the product (sign-in/up, dashboard, /link).
  *
  * One worker is bound to both domains; this middleware redirects any request that

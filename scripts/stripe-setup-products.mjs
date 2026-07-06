@@ -33,6 +33,16 @@ const stripe = new Stripe(key);
  */
 const CATALOG = [
   {
+    lookupKey: 'starter_monthly',
+    envKey: 'STRIPE_PRICE_STARTER',
+    product: {
+      name: 'Waddling Starter',
+      description: 'Starter tier — $15/mo personal data store, resets to $15 credits monthly. 3-day trial.',
+    },
+    unitAmount: 1500,
+    recurring: true,
+  },
+  {
     lookupKey: 'pro_monthly',
     envKey: 'STRIPE_PRICE_PRO',
     product: { name: 'Waddling Pro', description: 'Pro tier — $49/mo, resets to $49 credits monthly.' },

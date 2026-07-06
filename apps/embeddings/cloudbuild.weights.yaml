@@ -1,0 +1,16 @@
+# Build the weights-only image ONCE (Dockerfile.weights) on Cloud Build → Artifact Registry.
+# Tagged by model, not by git — it changes only when the model changes. The runtime build
+# (cloudbuild.yaml) consumes it via --build-arg WEIGHTS_IMAGE so TEI-base swaps stay cheap.
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-f', 'Dockerfile.weights', '-t', '${_WEIGHTS_IMAGE}', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_WEIGHTS_IMAGE}']
+images:
+  - '${_WEIGHTS_IMAGE}'
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 100
+timeout: 3600s
+substitutions:
+  _WEIGHTS_IMAGE: 'us-west1-docker.pkg.dev/project-bd87157a-f6fd-4d44-830/waddling/embeddings-weights:qwen3-4b'

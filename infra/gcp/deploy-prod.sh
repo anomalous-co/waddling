@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════════
-# deploy-cutover.sh — the FULL GCP deployment for the birdshot literal-GRANT/DENY-SQL
+# deploy-prod.sh — the FULL GCP deployment for the birdshot literal-GRANT/DENY-SQL
 # control plane. Runs the whole cutover so nothing gets forgotten. Idempotent.
 #
-#   ./deploy-cutover.sh all            # everything, in order
-#   ./deploy-cutover.sh migrate        # apply control-schema migrations to prod
-#   ./deploy-cutover.sh control-api    # build + push + deploy control-api
-#   ./deploy-cutover.sh gateway        # build gateway image (bakes birdshot from GCS)
+#   ./deploy-prod.sh all            # everything, in order
+#   ./deploy-prod.sh migrate        # apply control-schema migrations to prod
+#   ./deploy-prod.sh control-api    # build + push + deploy control-api
+#   ./deploy-prod.sh gateway        # build gateway image (bakes birdshot from GCS)
 #                                      #   + roll it across ALL gw-*/ws-* services
 #                                      #   + repoint the provisioner
-#   ./deploy-cutover.sh birdshot-pull  # refresh the staged linux_amd64 extension from GCS
+#   ./deploy-prod.sh birdshot-pull  # refresh the staged linux_amd64 extension from GCS
 #
 # WHY GCS (not R2): all non-UI/non-DNS infra is GCP. The birdshot CI publishes the
 # cross-compiled extensions to gs://waddling-ext (see birdshot/.github/workflows), and

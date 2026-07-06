@@ -127,6 +127,10 @@
     // (test-mode) STRIPE_SECRET_KEY flips `stripeConfigured` on (auth.ts).
     // Price ids below are TEST-mode, created idempotently (by lookup_key) via
     // `scripts/stripe-setup-products.mjs` — re-run with a live key + push as secrets for prod.
+    // Starter $15/mo — created by scripts/stripe-setup-products.mjs (lookup_key
+    // starter_monthly). Empty until the script is re-run; stripePlans() filters
+    // unset prices so checkout degrades gracefully.
+    "STRIPE_PRICE_STARTER": "",
     "STRIPE_PRICE_PRO": "price_1TlgZVDNZoqvxQqoVjX1v0yO",
     // 'scale' = the self-serve $199/mo tier (this $199 price was created as
     // enterprise_monthly before the tier split; relabelled scale_monthly by the

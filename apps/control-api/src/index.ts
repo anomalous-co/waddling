@@ -71,21 +71,45 @@ function errMessage(e: unknown): string {
 // ECHO the request origin only when it is in WEB_ORIGIN (comma-separated allowlist).
 // Registered FIRST and scoped to /api/* so an OPTIONS preflight short-circuits here
 // (Hono's cors answers it without next()) and never opens a DB/auth pool below.
-// Unset WEB_ORIGIN ⇒ no allowlist ⇒ no ACAO header (same-origin / service-binding
-// callers are unaffected; cross-origin browsers are correctly blocked).
-app.use("/api/*", (c, next) => {
-  const allow = (c.env.WEB_ORIGIN ?? "")
+//
+// Why a factory function instead of inline cors({ origin: ... })? The WORA env
+// (WEB_ORIGIN) can differ per deployment (CF vars vs GCP env), so we compute
+// the allow-set at call time rather than at module-load time. The closure is
+// cheap (an array split + trim on a short string) and keeps the origin check
+// lockstep with the current env binding.
+function buildApiCors(webOrigin: string | undefined) {
+  const allow = (webOrigin ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
   return cors({
-    origin: (origin) => (allow.includes(origin) ? origin : null),
+    // Return the EXACT origin if allowed, otherwise null. Never return "*" —
+    // credentialed CORS (cookies) requires a concrete origin.
+    origin: (origin) => {
+      // origin is always a string here (Hono passes c.req.header("origin") || "").
+      // An empty string means either same-origin or a direct server-to-server call;
+      // we return null (no ACAO header) which is correct — same-origin doesn't need CORS.
+      if (!origin) return null;
+      if (allow.includes(origin)) return origin;
+      // Origin not in the allowlist — block. Include the blocked origin in the log
+      // for observability but never leak it in the response.
+      if (allow.length > 0) {
+        console.log(`[cors] blocked origin: ${origin} (allow: ${allow.join(", ")})`);
+      }
+      return null;
+    },
     credentials: true,
     allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    // allowHeaders lists every header the browser may include in cross-origin
+    // API calls. "Content-Type" covers JSON POST/PATCH bodies; "Authorization"
+    // covers Bearer tokens sent directly by browser-side code (non-cookie auth).
+    // Cookie-based auth does NOT need its header listed — the browser manages
+    // "Cookie" automatically and never puts it in Access-Control-Request-Headers.
     allowHeaders: ["Content-Type", "Authorization"],
     maxAge: 600,
-  })(c, next);
-});
+  });
+}
+app.use("/api/*", (c, next) => buildApiCors(c.env.WEB_ORIGIN)(c, next));
 
 // ─── CORS for the hosted MCP endpoint + OAuth discovery ──────────────────────
 // The MCP endpoint (/mcp) and the apex OAuth metadata are reached by third-party
@@ -686,6 +710,42 @@ export function startupInit(config: Env): void {
  * Each tick: (1) sweeps expired sessions + debits wall-clock COGS, (2) resets monthly
  * tier-credit allotments (idempotent per period), (3) reconciles billed debits for drift.
  */
+// Context-graph maintenance pass: for each WARM quackboard, drain any un-embedded nodes through
+// the private embeddings service, then rebuild derived edges IF new vectors landed. Status-gated
+// (never cold-boots a sleeping board just to embed) and cheap when quiescent (embed-batch returns
+// 0 immediately once a board is fully embedded, so no edge recompute fires). Embedding stays off
+// the agent write path — this is the async drain the two graph invariants require.
+async function drainQuackboardEmbeddings(env: Env): Promise<{ boards: number; embedded: number; recomputed: number }> {
+  const embeddingsUrl = env.EMBEDDINGS_URL;
+  if (!embeddingsUrl) return { boards: 0, embedded: 0, recomputed: 0 };
+  const { rows } = await query<{ id: string; gateway_url: string | null }>(
+    `SELECT id, gateway_url FROM waddling.datalake WHERE kind = 'quackboard' AND status = 'running'`,
+  );
+  let boards = 0, embedded = 0, recomputed = 0;
+  for (const ep of rows) {
+    try {
+      const gwc = gatewayClientFor({ gateway_url: ep.gateway_url });
+      const st = await gwc.status(ep.id); // no-wake probe: skip sleeping boards
+      if (st.state !== 'running') continue;
+      boards++;
+      let boardEmbedded = 0;
+      for (let i = 0; i < 20; i++) {
+        const r = await gwc.qbEmbedBatch({ embeddingsUrl });
+        boardEmbedded += r.embedded;
+        if (r.remaining === 0 || r.embedded === 0) break;
+      }
+      embedded += boardEmbedded;
+      if (boardEmbedded > 0) {
+        await gwc.qbEdgesRecompute({});
+        recomputed++;
+      }
+    } catch (e) {
+      console.log(`[cron] qb-embed ${ep.id} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return { boards, embedded, recomputed };
+}
+
 export async function scheduledHandler(env: Env): Promise<void> {
   const connStr = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL ?? '';
   initPool(connStr);
@@ -712,6 +772,12 @@ export async function scheduledHandler(env: Env): Promise<void> {
     if (delivered > 0 || failed > 0) console.log(`[cron] dispatch drain: ${delivered} delivered, ${failed} failed`);
   } catch (e) {
     console.log(`[cron] drainGatewayDispatch failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    const { boards, embedded, recomputed } = await drainQuackboardEmbeddings(env);
+    if (embedded > 0 || recomputed > 0) console.log(`[cron] qb-embed: ${embedded} node(s) across ${boards} board(s), ${recomputed} edge recompute(s)`);
+  } catch (e) {
+    console.log(`[cron] drainQuackboardEmbeddings failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   try {
     const n = await sweepExpiredSessions();

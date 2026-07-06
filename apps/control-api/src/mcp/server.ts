@@ -22,16 +22,18 @@ const SERVER_INFO = { name: 'waddling', version: '0.1.0' };
 const LATEST_PROTOCOL = '2025-06-18';
 const SUPPORTED_PROTOCOLS = new Set(['2025-06-18', '2025-03-26', '2024-11-05']);
 const SERVER_INSTRUCTIONS =
-  'waddling governs AI-agent access to analytics datalakes. Start with ' +
-  'waddling_list_datalakes, then waddling_describe to learn the catalog you may see, ' +
-  'waddling_connect to open a session, waddling_query to run governed SQL (reference the ' +
-  'lake as lake.<schema>.<table>). To LOAD data into the lake from an external source ' +
-  '(CTAS/INSERT over read_json/read_csv/read_parquet), use waddling_etl — it runs on the ' +
-  'gateway with egress after birdshot authorizes the statement. Use waddling_whoami to check ' +
-  "grants WITHOUT triggering a denial. Denials are structured { error, table, reason } — read `reason` and self-correct. " +
-  'If you genuinely need access you lack, call waddling_request_access to get a human-approval ' +
-  'link, give it to the user, then call waddling_await_access (it blocks ~20s and returns { granted }) ' +
-  'in a loop until granted, up to ~10 min, before retrying.';
+  "waddling is your user's personal data store: a governed data lake you can query, load " +
+  'data into, and REMEMBER things in across sessions. Two habits make you good at this: ' +
+  '(1) call waddling_recall when you start work — your past notes and what other sessions ' +
+  'learned are there; (2) call waddling_remember whenever you learn something durable (how ' +
+  'a table is shaped, what you loaded and why, decisions made). For data work: ' +
+  'waddling_list_datalakes → waddling_describe (the catalog you may see) → waddling_connect ' +
+  '(opens a session) → waddling_query (governed SQL; reference the lake as ' +
+  'lake.<schema>.<table>). To LOAD external data (CTAS/INSERT over ' +
+  'read_json/read_csv/read_parquet URLs) use waddling_etl, not waddling_query — it runs on ' +
+  'the gateway with egress after birdshot authorizes the statement. waddling_whoami shows ' +
+  'your grants WITHOUT triggering a denial. Denials are structured { error, table, reason } ' +
+  '— read `reason` and self-correct.';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';

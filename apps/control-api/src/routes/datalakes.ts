@@ -25,7 +25,7 @@ import { grantsForKey, agentSubject, listStatements, epochFor } from '../lib/gra
 import { authVersionFor, bumpPolicyVersion } from '../lib/policy-version';
 import { loadSigningKey } from '../lib/session-jwt';
 import { provisionOrgCatalog } from '../lib/catalog-provision';
-import { provisionGateway, provisionQuackboard, type ProvisionableDatalake } from '../lib/provisioner';
+import { provisionGateway, type ProvisionableDatalake } from '../lib/provisioner';
 import type { DescribeResult, TableInfo, DatalakeStatus, DatalakeSummary, DatalakeDetail, DatalakeRuntime } from '../lib/types';
 
 // Endpoint status domain (canonical: lib/types DatalakeSummary['status']). The full
@@ -133,24 +133,41 @@ datalakes.post('/', (c) =>
     const input = await parseBody(c, CreateSchema);
 
     // Quota check (plan entitlement gate) — only when billing is configured.
-    const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
-    const ent = await getEntitlements(caller.orgId);
-    const count = await queryOne<{ n: string }>(
-      `SELECT count(*)::text AS n FROM waddling.datalake WHERE org_id = $1`,
-      [caller.orgId],
-    );
-    if (billingOn && Number(count?.n ?? 0) >= ent.endpoints) {
-      return err(c, 'endpoint_quota_exceeded', 402, `Plan allows ${ent.endpoints} endpoint(s)`);
+    // The memory lake (kind='quackboard') is exempt on BOTH sides: every paid org
+    // gets one regardless of tier, and it never consumes a data-lake slot. Its own
+    // cap is one-per-org (partial unique index, migration 023).
+    if (input.kind === 'quackboard') {
+      const existing = await queryOne<{ one: number }>(
+        `SELECT 1 AS one FROM waddling.datalake
+          WHERE org_id = $1 AND kind = 'quackboard' LIMIT 1`,
+        [caller.orgId],
+      );
+      if (existing) {
+        return err(c, 'quackboard_exists', 409, 'This org already has its memory lake');
+      }
+    } else {
+      const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
+      const ent = await getEntitlements(caller.orgId);
+      const count = await queryOne<{ n: string }>(
+        `SELECT count(*)::text AS n FROM waddling.datalake
+          WHERE org_id = $1 AND kind IS DISTINCT FROM 'quackboard'`,
+        [caller.orgId],
+      );
+      if (billingOn && Number(count?.n ?? 0) >= ent.endpoints) {
+        return err(c, 'endpoint_quota_exceeded', 402, `Plan allows ${ent.endpoints} endpoint(s)`);
+      }
     }
 
     // Normalise BYO storage vs. legacy flat dataPath into one descriptor. For a fully-
     // managed endpoint there is no BYO storage: the data_path is a marker (the R2 faucet
     // sets the real s3://<org-bucket>/<datalakeId>/ path at gateway boot).
-    // A quackboard has no DuckLake and no object store — it IS its own durable DuckDB,
-    // persisted to R2 by the data plane. It needs no catalog provisioning or storage creds.
+    // The memory board (kind='quackboard') is now a REAL managed DuckLake — same managed catalog
+    // + GCS storage as any lake, only its 8 coordination namespaces are bootstrapped into
+    // lake.main (via the MEMORY_LAKE provisioner flag). So it takes the managed storage/catalog
+    // path below exactly like a managed lake.
     const isQb = input.kind === 'quackboard';
     const storage = input.storage ?? {
-      dataPath: isQb ? 'quackboard' : input.managed ? 'managed-r2' : input.dataPath!,
+      dataPath: isQb || input.managed ? 'managed-r2' : input.dataPath!,
       provider: 'config' as const,
       region: input.region,
       urlStyle: 'path' as const,
@@ -165,7 +182,7 @@ datalakes.post('/', (c) =>
     // schema) unless the caller brings their own DSN. The `managed` flag only selects STORAGE
     // (the R2 faucet bucket vs a BYO bucket) — never the catalog. (managed-local is retired:
     // a local DuckLake file is not durable on the data plane.)
-    const catalogMode = isQb ? null : input.catalogDsn ? 'byo-postgres' : 'managed-postgres';
+    const catalogMode = input.catalogDsn ? 'byo-postgres' : 'managed-postgres';
     // Per-datalake metadata schema inside the org's shared Neon catalog (managed-postgres only).
     const catalogSchema = catalogMode === 'managed-postgres' ? `dl_${input.slug.replace(/-/g, '_')}` : null;
 
@@ -267,15 +284,9 @@ datalakes.post('/', (c) =>
             [created.id],
           );
           if (dlRow) {
-            // A quackboard row has no catalog DSN, so provisionGateway would throw resolving one.
-            // Provision the per-org QB gateway (QUACKBOARD=1 mode) instead; both return { url }.
-            const { url } = isQb
-              ? await provisionQuackboard(c.env, {
-                  slug: dlRow.slug,
-                  orgId: dlRow.org_id,
-                  serverToken: dlRow.server_token,
-                })
-              : await provisionGateway(c.env, dlRow);
+            // Both the memory board and a normal lake are managed DuckLake gateways; the board
+            // just also bootstraps its coordination schema (MEMORY_LAKE=1). Both return { url }.
+            const { url } = await provisionGateway(c.env, dlRow, isQb ? { memoryLake: true } : {});
             await query(`UPDATE waddling.datalake SET gateway_url = $1 WHERE id = $2`, [url, created.id]);
           }
         } catch (e) {

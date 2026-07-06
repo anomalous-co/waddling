@@ -125,7 +125,7 @@ export function OnboardingFlow({
     window.location.assign(res.data.url);
   };
 
-  const subscribe = async (plan: 'pro') => {
+  const subscribe = async (plan: 'starter' | 'pro') => {
     if (!orgId) {
       setError('No active organization to bill.');
       return;
@@ -241,24 +241,34 @@ export function OnboardingFlow({
               </Alert>
             ) : null}
 
-            <Card>
+            <Card className="border-emerald-500/50">
               <CardHeader>
-                <CardTitle>Subscribe</CardTitle>
+                <CardTitle>Start your personal data store</CardTitle>
                 <CardDescription>
-                  A monthly plan with included usage and higher limits.
+                  Starter — $15/mo. Your managed memory lake, 1 data lake, 3 agents.
+                  First 3 days free; cancel anytime during the trial and pay nothing.
                 </CardDescription>
               </CardHeader>
               <CardContent>
                 <Button
                   className="w-full"
                   disabled={loading}
-                  onClick={() => void subscribe('pro')}
+                  onClick={() => void subscribe('starter')}
                 >
                   {loading ? <Loader2 data-icon="inline-start" className="animate-spin" /> : null}
-                  Subscribe to Pro
+                  Start 3-day free trial
                 </Button>
                 <p className="mt-3 text-center text-xs text-muted-foreground">
-                  Need Enterprise?{' '}
+                  Need more lakes and agents?{' '}
+                  <button
+                    type="button"
+                    disabled={loading}
+                    onClick={() => void subscribe('pro')}
+                    className="text-primary hover:underline disabled:opacity-50"
+                  >
+                    Subscribe to Pro ($49/mo)
+                  </button>
+                  {' · '}
                   <a href="mailto:sales@getwaddling.com" className="text-primary hover:underline">
                     Contact sales
                   </a>

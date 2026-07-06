@@ -14,7 +14,7 @@ import { getStripePricePro, getStripePriceScale } from './env';
 export type PlanName = Plan['name'];
 
 /** Plan tiers in increasing order of capability. Index = rank for `requirePlan`. */
-export const PLAN_ORDER: readonly PlanName[] = ['free', 'pro', 'scale', 'enterprise'];
+export const PLAN_ORDER: readonly PlanName[] = ['free', 'starter', 'pro', 'scale', 'enterprise'];
 
 /**
  * Build the plan table. Functioned (not a frozen const) so price-id env vars are
@@ -31,6 +31,20 @@ export function getPlans(): Plan[] {
         dynamicAcl: false,
         adminMcp: false,
         auditRetentionDays: 7,
+      },
+    },
+    {
+      // $15/mo entry tier — the personal data store: 1 data lake + the memory
+      // lake (quota-exempt) + 3 agents. Display copy only; checkout price ids
+      // are threaded in control-api's auth.ts.
+      name: 'starter',
+      priceId: '',
+      entitlements: {
+        endpoints: 1,
+        agents: 3,
+        dynamicAcl: false,
+        adminMcp: false,
+        auditRetentionDays: 30,
       },
     },
     {

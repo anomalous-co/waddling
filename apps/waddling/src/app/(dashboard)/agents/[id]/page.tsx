@@ -44,7 +44,6 @@ import { ModeChip } from '@/components/waddling/agent-chips';
 import { agentSemanticStatus, formatRelative } from '@/components/waddling/agent-status';
 import { SectionCard } from '@/components/waddling/section-card';
 import { EmptyState } from '@/components/waddling/empty-state';
-import { formatBytes } from '@/lib/format';
 import type { AgentSummary } from '@/lib/types';
 import type { QbMemoryEntry } from './types';
 
@@ -64,18 +63,19 @@ interface AgentDetailEnvelope {
 }
 
 // ── Memory section ───────────────────────────────────────────────────────────────
-// Private agent_memory, surfaced read-only for oversight. The control-api memory
-// endpoint is not wired in production yet — a failed fetch (e.g. 404) resolves to
-// an empty list and renders the EmptyState, never an error.
+// Private agent_memory, surfaced read-only for oversight. Reads the org-wide
+// owner endpoint (GET /api/cp/quackboard/memory — the memory lake's
+// /ctrl/qb-memory-all) and filters to this agent; a failed fetch (e.g. the
+// gateway waking up) resolves to an empty list and renders the EmptyState.
 
 function MemorySection({ agentId }: { agentId: string }) {
   const [entries, setEntries] = useState<QbMemoryEntry[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    void fetchCp<{ entries: QbMemoryEntry[] }>(`/api/cp/agents/${agentId}/memory`).then((res) => {
+    void fetchCp<{ entries: QbMemoryEntry[] }>('/api/cp/quackboard/memory').then((res) => {
       if (cancelled) return;
-      setEntries(res.ok ? res.data.entries : []);
+      setEntries(res.ok ? res.data.entries.filter((m) => m.agent_role === agentId) : []);
     });
     return () => {
       cancelled = true;
@@ -108,17 +108,14 @@ function MemorySection({ agentId }: { agentId: string }) {
         Private to this agent — shown for oversight, not editable.
       </p>
       <ul className="mt-4 flex flex-col divide-y divide-border">
-        {entries.map((mem) => (
-          <li key={mem.id} className="flex flex-col gap-1 py-2.5 first:pt-0 last:pb-0">
+        {entries.map((mem, i) => (
+          <li key={`${mem.ts}-${i}`} className="flex flex-col gap-1 py-2.5 first:pt-0 last:pb-0">
             <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-              <code className="font-mono text-sm font-medium text-foreground">{mem.key}</code>
-              <span className="text-xs text-muted-foreground">
-                updated {formatRelative(mem.updatedAt)}
-              </span>
-              <span className="text-xs text-muted-foreground">{formatBytes(mem.sizeBytes)}</span>
+              <code className="font-mono text-sm font-medium text-foreground">{mem.key ?? '—'}</code>
+              <span className="text-xs text-muted-foreground">{formatRelative(mem.ts)}</span>
             </div>
             <code className="block truncate rounded bg-muted px-2 py-1 font-mono text-xs text-muted-foreground">
-              {mem.valuePreview}
+              {mem.content}
             </code>
           </li>
         ))}

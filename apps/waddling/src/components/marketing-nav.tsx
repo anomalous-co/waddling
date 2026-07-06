@@ -10,9 +10,7 @@ import { useFunnel } from '@/lib/funnel';
 const LINKS = [
   { href: '/docs', label: 'docs' },
   { href: '/blog', label: 'blog' },
-  { href: '/customers', label: 'customers' },
   { href: '/pricing', label: 'pricing' },
-  { href: '/enterprise', label: 'enterprise' },
 ];
 
 export function MarketingNav() {

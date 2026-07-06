@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
-import { LayoutGrid, Plus, Loader2, CreditCard } from 'lucide-react';
+import { LayoutGrid, Plus, Loader2, CreditCard, Hash, Brain, Activity, RefreshCw } from 'lucide-react';
 import Link from 'next/link';
 import { toast } from 'sonner';
 import {
@@ -294,6 +294,301 @@ function CreateQuackboardDialog({
   );
 }
 
+// ── Browse workspace (read-only) ─────────────────────────────────────────────────
+
+// Real board data from the owner-facing control-api reads (routes/quackboard.ts):
+//   GET /api/cp/quackboard/topics       → { topics }
+//   GET /api/cp/quackboard/observations → { entries }   (optional ?topic=)
+//   GET /api/cp/quackboard/memory       → { entries }   (cross-agent owner oversight)
+// These are read-only: agent activity is the source of truth, so there is no composer.
+
+interface TopicRow {
+  topic: string;
+  n: number;
+  lastTs?: unknown;
+}
+interface ObservationEntry {
+  id?: string | number;
+  agent_role: string;
+  agentName?: string;
+  content: string;
+  topic?: string | null;
+  ts?: unknown;
+}
+interface MemoryEntry {
+  agent_role: string;
+  agentName?: string;
+  key?: string | null;
+  content: string;
+  ts?: unknown;
+}
+
+type QbSelection = { kind: 'all' } | { kind: 'topic'; topic: string } | { kind: 'memory' };
+
+// DuckDB TIMESTAMP normalizes to a naive string ("2026-07-05 17:53:52[.sss]"); treat it as UTC
+// and render relative. Falls back to the raw value if it can't be parsed.
+function formatTs(ts: unknown): string {
+  if (ts == null || ts === '') return '';
+  const s = String(ts).trim();
+  const base = s.includes('T') ? s : s.replace(' ', 'T');
+  const hasTz = base.endsWith('Z') || /[+-]\d\d:?\d\d$/.test(base);
+  const d = new Date(hasTz ? base : `${base}Z`);
+  if (Number.isNaN(d.getTime())) return s;
+  const mins = Math.floor((Date.now() - d.getTime()) / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+}
+
+function WakingNotice({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className="flex flex-col items-center gap-3 py-12 text-center">
+      <Loader2 className="size-5 animate-spin text-muted-foreground" aria-hidden="true" />
+      <p className="text-sm text-muted-foreground">The quackboard gateway is waking up.</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        <RefreshCw className="mr-1.5 size-3.5" aria-hidden="true" />
+        Retry
+      </Button>
+    </div>
+  );
+}
+
+function RailButton({
+  active,
+  icon,
+  label,
+  count,
+  onClick,
+}: {
+  active: boolean;
+  icon: React.ReactNode;
+  label: string;
+  count?: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-current={active}
+      className={cn(
+        'flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm transition-colors',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        active ? 'bg-muted font-medium text-foreground' : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+      )}
+    >
+      <span className="shrink-0 text-muted-foreground">{icon}</span>
+      <span className="flex-1 truncate">{label}</span>
+      {count != null && <span className="shrink-0 font-mono text-xs text-muted-foreground/70">{count}</span>}
+    </button>
+  );
+}
+
+function QuackboardWorkspace({ board }: { board: QuackboardSummary }) {
+  const [selection, setSelection] = useState<QbSelection>({ kind: 'all' });
+  const [topics, setTopics] = useState<TopicRow[] | null>(null);
+  const [feed, setFeed] = useState<ObservationEntry[] | null>(null);
+  const [memory, setMemory] = useState<MemoryEntry[] | null>(null);
+  const [waking, setWaking] = useState(false);
+
+  const loadTopics = useCallback(() => {
+    void fetchCp<{ topics: TopicRow[] }>('/api/cp/quackboard/topics').then((res) => {
+      setTopics(res.ok ? res.data.topics : []);
+    });
+  }, []);
+
+  const loadFeed = useCallback((topic?: string) => {
+    setFeed(null);
+    setWaking(false);
+    const q = topic ? `?topic=${encodeURIComponent(topic)}` : '';
+    void fetchCp<{ entries: ObservationEntry[] }>(`/api/cp/quackboard/observations${q}`).then((res) => {
+      if (res.ok) setFeed(res.data.entries);
+      else {
+        setFeed([]);
+        if (res.status === 503) setWaking(true);
+      }
+    });
+  }, []);
+
+  const loadMemory = useCallback(() => {
+    setMemory(null);
+    setWaking(false);
+    void fetchCp<{ entries: MemoryEntry[] }>('/api/cp/quackboard/memory').then((res) => {
+      if (res.ok) setMemory(res.data.entries);
+      else {
+        setMemory([]);
+        if (res.status === 503) setWaking(true);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    loadTopics();
+  }, [loadTopics]);
+
+  useEffect(() => {
+    if (selection.kind === 'memory') loadMemory();
+    else loadFeed(selection.kind === 'topic' ? selection.topic : undefined);
+  }, [selection, loadFeed, loadMemory]);
+
+  const retry = useCallback(() => {
+    if (selection.kind === 'memory') loadMemory();
+    else loadFeed(selection.kind === 'topic' ? selection.topic : undefined);
+  }, [selection, loadFeed, loadMemory]);
+
+  // Group memory by agent for the oversight view.
+  const memoryByAgent = new Map<string, MemoryEntry[]>();
+  for (const m of memory ?? []) {
+    const label = m.agentName ?? m.agent_role;
+    (memoryByAgent.get(label) ?? memoryByAgent.set(label, []).get(label)!).push(m);
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Board header */}
+      <SectionCard title="Your quackboard" headingLevel={2}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-3">
+            <div className="flex size-9 items-center justify-center rounded-lg bg-muted text-muted-foreground" aria-hidden="true">
+              <LayoutGrid className="size-4" />
+            </div>
+            <div className="flex flex-col gap-0.5">
+              <span className="font-medium leading-snug">{board.name}</span>
+              <span className="font-mono text-xs text-muted-foreground">{board.slug}</span>
+            </div>
+          </div>
+          <StatusDot status={boardSemanticStatus(board.status)} decorative={false} showLabel />
+        </div>
+      </SectionCard>
+
+      {/* Two-pane browse */}
+      <div className="flex min-h-[28rem] overflow-hidden rounded-xl border bg-card ring-1 ring-foreground/10">
+        {/* Left rail */}
+        <nav className="hidden w-56 shrink-0 flex-col gap-1 border-r bg-muted/30 p-2 sm:flex" aria-label="Quackboard views">
+          <RailButton active={selection.kind === 'all'} icon={<Activity className="size-4" />} label="All activity" onClick={() => setSelection({ kind: 'all' })} />
+          <div className="mt-2 px-2.5 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">Topics</div>
+          {topics === null ? (
+            <div className="flex flex-col gap-1 px-2.5">
+              <Skeleton className="h-6 w-full rounded" />
+              <Skeleton className="h-6 w-4/5 rounded" />
+            </div>
+          ) : topics.length === 0 ? (
+            <p className="px-2.5 text-xs text-muted-foreground/70">No topics yet.</p>
+          ) : (
+            topics.map((t) => (
+              <RailButton
+                key={t.topic}
+                active={selection.kind === 'topic' && selection.topic === t.topic}
+                icon={<Hash className="size-4" />}
+                label={t.topic}
+                count={t.n}
+                onClick={() => setSelection({ kind: 'topic', topic: t.topic })}
+              />
+            ))
+          )}
+          <div className="mt-2 border-t pt-2">
+            <RailButton active={selection.kind === 'memory'} icon={<Brain className="size-4" />} label="Memory" onClick={() => setSelection({ kind: 'memory' })} />
+          </div>
+        </nav>
+
+        {/* Main pane */}
+        <main className="min-w-0 flex-1 overflow-y-auto">
+          {/* Mobile selector */}
+          <div className="flex flex-wrap gap-1.5 border-b p-2 sm:hidden">
+            <RailButton active={selection.kind === 'all'} icon={<Activity className="size-4" />} label="All" onClick={() => setSelection({ kind: 'all' })} />
+            <RailButton active={selection.kind === 'memory'} icon={<Brain className="size-4" />} label="Memory" onClick={() => setSelection({ kind: 'memory' })} />
+          </div>
+
+          {selection.kind === 'memory' ? (
+            // Memory oversight
+            <div className="flex flex-col">
+              <div className="border-b px-4 py-3">
+                <div className="flex items-center gap-2 font-medium">
+                  <Brain className="size-4 text-muted-foreground" aria-hidden="true" />
+                  All memories
+                </div>
+                <p className="mt-0.5 text-xs text-muted-foreground">Agent memory is private; shown here for owner oversight, not editable.</p>
+              </div>
+              {memory === null ? (
+                <div className="flex flex-col gap-3 p-4">
+                  <Skeleton className="h-16 w-full rounded" />
+                  <Skeleton className="h-16 w-full rounded" />
+                </div>
+              ) : waking ? (
+                <WakingNotice onRetry={retry} />
+              ) : memory.length === 0 ? (
+                <EmptyState icon={<Brain />} title="No memories yet" description="Agents write private memory with the waddling_qb_remember tool." />
+              ) : (
+                <div className="flex flex-col divide-y">
+                  {[...memoryByAgent.entries()].map(([agent, items]) => (
+                    <div key={agent} className="flex flex-col gap-2 p-4">
+                      <div className="flex items-center gap-2 text-sm font-medium">
+                        {agent}
+                        <span className="font-mono text-xs text-muted-foreground/70">{items.length}</span>
+                      </div>
+                      {items.map((m, i) => (
+                        <div key={i} className="flex flex-col gap-1 rounded-md border bg-background/50 p-2.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono text-xs text-muted-foreground">{m.key || '(no key)'}</span>
+                            <span className="text-xs text-muted-foreground/70">{formatTs(m.ts)}</span>
+                          </div>
+                          <p className="whitespace-pre-wrap break-words text-sm">{m.content}</p>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            // Observation feed
+            <div className="flex flex-col">
+              <div className="border-b px-4 py-3">
+                <div className="flex items-center gap-2 font-medium">
+                  {selection.kind === 'topic' ? <Hash className="size-4 text-muted-foreground" aria-hidden="true" /> : <Activity className="size-4 text-muted-foreground" aria-hidden="true" />}
+                  {selection.kind === 'topic' ? selection.topic : 'All activity'}
+                </div>
+                <p className="mt-0.5 text-xs text-muted-foreground">Shared observations your agents post via waddling_qb_observe.</p>
+              </div>
+              {feed === null ? (
+                <div className="flex flex-col gap-3 p-4">
+                  <Skeleton className="h-14 w-full rounded" />
+                  <Skeleton className="h-14 w-full rounded" />
+                  <Skeleton className="h-14 w-3/4 rounded" />
+                </div>
+              ) : waking ? (
+                <WakingNotice onRetry={retry} />
+              ) : feed.length === 0 ? (
+                <EmptyState icon={<Activity />} title="No observations yet" description="When your agents post findings to the board, they appear here." />
+              ) : (
+                <ul className="flex flex-col divide-y">
+                  {feed.map((e, i) => (
+                    <li key={e.id ?? i} className="flex flex-col gap-1 px-4 py-3">
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <span className="font-medium text-foreground">{e.agentName ?? e.agent_role}</span>
+                        {e.topic && (
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px]">
+                            <Hash className="size-2.5" aria-hidden="true" />
+                            {e.topic}
+                          </span>
+                        )}
+                        <span className="ml-auto">{formatTs(e.ts)}</span>
+                      </div>
+                      <p className="whitespace-pre-wrap break-words text-sm">{e.content}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}
+
 // ── Page ────────────────────────────────────────────────────────────────────────
 
 export default function QuackboardPage() {
@@ -322,6 +617,16 @@ export default function QuackboardPage() {
       <PageHeader
         title="Quackboard"
         description="Shared memory and coordination for your agents."
+        actions={
+          // One quackboard per org: offer create only when the org has none yet.
+          // Hidden while detecting (undefined) and once a board exists.
+          board === null ? (
+            <Button size="sm" onClick={() => setDialogOpen(true)}>
+              <Plus className="mr-1.5 size-3.5" aria-hidden="true" />
+              Create quackboard
+            </Button>
+          ) : undefined
+        }
       />
 
       {board === undefined ? (
@@ -349,31 +654,8 @@ export default function QuackboardPage() {
           }
         />
       ) : (
-        // The org has a quackboard.
-        <SectionCard title="Your quackboard" headingLevel={2}>
-          <div className="flex flex-col gap-4">
-            <div className="flex items-start justify-between gap-2">
-              <div className="flex items-center gap-3">
-                <div
-                  className="flex size-9 items-center justify-center rounded-lg bg-muted text-muted-foreground"
-                  aria-hidden="true"
-                >
-                  <LayoutGrid className="size-4" />
-                </div>
-                <div className="flex flex-col gap-0.5">
-                  <span className="font-medium leading-snug">{board.name}</span>
-                  <span className="font-mono text-xs text-muted-foreground">{board.slug}</span>
-                </div>
-              </div>
-              <StatusDot status={boardSemanticStatus(board.status)} decorative={false} showLabel />
-            </div>
-            <p className="text-sm text-muted-foreground">
-              Your agents coordinate here through Quackboard&apos;s shared observations and private
-              memories via the <code>waddling_qb_*</code> MCP tools. A human view of that activity —
-              the feed and the memory browser — is on its way to this page.
-            </p>
-          </div>
-        </SectionCard>
+        // The org has a quackboard — show its live, read-only browse workspace.
+        <QuackboardWorkspace board={board} />
       )}
 
       <CreateQuackboardDialog open={dialogOpen} onOpenChange={setDialogOpen} onCreated={handleCreated} />

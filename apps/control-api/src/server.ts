@@ -64,6 +64,7 @@ const config: Env = {
 
   STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY ?? '',
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET ?? '',
+  STRIPE_PRICE_STARTER: process.env.STRIPE_PRICE_STARTER ?? '',
   STRIPE_PRICE_PRO: process.env.STRIPE_PRICE_PRO ?? '',
   STRIPE_PRICE_SCALE: process.env.STRIPE_PRICE_SCALE ?? '',
   STRIPE_PRICE_CREDIT_10: process.env.STRIPE_PRICE_CREDIT_10 ?? '',
@@ -81,6 +82,11 @@ const config: Env = {
 
   GATEWAY_BASE_URL: process.env.GATEWAY_BASE_URL,
   GATEWAY_INTERNAL_URL: process.env.GATEWAY_INTERNAL_URL,
+  // Read-only DSN the gateway ATTACHes as the `__birdshot` grant store (grants are pulled +
+  // freshness-checked from it). On Cloudflare this was a workerd binding; the Node port must map
+  // it from process.env or EVERY snapshot ships grantStoreDsn=undefined and birdshot enforces
+  // nothing (the store is never attached → default-deny for every agent, board and lake alike).
+  BIRDSHOT_STORE_DSN: process.env.BIRDSHOT_STORE_DSN,
   SENDGRID_API_KEY: process.env.SENDGRID_API_KEY,
 
   PG_HOST: process.env.PG_HOST,

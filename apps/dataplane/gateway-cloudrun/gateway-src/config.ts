@@ -63,6 +63,15 @@ export interface GatewayConfig {
    */
   workspaceMode: boolean;
   /**
+   * Memory-lake (quackboard) mode: a NORMAL managed DuckLake gateway (real Postgres catalog +
+   * object store) that ALSO bootstraps the shared agent-coordination tables into `lake.main`
+   * at boot. Unlike the legacy {@link quackboard} local-file mode this is NOT no-lake — the 8
+   * coordination namespaces are governed DuckLake tables, durable in the catalog/object store,
+   * and board reads+writes ride the trusted `/qb-query` path (birdshot-authorized, executed on
+   * the control connection that has `USE lake`). Orthogonal to quackboard/workspaceMode.
+   */
+  memoryLake: boolean;
+  /**
    * Workspace encryption key (64 hex chars) for the durable .duckdb. When set in workspace
    * mode the gateway opens ':memory:' and ATTACHes {@link databasePath} ENCRYPTED (OpenSSL via
    * httpfs), so the file is encrypted at rest before it is uploaded to GCS. Empty ⇒ plaintext
@@ -116,6 +125,9 @@ export function loadGatewayConfig(): GatewayConfig {
   // Quackboard also bootstraps coordination tables; workspace opens the file clean (agent DDL).
   const quackboard = bool("QUACKBOARD", false);
   const workspaceMode = !quackboard && bool("WORKSPACE_MODE", false);
+  // Memory-lake mode is a REAL managed DuckLake (lake env vars required, like a normal lake) that
+  // additionally bootstraps the board schema — so it is NOT part of noDuckLake.
+  const memoryLake = !quackboard && !workspaceMode && bool("MEMORY_LAKE", false);
   const noDuckLake = quackboard || workspaceMode;
   const ducklakeDataPath = noDuckLake ? opt("DUCKLAKE_DATA_PATH", "") : req("DUCKLAKE_DATA_PATH");
   const localData = noDuckLake || !/^s3:\/\//i.test(ducklakeDataPath);
@@ -147,6 +159,7 @@ export function loadGatewayConfig(): GatewayConfig {
 
     quackboard,
     workspaceMode,
+    memoryLake,
     encryptionKey: opt("WORKSPACE_ENCRYPTION_KEY", ""),
     databasePath: opt("DUCKDB_DATABASE_PATH", ":memory:"),
 

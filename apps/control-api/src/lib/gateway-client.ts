@@ -33,8 +33,14 @@ export interface GatewayBoot {
     endpoint?: string; keyId?: string; secret?: string; sessionToken?: string;
     region?: string; useSsl?: boolean; urlStyle?: 'path' | 'vhost';
   };
+  /** Legacy local-file quackboard boot (durable .duckdb restored from R2). Superseded by
+   *  {@link memoryLake}; kept for back-compat with any not-yet-migrated board. */
   quackboard?: boolean;
   r2Key?: string;
+  /** Memory-lake board: a managed DuckLake whose gateway also bootstraps the coordination
+   *  tables into `lake.main`. Used by control-api's prepareQbContext gate; the gateway itself
+   *  bootstraps off its own MEMORY_LAKE deploy-env flag, not this wire field. */
+  memoryLake?: boolean;
 }
 
 export interface BirdshotJwk {
@@ -335,6 +341,36 @@ export class GatewayClient {
   }
   qbRecall(body: unknown): Promise<any> {
     return this.send('POST', '/ctrl/qb-recall', body);
+  }
+
+  // Owner-oversight reads (read-only; owner authz enforced at control-api, NOT here).
+  qbObservations(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-observations', body);
+  }
+  qbTopics(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-topics', body);
+  }
+  qbMemoryAll(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-memory-all', body);
+  }
+
+  // Context graph (trusted control connection). Embedding is async; the gateway calls the
+  // private embeddings service itself (embeddingsUrl passed through). Owner authz enforced at
+  // control-api; the agent-scoped graph enforces the privacy invariant in the gateway SQL.
+  qbEmbedBatch(body: { embeddingsUrl: string; limit?: number }): Promise<{ ok: boolean; embedded: number; remaining: number }> {
+    return this.send('POST', '/ctrl/qb-embed-batch', body, 120_000);
+  }
+  qbEdgesRecompute(body?: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-edges-recompute', body ?? {}, 120_000);
+  }
+  qbLink(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-link', body);
+  }
+  qbGraphOwner(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-graph-owner', body);
+  }
+  qbGraphAgent(body: unknown): Promise<any> {
+    return this.send('POST', '/ctrl/qb-graph-agent', body, 60_000);
   }
 
   // Generic escape hatch for any other /ctrl/* route without a dedicated method.

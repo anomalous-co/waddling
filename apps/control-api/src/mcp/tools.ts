@@ -11,9 +11,12 @@
  * now the two are mirrored deliberately (control-api does not import workspace
  * packages — see lib/types.ts header).
  *
- * Only tools with a live control-api backend are registered: list, describe,
- * connect, query, whoami, install_extension. `explain` / `time_travel` are omitted
- * until their backend routes exist (they would 404).
+ * The registered surface is deliberately the personal-data-store core: memory
+ * (waddling_remember / waddling_recall) + the lake data path (list, describe,
+ * connect, query, etl, whoami). The multi-agent coordination verbs and the
+ * human-approval access flow have live backends but are unregistered — see
+ * UNREGISTERED_TOOL_HANDLERS at the bottom. `explain` / `time_travel` are
+ * omitted until their backend routes exist (they would 404).
  */
 
 /** JSON Schema for a tool's arguments (object schema only — all tools take flat args). */
@@ -405,25 +408,102 @@ const qbPost = (path: string): McpTool['handler'] => async (args, ctx) => {
   }
 };
 
+// waddling_recall — one search over BOTH memory surfaces: the agent's private
+// notes (agent_memory, via /mine) and the org's shared observation corpus (BM25,
+// via /recall). Both ride trusted /ctrl/qb-* gateway routes, so recall works on a
+// fresh org with zero setup. /mine has no content filter server-side; it is
+// substring-filtered here.
+const recallMemory: McpTool['handler'] = async (args, ctx) => {
+  try {
+    const q = str(args.query);
+    if (!q) return failErr(new Error('query is required'));
+    const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.min(args.limit, 100) : 20;
+
+    const [mineRes, corpusRes] = await Promise.all([
+      ctx.loopback('/api/cp/quackboard/mine', { method: 'POST', body: { limit: 500 } }),
+      ctx.loopback('/api/cp/quackboard/recall', { method: 'POST', body: { query: q, limit } }),
+    ]);
+
+    const rowsOf = (r: LoopbackResult): unknown[] => {
+      if (!r.ok || !r.data || typeof r.data !== 'object') return [];
+      const rows = (r.data as { rows?: unknown }).rows;
+      return Array.isArray(rows) ? rows : [];
+    };
+    const needle = q.toLowerCase();
+    const privateNotes = rowsOf(mineRes)
+      .filter((row) => JSON.stringify(row).toLowerCase().includes(needle))
+      .slice(0, limit);
+
+    // A completely fresh memory lake may still be provisioning its gateway on the
+    // very first call — surface that as a retryable state, not a hard error.
+    if (!mineRes.ok && !corpusRes.ok) return failFrom(mineRes);
+
+    return ok({
+      query: q,
+      private_notes: privateNotes,
+      shared_observations: corpusRes.ok ? corpusRes.data : { rows: [] },
+      note:
+        privateNotes.length === 0 && !rowsOf(corpusRes).length
+          ? 'Nothing remembered yet matches this — as you work, save durable facts with waddling_remember.'
+          : undefined,
+    });
+  } catch (e) {
+    return failErr(e);
+  }
+};
+
 const datalakeIdProp = {
   datalake_id: { type: 'string', description: 'Datalake id from waddling_list_datalakes.' },
   endpoint_id: { type: 'string', description: 'Deprecated alias for datalake_id.' },
 };
 
+// ── the registry ─────────────────────────────────────────────────────────────
+// Deliberately small: the personal-data-store surface is remember/recall +
+// the lake data path. The multi-agent coordination tools (qb_join/observe/
+// subscribe/inbox/query), the human-approval access flow (request_access/
+// await_access), and install_extension have live handlers above/below but are
+// UNREGISTERED — re-add them for the multi-agent tier, don't delete them.
 export const TOOLS: McpTool[] = [
+  {
+    name: 'waddling_remember',
+    description:
+      "Save something durable to your user's personal data store — a fact you learned, how a table " +
+      'is shaped, what you loaded and why, a decision made. It persists across sessions and ' +
+      'restarts; call it whenever you learn something worth keeping. Notes are private to YOU ' +
+      '(per-agent, server-enforced). Optionally set `key` to group related notes (e.g. one key per ' +
+      'project or table). Returns { ok }.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'The note to remember.' },
+        key: { type: 'string', description: 'Optional key to group/lookup related notes.' },
+      },
+      required: ['content'],
+    },
+    handler: qbPost('remember'),
+  },
+  {
+    name: 'waddling_recall',
+    description:
+      'Search your memory BEFORE starting work. Returns { private_notes, shared_observations }: ' +
+      'your own waddling_remember notes plus what any of your other sessions/agents recorded in ' +
+      "this org's shared corpus (full-text ranked). Pass a search term; optionally `limit`.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search term.' },
+        limit: { type: 'number', description: 'Max results per bucket (default 20, max 100).' },
+      },
+      required: ['query'],
+    },
+    handler: recallMemory,
+  },
   {
     name: 'waddling_list_datalakes',
     description:
-      'List the governed datalakes (analytics lakehouses) this caller can access. Call this FIRST ' +
-      'to discover what you can connect to. Returns [{id, name, slug, status}]. Use a datalake `id` ' +
-      'with waddling_describe or waddling_connect.',
-    inputSchema: { type: 'object', properties: {} },
-    handler: listDatalakes,
-  },
-  // Alias: live agent configs may still call the old name — keep it working.
-  {
-    name: 'waddling_list_endpoints',
-    description: 'Deprecated alias for waddling_list_datalakes.',
+      'List the governed datalakes this caller can access. Call this to discover what you can ' +
+      'connect to. Returns [{id, name, slug, status}]. Use a datalake `id` with waddling_describe ' +
+      'or waddling_connect.',
     inputSchema: { type: 'object', properties: {} },
     handler: listDatalakes,
   },
@@ -510,210 +590,138 @@ export const TOOLS: McpTool[] = [
       'GRANT/DENY SQL governing your key — `grants.statements` for the session/datalake in scope, and ' +
       '`grantsByDatalake[]` (the same grant SQL in every datalake you can reach) so a bare call still ' +
       'shows exactly what you can do — no trial-and-error denials. Pass `session_id` for live grants + ' +
-      'remaining TTL, or omit for your standing identity. Also the way to confirm a ' +
-      'waddling_request_access approval: poll this until the requested grants appear in the statements.',
+      'remaining TTL, or omit for your standing identity.',
     inputSchema: {
       type: 'object',
       properties: { session_id: { type: 'string', description: 'Optional open session to report live grants + TTL for.' } },
     },
     handler: whoami,
   },
+  // ── quackboard: per-org agent coordination board ──────────────────────
   {
-    name: 'waddling_request_access',
+    name: 'waddling_board_note',
     description:
-      'Request EXPANDED access for this agent when a query was denied or you need a table/capability ' +
-      'you lack. Returns { url, wait_for, message }: `url` is a link a human operator (org owner/admin) ' +
-      'opens to review the requested grants as a pending change in the agent’s Access editor and ' +
-      'approve by clicking Save. This does NOT grant access by itself, and there is no push ' +
-      'notification — you must WAIT for approval: show the url to the user, then call ' +
-      'waddling_await_access (the `wait_for` block has the exact args) in a loop until it returns ' +
-      'granted=true, giving up after ~10 minutes (then tell the user it is still pending). For agents ' +
-      'authenticated with an agent API key (sk_…); delegated OAuth sessions have no standing agent.',
+      'Post a shared, topic-scoped note to the org quackboard — visible to all agents. ' +
+      'Use `topic` as a channel name to group related notes (e.g. "architecture", "decisions", ' +
+      '"findings"). Every agent can recall these by topic later with waddling_recall. Returns ' +
+      '{ ok, notified } where `notified` is the count of other agents whose subscriptions matched ' +
+      '(pub/sub fan-out). Use to share discoveries, decisions, and durable context across agents.',
     inputSchema: {
       type: 'object',
       properties: {
-        ...datalakeIdProp,
-        grants: {
-          type: 'array',
-          description:
-            'The catalog access to request, one entry per table or schema. Use table:"*" for a whole ' +
-            'schema, or schema:"*" too for the entire lake.',
-          items: {
-            type: 'object',
-            properties: {
-              schema: { type: 'string', description: 'Schema name, or "*" for all schemas.' },
-              table: { type: 'string', description: 'Table name, or "*" for all tables in the schema.' },
-              caps: {
-                type: 'array',
-                description: 'Catalog capabilities: read, write, create, drop, alter, detach.',
-                items: { type: 'string' },
-              },
-            },
-            required: ['caps'],
-          },
-        },
-        agent_id: { type: 'string', description: 'Agent to expand (defaults to the calling agent).' },
-      },
-      required: ['grants'],
-    },
-    handler: requestAccess,
-  },
-  {
-    name: 'waddling_await_access',
-    description:
-      'Wait for a pending waddling_request_access approval to land. Pass the SAME { datalake_id, grants } ' +
-      'you requested; this BLOCKS up to ~timeout_seconds (≤25s) server-side, polling your grants, and ' +
-      'returns { granted } as soon as every requested table/capability is covered (or after the wait ' +
-      'window). Call it again while granted=false to keep waiting; give up after ~10 minutes total. Use ' +
-      'this instead of hand-rolling a poll loop over waddling_whoami.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        ...datalakeIdProp,
-        grants: {
-          type: 'array',
-          description: 'The same grants passed to waddling_request_access, one entry per table or schema.',
-          items: {
-            type: 'object',
-            properties: {
-              schema: { type: 'string', description: 'Schema name, or "*" for all schemas.' },
-              table: { type: 'string', description: 'Table name, or "*" for all tables in the schema.' },
-              caps: {
-                type: 'array',
-                description: 'Catalog capabilities: read, write, create, drop, alter, detach.',
-                items: { type: 'string' },
-              },
-            },
-            required: ['caps'],
-          },
-        },
-        timeout_seconds: { type: 'number', description: 'Max seconds to block this call (default 20, capped at 25).' },
-        agent_id: { type: 'string', description: 'Agent to check (defaults to the calling agent).' },
-      },
-      required: ['grants'],
-    },
-    handler: awaitAccess,
-  },
-  {
-    name: 'waddling_install_extension',
-    description:
-      'Get the one-liner to INSTALL + LOAD the birdshot extension in a LOCAL DuckDB you run yourself ' +
-      '(self-hosted / edge case — most agents never need this; the gateway runs birdshot server-side). ' +
-      'Returns { sql, note }.',
-    inputSchema: { type: 'object', properties: {} },
-    handler: installExtension,
-  },
-  // ── quackboard: shared per-org agent memory + coordination ──────────────────
-  {
-    name: 'waddling_qb_join',
-    description:
-      'Join your org\'s quackboard — a shared, governed coordination board for agents. Call this ' +
-      'FIRST. Boots the board and returns { org_id, agent_id, shared_tables, protocol }. After ' +
-      'joining: qb_observe findings, qb_recall to search, qb_subscribe + qb_inbox for pub/sub, ' +
-      'qb_remember/qb_mine for PRIVATE notes only you can read, qb_query for raw SQL.',
-    inputSchema: { type: 'object', properties: {} },
-    handler: qbPost('join'),
-  },
-  {
-    name: 'waddling_qb_observe',
-    description:
-      'Record a finding to the shared board (visible to every agent in your org). Your identity is ' +
-      'stamped automatically. Fans a notification to any agent whose subscription matches. Returns ' +
-      '{ ok, notified }.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        content: { type: 'string', description: 'The finding / observation text.' },
-        refs: { type: 'array', items: { type: 'string' }, description: 'Optional reference strings (files, urls, ids).' },
-        topic: { type: 'string', description: 'Optional topic tag.' },
+        content: { type: 'string', description: 'The note text to share.' },
+        topic: { type: 'string', description: 'Topic/channel name to group related notes (e.g. "architecture").' },
+        refs: { type: 'array', items: { type: 'string' }, description: 'Optional reference links or ids.' },
       },
       required: ['content'],
     },
     handler: qbPost('observe'),
   },
   {
-    name: 'waddling_qb_recall',
+    name: 'waddling_board_query',
     description:
-      'Search the shared observations (substring match), newest first. Returns { columns, rows }. Use ' +
-      'this to see what other agents have found before you start work.',
+      'Run a governed SQL query over the org quackboard shared tables (observations, notifications, ' +
+      'subscriptions, messages, boundaries, objectives, claims). Birdshot enforces your per-agent ACL. ' +
+      'Use to explore the board programmatically. Returns { columns, rows, rowCount }. DO NOT query ' +
+      'agent_memory — it is private and unreachable through this path (denied by ACL by design).',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search term.' },
-        limit: { type: 'number', description: 'Max rows (default 20, max 100).' },
+        sql: { type: 'string', description: 'A single SQL statement against the quackboard shared tables.' },
       },
-      required: ['query'],
+      required: ['sql'],
     },
-    handler: qbPost('recall'),
+    handler: qbPost('query'),
   },
   {
-    name: 'waddling_qb_remember',
+    name: 'waddling_board_subscribe',
     description:
-      'Save a PRIVATE note that only YOU can read back (per-agent memory — other agents cannot see it, ' +
-      'not even via raw qb_query). Optionally key it. Returns { ok }.',
+      'Subscribe to a pub/sub pattern on the org quackboard. When any agent posts a waddling_board_note ' +
+      'whose content matches your pattern (case-insensitive substring), a notification is fanned to ' +
+      'your inbox. Optionally scope to a `topic`. Returns { ok }. Use waddling_board_inbox to read.',
     inputSchema: {
       type: 'object',
       properties: {
-        key: { type: 'string', description: 'Optional key to group/lookup the note.' },
-        content: { type: 'string', description: 'The private note.' },
-      },
-      required: ['content'],
-    },
-    handler: qbPost('remember'),
-  },
-  {
-    name: 'waddling_qb_mine',
-    description:
-      'Read back YOUR private notes (qb_remember), newest first. Optionally filter by `key`. Returns ' +
-      '{ rows }. Scoped to your identity server-side — never returns another agent\'s memory.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        key: { type: 'string', description: 'Optional key filter.' },
-        limit: { type: 'number', description: 'Max rows (default 50, max 500).' },
-      },
-    },
-    handler: qbPost('mine'),
-  },
-  {
-    name: 'waddling_qb_subscribe',
-    description:
-      'Subscribe to a pattern: when another agent observes content matching it, a notification lands in ' +
-      'your qb_inbox. Returns { ok }.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        pattern: { type: 'string', description: 'Substring to watch for in new observations.' },
-        topic: { type: 'string', description: 'Optional topic tag.' },
+        pattern: { type: 'string', description: 'Pattern to match (case-insensitive substring ILIKE).' },
+        topic: { type: 'string', description: 'Optional topic to scope the subscription to.' },
       },
       required: ['pattern'],
     },
     handler: qbPost('subscribe'),
   },
   {
-    name: 'waddling_qb_inbox',
+    name: 'waddling_board_join',
     description:
-      'Your pub/sub notifications (from qb_subscribe matches), newest first. Returns { columns, rows }.',
+      'Ensure the org quackboard is booted with the latest birdshot ACL snapshot and return the ' +
+      'shared-table protocol. Idempotent — call it at the start of a session to confirm the board is ' +
+      'ready. Returns { org_id, agent_id, shared_tables, protocol }.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: qbPost('join'),
+  },
+  {
+    name: 'waddling_board_inbox',
+    description:
+      'Read your quackboard notification inbox — the per-agent inbox populated by pub/sub fan-out ' +
+      'when another agent posts an observation matching your subscriptions. Returns { columns, rows, ' +
+      'rowCount } with id, sub_id, snippet, ts, and is_read fields. Optionally set `limit` (default 20).',
     inputSchema: {
       type: 'object',
-      properties: { limit: { type: 'number', description: 'Max rows (default 20, max 100).' } },
+      properties: {
+        limit: { type: 'number', description: 'Max notifications to return (default 20, max 100).' },
+      },
     },
     handler: qbPost('inbox'),
   },
   {
-    name: 'waddling_qb_query',
+    name: 'waddling_qb_graph',
     description:
-      'Run raw governed SQL over the shared board tables (observations, notifications, subscriptions, ' +
-      'messages, boundaries, objectives, claims). birdshot enforces access — a reference to another ' +
-      'agent\'s private memory is denied. Returns { columns, rows }. Escape hatch for power use; prefer ' +
-      'the verb tools above.',
+      'Retrieve context from the quackboard KNOWLEDGE GRAPH, scoped to what YOU may see: all shared ' +
+      'observations plus your OWN private memories (never another agent\'s memory). With a `query`, ' +
+      'returns the semantically nearest nodes (via a self-hosted Qwen3 embedding + cosine search) — ' +
+      'use this for "what do we already know about X?" recall that spans observations and your notes. ' +
+      'Without a query, returns your allowed subgraph. Returns { nodes, edges }; each node has ' +
+      '{ node_kind (observation|memory), node_id, label, topic, ts, sim? }. Newly-written items are ' +
+      'embedded asynchronously (a nightly pass), so the freshest notes may not appear immediately.',
     inputSchema: {
       type: 'object',
-      properties: { sql: { type: 'string', description: 'A single SQL statement over the shared tables.' } },
-      required: ['sql'],
+      properties: {
+        query: { type: 'string', description: 'Natural-language query to find relevant nodes by meaning. Omit to list your allowed subgraph.' },
+        limit: { type: 'number', description: 'Max nodes to return (default 100, max 200).' },
+      },
     },
-    handler: qbPost('query'),
+    handler: qbPost('graph-query'),
+  },
+  {
+    name: 'waddling_qb_link',
+    description:
+      'Declare a relationship edge in the quackboard context graph between two nodes — an observation ' +
+      'or your own memory. Use to assert that two pieces of context are related (e.g. a finding that ' +
+      'supports a decision). These agent-declared edges are preserved across the nightly semantic ' +
+      'recompute. Identify nodes by { kind: observation|memory, id } (ids come from waddling_qb_graph ' +
+      'or waddling_board_query). Returns { ok }.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        srcKind: { type: 'string', enum: ['observation', 'memory'], description: 'Source node kind.' },
+        srcId: { type: 'number', description: 'Source node id.' },
+        dstKind: { type: 'string', enum: ['observation', 'memory'], description: 'Destination node kind.' },
+        dstId: { type: 'number', description: 'Destination node id.' },
+        weight: { type: 'number', description: 'Optional edge weight/strength (default 1.0).' },
+      },
+      required: ['srcKind', 'srcId', 'dstKind', 'dstId'],
+    },
+    handler: qbPost('link'),
   },
 ];
+
+// Unregistered handlers kept for the multi-agent tier: requestAccess, awaitAccess,
+// installExtension, and the qb coordination verbs (via qbPost: join/observe/
+// subscribe/inbox/query/mine/recall). Referencing them here keeps them compiled
+// and lint-clean until they are re-registered.
+export const UNREGISTERED_TOOL_HANDLERS: Record<string, McpTool['handler']> = {
+  waddling_request_access: requestAccess,
+  waddling_await_access: awaitAccess,
+  waddling_install_extension: installExtension,
+};
 
 export const TOOLS_BY_NAME: Map<string, McpTool> = new Map(TOOLS.map((t) => [t.name, t]));

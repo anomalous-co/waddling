@@ -1,0 +1,8 @@
+# Weights-only image: Qwen3-Embedding-4B safetensors at /models/qwen3-embed, nothing else.
+# Built ONCE and pushed to Artifact Registry; the runtime Dockerfile then COPYs the weights from
+# this image (an in-GCP pull, ~seconds) instead of re-downloading ~8GB from HuggingFace on every
+# rebuild. This is what makes iterating on the TEI base image cheap — the weight layer is fixed
+# and cached, only the (small) runtime image changes. Rebuild this ONLY when the model changes.
+FROM python:3.12-slim
+RUN pip install --no-cache-dir "huggingface_hub>=0.27"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Embedding-4B', local_dir='/models/qwen3-embed', ignore_patterns=['*.pth','onnx/*','*.gguf'])"

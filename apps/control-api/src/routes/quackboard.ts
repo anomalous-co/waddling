@@ -32,7 +32,7 @@ import { Hono } from 'hono';
 import { importJWK, SignJWT, type JWK } from 'jose';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
-import { grant, applyStatement } from '../lib/grant-store';
+import { grant, applyStatement, agentSubject, bumpEpoch } from '../lib/grant-store';
 import {
   gatewayClientFor,
   GatewayError,
@@ -41,6 +41,7 @@ import {
   type GatewayAck,
 } from '../lib/gateway-client';
 import { resolveGatewayBoot, CatalogNotReadyError, StorageNotReadyError } from '../lib/gateway-boot';
+import { ensureMemoryLake } from '../lib/memory-lake';
 import { resolveCaller, handle, ok, err, parseBody, AuthError, type Caller } from '../lib/cp-shared';
 
 const QB_JWT_TTL_SECONDS = 15 * 60;
@@ -63,23 +64,27 @@ function lit(s: string): string {
   return "'" + String(s).replace(/'/g, "''") + "'";
 }
 
-/** Ensure the quackboard's shared-table grants exist in the store (spec §13 pull model).
- *  A quackboard is a SHARED board: every active agent gets RW on the shared tables — which is
- *  exactly `TO PUBLIC` (reaches every authenticated identity), so no per-agent fan-out and no
- *  per-connect re-push. RW → the granular DML set (SELECT/INSERT/UPDATE/DELETE). Idempotent:
- *  each PUBLIC grant is written ONCE (the store is append-only, so we skip an identical row).
- *  Scoped to the quackboard datalake so birdshot pulls it under set_grant_scope(datalakeId). */
-async function ensureQuackboardGrants(datalakeId: string): Promise<void> {
+/** On join, grant THIS agent RW on the memory lake's shared coordination tables — exactly the
+ *  way a lake grants an agent (agents.ts): a per-agent SUBJECT grant `GRANT <dml> ON main.<t> TO
+ *  agent:<id>`, authored through the literal-SQL store (applyStatement). NOT `TO PUBLIC` — birdshot
+ *  resolves a subject's grants from its OWN subject rows (∪ roles), and the board's model is that
+ *  each agent that joins is granted access to the board, keyed to its `agent:<id>` subject (= the
+ *  session JWT `sub`). Idempotent: the identical row is written once (append-only store), so a
+ *  re-join is a no-op. The objref is the bare 2-part `main.<t>` the AccessManager uses; birdshot's
+ *  RefMatch suffix-matches it against the bound `lake.main.<t>` ref. `agent_memory` is deliberately
+ *  NOT granted — it stays private, reached only via the trusted remember/mine ops. */
+async function ensureQuackboardGrants(datalakeId: string, agentId: string): Promise<void> {
+  const subject = agentSubject(agentId);
   for (const t of QB_SHARED_TABLES) {
     const stmt = grant({
       privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'],
       on: `main.${t}`,
-      to: 'public',
+      to: { subject },
     });
     const exists = await queryOne<{ one: number }>(
       `SELECT 1 AS one FROM public.__birdshot_grants
-        WHERE datalake = $1 AND grantee_kind = 'public' AND stmt = $2 LIMIT 1`,
-      [datalakeId, stmt],
+        WHERE datalake = $1 AND grantee_kind = 'subject' AND grantee = $2 AND stmt = $3 LIMIT 1`,
+      [datalakeId, subject, stmt],
     );
     if (!exists) await applyStatement(datalakeId, stmt);
   }
@@ -119,6 +124,10 @@ interface QbContext {
   auth: { issuer: string; audience: string; mode: 'rs256'; jwks: { kid: string; n: string; e: string }[] };
   /** Read-only grant-store DSN pushed to the QB gateway (config-only §13). */
   grantStoreDsn?: string;
+  /** The birdshot lake catalog alias for this board (from resolveGatewayBoot — 'lake' for a
+   *  managed memory lake). Pushed as the snapshot's lakeCatalog so birdshot binds bare board
+   *  table refs against the same catalog the grants (`main.<t>`) are scoped to. */
+  lakeCatalog: string;
 }
 
 /** Resolve the org's quackboard + acting agent, build the snapshot, mint the agent's JWT. */
@@ -127,14 +136,17 @@ async function prepareQbContext(c: Parameters<typeof resolveCaller>[0], env: Env
   const caller = await resolveCaller(c, true, true);
   const orgId = caller.orgId;
 
-  const ep = await queryOne<{ id: string; status: string; gateway_url: string | null }>(
-    `SELECT id, status, gateway_url FROM waddling.datalake
-       WHERE org_id = $1 AND kind = 'quackboard'
-       ORDER BY created_at ASC LIMIT 1`,
-    [orgId],
-  );
-  if (!ep) {
-    throw new AuthError('no_quackboard', 404, 'This org has no quackboard — create a quackboard datalake first');
+  // Every org gets a memory lake by default — created lazily here when an
+  // agent's first memory call arrives before onboarding ever provisioned one.
+  let ep: { id: string; status: string; gateway_url: string | null };
+  try {
+    ep = await ensureMemoryLake(env, orgId);
+  } catch (e) {
+    throw new AuthError(
+      'memory_lake_unavailable',
+      503,
+      `Could not provision this org's memory lake: ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
   if (ep.status !== 'running') {
     throw new AuthError('quackboard_not_running', 409, `Quackboard status is ${ep.status}`);
@@ -150,11 +162,11 @@ async function prepareQbContext(c: Parameters<typeof resolveCaller>[0], env: Env
     if (e instanceof StorageNotReadyError) throw new AuthError('storage_unavailable', 503, e.message);
     throw e;
   }
-  if (!boot.gatewayBoot?.quackboard) {
-    throw new AuthError('not_a_quackboard', 500, 'resolved boot config is not a quackboard');
+  if (!boot.gatewayBoot?.memoryLake) {
+    throw new AuthError('not_a_quackboard', 500, 'resolved boot config is not a memory lake');
   }
 
-  await ensureQuackboardGrants(ep.id);
+  await ensureQuackboardGrants(ep.id, agentId);
   const { kid, publicJwk, privateJwk } = await loadSigningKey();
   const audience = `qb:${orgId}`;
   const auth = {
@@ -176,7 +188,7 @@ async function prepareQbContext(c: Parameters<typeof resolveCaller>[0], env: Env
     .setExpirationTime(`${QB_JWT_TTL_SECONDS}s`)
     .sign(key);
 
-  return { orgId, datalakeId: ep.id, agentId, agentRole: agentId, gatewayUrl: ep.gateway_url, jwt, gatewayBoot: boot.gatewayBoot, auth, grantStoreDsn: env.BIRDSHOT_STORE_DSN };
+  return { orgId, datalakeId: ep.id, agentId, agentRole: agentId, gatewayUrl: ep.gateway_url, jwt, gatewayBoot: boot.gatewayBoot, auth, grantStoreDsn: env.BIRDSHOT_STORE_DSN, lakeCatalog: boot.lakeCatalog };
 }
 
 /** Resolve the acting agent: API-key agents are themselves; delegated OAuth callers get a
@@ -215,7 +227,9 @@ async function configureQb(ctx: QbContext): Promise<GatewayAck> {
       return await gw(ctx).pushSnapshot({
         datalakeId: ctx.datalakeId,
         auth: ctx.auth,
-        lakeCatalog: 'quackboard',
+        // birdshot_set_lake_catalog target — the memory lake's alias ('lake'), matching the
+        // catalog its board tables (lake.main.<t>) and the `main.<t>` grants resolve against.
+        lakeCatalog: ctx.lakeCatalog,
         grantStoreDsn: ctx.grantStoreDsn,
         gatewayBoot: ctx.gatewayBoot,
       });
@@ -229,18 +243,27 @@ async function configureQb(ctx: QbContext): Promise<GatewayAck> {
   }
 }
 
-/** Run a gated query AS the agent (JWT = quack TOKEN). /query is HTTP-200-ALWAYS — the outcome is
+/** Run a gated query AS the agent (JWT = quack TOKEN). /qb-query is HTTP-200-ALWAYS — the outcome is
  *  in the BODY ({ ok, rows, rowCount, error, authorizeDecision, phase }). On a cold-boot / lost-
  *  config failure the container has no JWKS, so quack AUTHENTICATION fails and the body carries
- *  phase === 'authenticate' — re-push the snapshot (re-arm) + retry once. A birdshot AUTHORIZATION
- *  deny (ok:false, authorizeDecision 'deny') is a real verdict: never retried. A genuine transport
+ *  phase === 'authenticate' — re-push the snapshot (re-arm) + retry once. birdshot pulls grants
+ *  LIVE from the Postgres grant store (ATTACHed via grantStoreDsn in the snapshot), so an
+ *  authorization denial (authorizeDecision 'deny') on a freshly-armed gateway is a transient
+ *  grant-store-not-yet-attached condition — re-arm + retry once here too. A genuine transport
  *  failure throws GatewayError (caller wraps). */
 async function gatedQuery(ctx: QbContext, sql: string): Promise<GatewayQueryResult> {
   let r = await gw(ctx).qbGatedQuery(ctx.jwt, sql);
   if (r.phase === 'authenticate') {
+    // Cold gateway lost its JWKS (scale-to-zero) — re-arm the snapshot and retry ONCE.
     await configureQb(ctx);
     r = await gw(ctx).qbGatedQuery(ctx.jwt, sql);
   }
+  // Do NOT re-push + retry on an authorization DENY. A deny is birdshot's authoritative verdict
+  // (the store is attached and the subject is hydrated), and configureQb → applySnapshot runs
+  // birdshot_commit_config, which CLOBBERS the live-hydrated grants (birdshot §12d: no commit may
+  // follow an authenticate). Since a legitimate deny (e.g. agent_memory) advances no store epoch,
+  // the clobbered grants would NOT re-hydrate, and every SUBSEQUENT gated query on the same warm
+  // container would then wrongly deny. Surface the deny as-is; the snapshot is armed at join.
   return r;
 }
 
@@ -341,6 +364,35 @@ function gatedResult(c: any, r: GatewayQueryResult) {
   return err(c, 'query_failed', 500, cleanReason(raw));
 }
 
+/** Owner-facing resolver for the browse UI: cookie-session owner (requireOrg, NO agent binding),
+ *  returns the org's RUNNING quackboard + its gateway url. Mirrors prepareQbContext's board lookup
+ *  but skips agent identity — owner-oversight reads are authorized by org membership alone. */
+async function resolveOwnerQb(
+  c: Parameters<typeof resolveCaller>[0],
+): Promise<{ orgId: string; datalakeId: string; gatewayUrl: string | null }> {
+  const caller = await resolveCaller(c, false, true);
+  const ep = await queryOne<{ id: string; status: string; gateway_url: string | null }>(
+    `SELECT id, status, gateway_url FROM waddling.datalake
+       WHERE org_id = $1 AND kind = 'quackboard' ORDER BY created_at ASC LIMIT 1`,
+    [caller.orgId],
+  );
+  if (!ep) throw new AuthError('no_quackboard', 404, 'This org has no quackboard yet');
+  if (ep.status !== 'running') throw new AuthError('quackboard_not_running', 409, `Quackboard status is ${ep.status}`);
+  return { orgId: caller.orgId, datalakeId: ep.id, gatewayUrl: ep.gateway_url };
+}
+
+/** Map agent_role (the raw agent id bound server-side on writes) → display name, so the browse
+ *  UI shows names not uuids. One query per request. */
+async function agentNameMap(orgId: string): Promise<Record<string, string>> {
+  const { rows } = await query<{ id: string; name: string }>(
+    `SELECT id, name FROM waddling.agent WHERE org_id = $1`,
+    [orgId],
+  );
+  const m: Record<string, string> = {};
+  for (const r of rows) m[r.id] = r.name;
+  return m;
+}
+
 const quackboard = new Hono<{ Bindings: Env }>();
 
 // GET — owner-facing detection: does this org have a quackboard yet? Powers the
@@ -360,6 +412,103 @@ quackboard.get('/', (c) =>
   }),
 );
 
+// ── Owner-facing browse (read-only) — powers the human /quackboard workspace ──
+// Cookie-session owner only (resolveOwnerQb, NO agent binding). Reads go through the
+// gateway's TRUSTED /ctrl read handlers, so they see the whole board incl. every agent's
+// private memory — intentional owner oversight, NEVER exposed to an agent-facing surface.
+// The gateway cold-boots lazily on the first /ctrl hit; a transient gateway error surfaces
+// as 503 "waking up" for the client to retry (trusted reads need no snapshot/configure).
+const OWNER_UNAVAILABLE = 'The quackboard gateway is waking up — retry in a moment.';
+
+quackboard.get('/observations', (c) =>
+  handle(c, async () => {
+    const qb = await resolveOwnerQb(c);
+    const topic = c.req.query('topic') || undefined;
+    const limit = Number(c.req.query('limit')) || undefined;
+    try {
+      const r = await gatewayClientFor({ gateway_url: qb.gatewayUrl }).qbObservations({ topic, limit });
+      const names = await agentNameMap(qb.orgId);
+      const entries = (r?.rows ?? []).map((row: any) => ({ ...row, agentName: names[row.agent_role] ?? row.agent_role }));
+      return ok(c, { entries });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'quackboard_unavailable', 503, OWNER_UNAVAILABLE);
+      throw e;
+    }
+  }),
+);
+
+quackboard.get('/topics', (c) =>
+  handle(c, async () => {
+    const qb = await resolveOwnerQb(c);
+    try {
+      const r = await gatewayClientFor({ gateway_url: qb.gatewayUrl }).qbTopics({});
+      const topics = (r?.rows ?? []).map((row: any) => ({ topic: row.topic, n: Number(row.n), lastTs: row.last_ts }));
+      return ok(c, { topics });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'quackboard_unavailable', 503, OWNER_UNAVAILABLE);
+      throw e;
+    }
+  }),
+);
+
+quackboard.get('/memory', (c) =>
+  handle(c, async () => {
+    const qb = await resolveOwnerQb(c);
+    const limit = Number(c.req.query('limit')) || undefined;
+    try {
+      const r = await gatewayClientFor({ gateway_url: qb.gatewayUrl }).qbMemoryAll({ limit });
+      const names = await agentNameMap(qb.orgId);
+      const entries = (r?.rows ?? []).map((row: any) => ({ ...row, agentName: names[row.agent_role] ?? row.agent_role }));
+      return ok(c, { entries });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'quackboard_unavailable', 503, OWNER_UNAVAILABLE);
+      throw e;
+    }
+  }),
+);
+
+// Owner context-graph viz: all nodes + all edges (owner oversight). Read-only, cookie owner.
+quackboard.get('/graph', (c) =>
+  handle(c, async () => {
+    const qb = await resolveOwnerQb(c);
+    const limit = Number(c.req.query('limit')) || undefined;
+    try {
+      const r = await gatewayClientFor({ gateway_url: qb.gatewayUrl }).qbGraphOwner({ limit });
+      const names = await agentNameMap(qb.orgId);
+      const nodes = (r?.nodes ?? []).map((n: any) => ({ ...n, agentName: names[n.agent_role] ?? n.agent_role }));
+      return ok(c, { nodes, edges: r?.edges ?? [] });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'quackboard_unavailable', 503, OWNER_UNAVAILABLE);
+      throw e;
+    }
+  }),
+);
+
+// Owner-triggered embed + edge recompute (the same work the nightly cron does). Loops
+// qb-embed-batch until the board is drained, then rebuilds derived edges. Manual runs let an
+// owner populate the graph immediately instead of waiting for the nightly pass.
+quackboard.post('/embed-run', (c) =>
+  handle(c, async () => {
+    const qb = await resolveOwnerQb(c);
+    const embeddingsUrl = c.env.EMBEDDINGS_URL;
+    if (!embeddingsUrl) return err(c, 'embeddings_not_configured', 500, 'EMBEDDINGS_URL is not set');
+    const gwc = gatewayClientFor({ gateway_url: qb.gatewayUrl });
+    let embedded = 0;
+    try {
+      for (let i = 0; i < 20; i++) {
+        const r = await gwc.qbEmbedBatch({ embeddingsUrl });
+        embedded += r.embedded;
+        if (r.remaining === 0 || r.embedded === 0) break;
+      }
+      const edges = await gwc.qbEdgesRecompute({});
+      return ok(c, { embedded, edges: edges?.byKind ?? [] });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'embed_run_failed', 502, e.message);
+      throw e;
+    }
+  }),
+);
+
 quackboard.post('/join', (c) =>
   handle(c, async () => {
     const ctx = await prepareQbContext(c, c.env);
@@ -370,6 +519,11 @@ quackboard.post('/join', (c) =>
       if (e instanceof GatewayError) return err(c, 'quackboard_configure_failed', 502, e.message);
       throw e;
     }
+    // configureQb re-armed the gateway (birdshot_commit_config), which clobbers any live-hydrated
+    // grants on a WARM container — including this agent's, just written above by ensureQuackboardGrants
+    // when they already existed (idempotent → no epoch bump). Bump the epoch now so the agent's first
+    // gated query re-hydrates its (clobbered) grants instead of wrongly denying. [[grant-store bumpEpoch]]
+    await bumpEpoch(ctx.datalakeId);
     return ok(c, {
       org_id: ctx.orgId,
       agent_id: ctx.agentId,
@@ -397,15 +551,22 @@ quackboard.post('/observe', (c) =>
     try {
       // agent_role is BOUND from the authenticated identity (ctx.agentRole), never the tool args.
       insert = await gatedQuery(ctx,
-        `INSERT INTO observations(agent_role, content, refs, topic) VALUES (${lit(ctx.agentRole)}, ${lit(content)}, ${lit(refsJson)}::JSON, ${topic ? lit(topic) : 'NULL'})`,
+        // id is supplied inline (DuckLake has no sequences). observations is granted RW, so the
+        // max(id) read + the insert are both authorized under the same PUBLIC grant.
+        `INSERT INTO observations(id, agent_role, content, refs, topic)
+           SELECT (SELECT coalesce(max(id),0)+1 FROM observations), ${lit(ctx.agentRole)}, ${lit(content)}, ${lit(refsJson)}::JSON, ${topic ? lit(topic) : 'NULL'}`,
       );
       if (!insert.ok) return gatedResult(c, insert);
       // Pub/sub fan-out: notify every OTHER agent whose subscription pattern matches this
       // observation (substring match — robust + no per-write FTS rebuild). Runs as the same
       // agent (write notifications + read subscriptions, both shared/granted).
       fanout = await gatedQuery(ctx,
-        `INSERT INTO notifications(to_role, sub_id, snippet)
-           SELECT s.agent_role, s.id, substr(${lit(content)}, 1, 200)
+        // Multi-row insert: a single max+1 subquery would give every row the SAME id, so offset
+        // by row_number() for distinct climbing ids (verified on DuckLake). notifications +
+        // subscriptions are both granted RW.
+        `INSERT INTO notifications(id, to_role, sub_id, snippet)
+           SELECT (SELECT coalesce(max(id),0) FROM notifications) + row_number() OVER (),
+                  s.agent_role, s.id, substr(${lit(content)}, 1, 200)
              FROM subscriptions s
             WHERE s.agent_role <> ${lit(ctx.agentRole)}
               AND ${lit(content)} ILIKE '%' || s.pattern || '%'`,
@@ -472,6 +633,56 @@ quackboard.post('/mine', (c) =>
   }),
 );
 
+// Agent-declared graph edge (waddling_qb_link). agentRole is bound for auditing, but the edge is
+// a relation the agent asserts between two nodes — the write goes to the trusted /ctrl/qb-link.
+const LinkSchema = z.object({
+  srcKind: z.enum(['observation', 'memory']),
+  srcId: z.number().int(),
+  dstKind: z.enum(['observation', 'memory']),
+  dstId: z.number().int(),
+  weight: z.number().optional(),
+});
+quackboard.post('/link', (c) =>
+  handle(c, async () => {
+    const ctx = await prepareQbContext(c, c.env);
+    const body = await parseBody(c, LinkSchema);
+    try {
+      await gw(ctx).qbLink(body);
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'link_failed', 502, e.message);
+      throw e;
+    }
+    await checkpointBoard(c, ctx);
+    return ok(c, { ok: true });
+  }),
+);
+
+// Agent-scoped context graph (waddling_qb_graph). The gateway enforces the privacy invariant:
+// the agent sees shared observations + its OWN memory only. With a `query`, returns the top-k
+// semantically-nearest allowed nodes (Qwen3 query embedding); without, the allowed subgraph.
+const GraphQuerySchema = z.object({
+  query: z.string().optional(),
+  limit: z.number().int().positive().max(200).optional(),
+});
+quackboard.post('/graph-query', (c) =>
+  handle(c, async () => {
+    const ctx = await prepareQbContext(c, c.env);
+    const { query, limit } = await parseBody(c, GraphQuerySchema);
+    try {
+      const r = await gw(ctx).qbGraphAgent({
+        agentRole: ctx.agentRole,
+        query,
+        embeddingsUrl: c.env.EMBEDDINGS_URL,
+        limit,
+      });
+      return ok(c, { nodes: r?.nodes ?? [], edges: r?.edges ?? [] });
+    } catch (e) {
+      if (e instanceof GatewayError) return err(c, 'graph_failed', 502, e.message);
+      throw e;
+    }
+  }),
+);
+
 const SubscribeSchema = z.object({ pattern: z.string().min(1), topic: z.string().optional() });
 quackboard.post('/subscribe', (c) =>
   handle(c, async () => {
@@ -480,7 +691,8 @@ quackboard.post('/subscribe', (c) =>
     let r: GatewayQueryResult;
     try {
       r = await gatedQuery(ctx,
-        `INSERT INTO subscriptions(agent_role, pattern, match_type, topic) VALUES (${lit(ctx.agentRole)}, ${lit(pattern)}, 'ilike', ${topic ? lit(topic) : 'NULL'})`,
+        `INSERT INTO subscriptions(id, agent_role, pattern, match_type, topic)
+           SELECT (SELECT coalesce(max(id),0)+1 FROM subscriptions), ${lit(ctx.agentRole)}, ${lit(pattern)}, 'ilike', ${topic ? lit(topic) : 'NULL'}`,
       );
     } catch (e) {
       if (e instanceof GatewayError) return err(c, 'subscribe_failed', 502, e.message);

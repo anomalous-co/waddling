@@ -53,7 +53,11 @@ export interface ProvisionableDatalake {
   encrypted: boolean;
 }
 
-export async function provisionGateway(env: Env, dl: ProvisionableDatalake): Promise<{ url: string }> {
+export async function provisionGateway(
+  env: Env,
+  dl: ProvisionableDatalake,
+  opts: { memoryLake?: boolean } = {},
+): Promise<{ url: string }> {
   if (!env.PROVISIONER_URL) throw new Error('PROVISIONER_URL unset — cannot provision per-endpoint gateway');
 
   // Catalog DSN: the per-org Cloud SQL database (managed) or the customer's own (byo).
@@ -77,6 +81,10 @@ export async function provisionGateway(env: Env, dl: ProvisionableDatalake): Pro
     S3_REGION: 'us-west1',
     S3_USE_SSL: 'true',
     S3_URL_STYLE: 'path',
+    // Memory lake (the org's kind='quackboard' board): a normal managed DuckLake gateway that
+    // ALSO bootstraps the 8 agent-coordination tables into lake.main at boot. This env flag —
+    // NOT any snapshot field — is what drives the gateway's board bootstrap.
+    ...(opts.memoryLake ? { MEMORY_LAKE: '1' } : {}),
   };
   // Shared GCS HMAC creds (same secrets gw-bringup references) — not per-endpoint.
   const secretEnv: Record<string, string> = { S3_KEY_ID: 'gcs-hmac-key-id', S3_SECRET: 'gcs-hmac-secret' };

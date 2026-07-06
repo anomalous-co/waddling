@@ -129,6 +129,23 @@ export interface DuckRuntime {
   run(sql: string): Promise<void>;
 }
 
+// Context-graph spine — DuckLake-SAFE so it bootstraps identically in the legacy local-file board
+// (QUACKBOARD_SCHEMA) and the DuckLake-backed memoryLake board (BOARD_SCHEMA). Constraints proven
+// against the DuckLake docs: `vec` is a LIST (FLOAT[]), NOT a fixed ARRAY — DuckLake does not
+// support the ARRAY type; NO PRIMARY KEY / UNIQUE / sequences — DuckLake bans them. The vector is
+// cast to ::FLOAT[2560] at query time for `array_cosine_similarity` (a CORE DuckDB function — no
+// vss extension needed for brute-force cosine; HNSW is impossible on DuckLake anyway). embeddings:
+// one vector per node, (node_kind, node_id) → observations.id / agent_memory.id — a node is
+// un-embedded until it has a row here. edges: semantic (top-k cosine) / structural (shared topic)
+// / declared (agent-written). No PK ⇒ writes never upsert: embed only un-embedded nodes; declared
+// links delete-then-insert; recompute deletes derived edges first.
+const GRAPH_SCHEMA: string[] = [
+  `CREATE TABLE IF NOT EXISTS embeddings(node_kind TEXT, node_id INTEGER, vec FLOAT[],
+     model TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS edges(src_kind TEXT, src_id INTEGER, dst_kind TEXT, dst_id INTEGER,
+     kind TEXT, weight DOUBLE, ts TIMESTAMP DEFAULT current_timestamp)`,
+];
+
 // Idempotent quackboard schema: the shared agent-coordination tables + a seeded FTS index.
 // Run on the un-gated CONTROL connection at boot (before quack_serve), so it is not subject
 // to birdshot authorization. CREATE … IF NOT EXISTS makes it a no-op on a restored db.
@@ -158,6 +175,7 @@ const QUACKBOARD_SCHEMA: string[] = [
      ts TIMESTAMP DEFAULT current_timestamp)`,
   `CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY DEFAULT nextval('msg_seq'),
      from_agent TEXT, to_agent TEXT, body TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  ...GRAPH_SCHEMA,
   // Seed one sentinel so the FTS index always has a document, then build it.
   `INSERT INTO observations(agent_role, content, refs, topic)
      SELECT 'system', 'quackboard initialized', '[]', 'meta'
@@ -167,6 +185,46 @@ const QUACKBOARD_SCHEMA: string[] = [
 
 async function bootstrapQuackboardSchema(connection: DuckDBConnection): Promise<void> {
   for (const stmt of QUACKBOARD_SCHEMA) await connection.run(stmt);
+}
+
+// DuckLake-safe board schema: the same 8 agent-coordination namespaces as QUACKBOARD_SCHEMA,
+// but created as governed DuckLake tables in `lake.main` (the memory lake). DuckLake does NOT
+// support sequences or a persistent FTS index (verified: `CREATE SEQUENCE` → "DuckLake does not
+// support sequences"; `create_fts_index` → "Failed to commit DuckLake transaction"), so:
+//   • ids are plain INTEGER supplied inline by the writer (control-api uses `(SELECT
+//     coalesce(max(id),0)+1 …)`), not `DEFAULT nextval(seq)`;
+//   • recall is ILIKE substring (see /ctrl/qb-recall), not BM25 — so no FTS index + no seed
+//     sentinel is needed here.
+// PRIMARY KEY / UNIQUE constraints are omitted (DuckLake enforcement is limited and the board
+// does not depend on them). Run on the un-gated control connection AFTER `USE lake`, so bare
+// table names land in `lake.main`. Idempotent (CREATE … IF NOT EXISTS) — a no-op on a lake whose
+// board tables already exist (durability is the DuckLake catalog, not this call).
+const BOARD_SCHEMA: string[] = [
+  `CREATE TABLE IF NOT EXISTS objectives(id INTEGER, owner TEXT,
+     status TEXT DEFAULT 'open', body TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS observations(id INTEGER,
+     agent_role TEXT, content TEXT, refs JSON, topic TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS agent_memory(id INTEGER,
+     agent_role TEXT, key TEXT, content TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS claims(area TEXT, agent_role TEXT,
+     status TEXT DEFAULT 'claimed', ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS subscriptions(id INTEGER,
+     agent_role TEXT, pattern TEXT, match_type TEXT DEFAULT 'ilike', topic TEXT,
+     created TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS notifications(id INTEGER,
+     to_role TEXT, source_id INTEGER, sub_id INTEGER, snippet TEXT,
+     ts TIMESTAMP DEFAULT current_timestamp, is_read BOOLEAN DEFAULT false)`,
+  `CREATE TABLE IF NOT EXISTS boundaries(id INTEGER,
+     name TEXT, scope TEXT, paths JSON, status TEXT DEFAULT 'open', owner TEXT,
+     ts TIMESTAMP DEFAULT current_timestamp)`,
+  `CREATE TABLE IF NOT EXISTS messages(id INTEGER,
+     from_agent TEXT, to_agent TEXT, body TEXT, ts TIMESTAMP DEFAULT current_timestamp)`,
+  // Context-graph spine (same DuckLake-safe LIST/no-PK tables as the legacy board).
+  ...GRAPH_SCHEMA,
+];
+
+async function bootstrapBoardSchema(connection: DuckDBConnection): Promise<void> {
+  for (const stmt of BOARD_SCHEMA) await connection.run(stmt);
 }
 
 /**
@@ -388,6 +446,15 @@ export async function bootDuckRuntime(
   // birdshot_set_lake_catalog (applySnapshot), since `USE` does NOT carry to the
   // transient per-request connections quack's auth callbacks run on.
   await connection.run(`USE ${config.lakeAlias}`);
+
+  // Memory lake: bootstrap the shared agent-coordination tables into `lake.main` (bare names
+  // resolve there under the USE above). Runs on the un-gated control connection BEFORE
+  // quack_serve + the read-through views below, so the board tables exist for both the trusted
+  // /qb-query writes (executed on this connection) and the memory.main views. Idempotent.
+  if (config.memoryLake) {
+    await bootstrapBoardSchema(connection);
+    mark("board-schema");
+  }
 
   // quack serves ONLY the server's `memory` catalog (verified: USE does not change what it
   // serves, and a client cannot address an attached server catalog). So expose the lake's
@@ -613,6 +680,9 @@ export async function applySnapshot(rt: DuckRuntime, cfg: GatewayConfigPush): Pr
     if (cfg.datalakeId) {
       await c.run(`SELECT birdshot_set_grant_scope(${q(cfg.datalakeId)})`);
     }
+    console.log(`[applySnapshot] grant-store WIRED dsnLen=${cfg.grantStoreDsn.length} scope=${cfg.datalakeId ?? '(none)'} lakeCatalog=${rt.config.lakeAlias}`);
+  } else {
+    console.log(`[applySnapshot] grant-store SKIPPED — no grantStoreDsn (grants will NOT enforce) scope=${cfg.datalakeId ?? '(none)'}`);
   }
 
   // Re-expose lake tables as read-through views. The per-replica `memory.main` views

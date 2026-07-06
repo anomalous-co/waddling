@@ -111,6 +111,8 @@ export interface Env {
   // ── Stripe (placeholder values in B1; real keys are Worker secrets later) ─
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
+  // 'starter' is the $15/mo entry tier (3-day trial; see auth.ts stripePlans).
+  STRIPE_PRICE_STARTER: string;
   STRIPE_PRICE_PRO: string;
   // 'scale' is the self-serve $199/mo tier (formerly labelled enterprise). The
   // sales-led `enterprise` tier has no self-serve price, hence no var here.
@@ -150,6 +152,11 @@ export interface Env {
   // to deploy a per-datalake private gateway at create. Unset ⇒ no per-endpoint provisioning
   // (datalakes fall back to the single GATEWAY_BASE_URL bring-up gateway).
   PROVISIONER_URL?: string;
+
+  // Private embeddings service URL (Qwen3-Embedding-4B on Cloud Run L4 GPU, us-central1).
+  // Passed to the QB gateway in /ctrl/qb-embed-batch|qb-graph-agent bodies; the gateway mints an
+  // OIDC token for it. Unset ⇒ the context-graph embed pipeline is a no-op.
+  EMBEDDINGS_URL?: string;
 
   // Public router host suffix (e.g. 'getwaddling.com'). A workspace ATTACHes the lake via quack at
   // gw-<lakeslug>.<ROUTER_HOST_SUFFIX>:443 — the public router forwards /quack to the private lake

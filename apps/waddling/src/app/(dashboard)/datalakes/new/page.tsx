@@ -41,13 +41,17 @@ type StorageKind = 'managed' | 'byo';
 // urlStyle/useSsl are real StorageSchema fields with real access consequences, so
 // they come from the chosen platform rather than a guess (mirrors the prod create
 // contract — a wrong urlStyle silently breaks S3/R2 reads).
-type StoreKind = 'r2' | 's3' | 'minio';
+// `comingSoon` renders the provider as a disabled tile (not yet selectable). GCS is
+// S3-interop (the managed path already uses gcs-hmac creds), so it rides the same
+// StorageSchema fields as R2/MinIO — endpoint + config keyId/secret + urlStyle + useSsl.
+type StoreKind = 'r2' | 'gcs' | 's3' | 'minio';
 const STORE_PRESETS: Record<
   StoreKind,
-  { label: string; urlStyle: 'vhost' | 'path'; useSsl: boolean; needsEndpoint: boolean; endpointPlaceholder: string }
+  { label: string; urlStyle: 'vhost' | 'path'; useSsl: boolean; needsEndpoint: boolean; endpointPlaceholder: string; comingSoon?: boolean }
 > = {
   r2: { label: 'Cloudflare R2', urlStyle: 'path', useSsl: true, needsEndpoint: true, endpointPlaceholder: '<account-id>.r2.cloudflarestorage.com' },
-  s3: { label: 'Amazon S3', urlStyle: 'vhost', useSsl: true, needsEndpoint: false, endpointPlaceholder: '(none — AWS default)' },
+  gcs: { label: 'Google Cloud Storage', urlStyle: 'path', useSsl: true, needsEndpoint: true, endpointPlaceholder: 'storage.googleapis.com' },
+  s3: { label: 'Amazon S3', urlStyle: 'vhost', useSsl: true, needsEndpoint: false, endpointPlaceholder: '(none — AWS default)', comingSoon: true },
   minio: { label: 'MinIO / other S3', urlStyle: 'path', useSsl: true, needsEndpoint: true, endpointPlaceholder: 'minio.example.com:9000' },
 };
 
@@ -356,24 +360,50 @@ export default function NewDataLakePage() {
 
               {storage === 'byo' && (
                 <div className="flex flex-col gap-3 border-t pt-4">
-                  {/* Object store */}
+                  {/* Object store — pick the provider from a row of tiles. */}
                   <div className="flex flex-col gap-1.5">
-                    <Label htmlFor={storeKindId}>Object store</Label>
-                    <select
-                      id={storeKindId}
-                      value={storeKind}
-                      onChange={(e) => setStoreKind(e.target.value as StoreKind)}
-                      className={selectClass}
+                    <span id={storeKindId} className="text-sm font-medium leading-none">
+                      Object store
+                    </span>
+                    <div
+                      role="radiogroup"
+                      aria-labelledby={storeKindId}
+                      className="grid grid-cols-2 gap-2 sm:grid-cols-4"
                     >
-                      {(Object.keys(STORE_PRESETS) as StoreKind[]).map((k) => (
-                        <option key={k} value={k}>
-                          {STORE_PRESETS[k].label}
-                        </option>
-                      ))}
-                    </select>
-                    <p className="text-xs text-muted-foreground">
-                      Sets the connection style for you ({preset.urlStyle}-style{preset.useSsl ? ', SSL' : ''}).
-                    </p>
+                      {(Object.keys(STORE_PRESETS) as StoreKind[]).map((k) => {
+                        const p = STORE_PRESETS[k];
+                        const selected = storeKind === k;
+                        return (
+                          <button
+                            key={k}
+                            type="button"
+                            role="radio"
+                            aria-checked={selected}
+                            aria-disabled={p.comingSoon}
+                            disabled={p.comingSoon}
+                            onClick={() => !p.comingSoon && setStoreKind(k)}
+                            className={cn(
+                              'relative flex flex-col items-start gap-1 rounded-lg border bg-card p-3 text-left transition-colors',
+                              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                              selected && !p.comingSoon && 'border-primary ring-1 ring-primary',
+                              !selected && !p.comingSoon && 'hover:border-foreground/30',
+                              p.comingSoon && 'cursor-not-allowed opacity-60',
+                            )}
+                          >
+                            <span className="text-sm font-medium leading-snug">{p.label}</span>
+                            {p.comingSoon ? (
+                              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                                Coming soon
+                              </span>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">
+                                {p.urlStyle}-style{p.useSsl ? ', SSL' : ''}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   <div className="grid gap-3 sm:grid-cols-2">

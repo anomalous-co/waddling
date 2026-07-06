@@ -18,17 +18,16 @@ import { Button } from '@/components/ui/button';
 const KEY_PLACEHOLDER = 'sk_agent_…';
 
 // ── Snippet builders (mirrored from connect-wizard; do not import from there) ──
+// Remote MCP over Streamable HTTP — no local install. Works as-is in Claude
+// Code (.mcp.json) and any host that supports `type: "http"` servers.
 function mcpConfig(agentKey: string): string {
   return JSON.stringify(
     {
       mcpServers: {
         waddling: {
-          command: 'npx',
-          args: ['-y', '@waddling/mcp@latest'],
-          env: {
-            WADDLING_URL: 'https://api.getwaddling.com',
-            WADDLING_API_KEY: agentKey,
-          },
+          type: 'http',
+          url: 'https://api.getwaddling.com/mcp',
+          headers: { Authorization: `Bearer ${agentKey}` },
         },
       },
     },

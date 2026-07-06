@@ -178,6 +178,20 @@ export async function listStatements(datalake: string): Promise<GrantRow[]> {
   return r.rows;
 }
 
+/** Bump a datalake's store epoch (the freshness cursor birdshot compares against its hydrated
+ *  epoch). A config re-arm on the gateway runs birdshot_commit_config, which does `live_ =
+ *  staging_` and CLOBBERS every live-hydrated grant while leaving the subject marked hydrated —
+ *  so without a fresh epoch the clobbered grants never re-pull and the agent wrongly denies.
+ *  Bumping the epoch after such a re-arm makes birdshot FlushHydrated + re-hydrate on the next
+ *  authorize. Idempotent-safe: a spurious bump only costs one re-pull. */
+export async function bumpEpoch(datalake: string): Promise<void> {
+  await query(
+    `INSERT INTO ${META} (datalake, epoch) VALUES ($1, 1)
+     ON CONFLICT (datalake) DO UPDATE SET epoch = ${META}.epoch + 1`,
+    [datalake],
+  );
+}
+
 /** The current epoch (freshness/version signal) for a datalake; 0 if none yet. */
 export async function epochFor(datalake: string): Promise<number> {
   const r = await query<{ epoch: string }>(

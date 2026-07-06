@@ -20,6 +20,7 @@ import { query, queryOne } from '../lib/db';
 import { resolveCaller, handle, ok, err, AuthError } from '../lib/cp-shared';
 import { buildAuth } from '../lib/auth';
 import { provisionOrgCatalog } from '../lib/catalog-provision';
+import { ensureMemoryLake } from '../lib/memory-lake';
 import { recompileAndPush } from '../lib/gateway-push';
 import { makePostHog } from '../lib/posthog';
 import type { Env } from '../lib/env';
@@ -214,6 +215,16 @@ onboarding.post('/provision', (c) =>
     }
     const orgId = caller.orgId;
     let row = await loadRow(orgId);
+
+    // Every paid org gets its memory lake by default — kick creation (row +
+    // per-org QB gateway) here so it's warm before the agent's first memory
+    // call. Fire-and-forget: the gateway deploy takes ~30-60s and onboarding
+    // must not block on it; prepareQbContext lazily heals anything unfinished.
+    void ensureMemoryLake(c.env, orgId).catch((e: unknown) => {
+      console.log(
+        `[onboarding] memory-lake provision deferred for ${orgId}: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    });
 
     if (!row || !row.demo_lake_id || !row.demo_agent_id) {
       // ── First-time provision ──

@@ -22,7 +22,6 @@ import {
   Home,
   Bot,
   LayoutGrid,
-  Users,
   Search,
   ChevronRight,
   Sun,
@@ -110,24 +109,25 @@ interface Org {
   slug: string;
 }
 
-// Primary nav — the redesigned simplified surface (Home/Agents/Data/Quackboard/
-// Team/Settings). Billing + Account live in the user menu; "Connect" is the header
-// action (opens the connect-agent modal). Operational surfaces (sessions/audit/
-// usage/acl/connected/notebooks/views) remain reachable by URL but are folded out
-// of the sidebar per the new information architecture.
+// Primary nav — the personal-data-store surface (Home/Agents/Data/Memory/
+// Settings). "Memory" is the quackboard page: the org's memory lake (what your
+// agents observed + remembered) — the product's core proof, so it keeps a nav
+// slot under its product name. Billing + Account live in the user menu;
+// "Connect" is the header action (opens the connect-agent modal). Operational
+// and multi-agent surfaces (team/sessions/audit/usage/acl/connected/notebooks/
+// views) remain reachable by URL but are folded out of the sidebar.
 const NAV_ITEMS = [
-  { href: '/dashboard',  label: 'Home',       icon: Home },
-  { href: '/agents',     label: 'Agents',     icon: Bot },
-  { href: '/datalakes',  label: 'Data',       icon: DataLakeIcon },
-  { href: '/quackboard', label: 'Quackboard', icon: LayoutGrid },
-  { href: '/team',       label: 'Team',       icon: Users },
-  { href: '/settings',   label: 'Settings',   icon: Settings },
+  { href: '/dashboard',  label: 'Home',     icon: Home },
+  { href: '/agents',     label: 'Agents',   icon: Bot },
+  { href: '/datalakes',  label: 'Data',     icon: DataLakeIcon },
+  { href: '/quackboard', label: 'Memory',   icon: LayoutGrid },
+  { href: '/settings',   label: 'Settings', icon: Settings },
 ] as const;
 
 const SEGMENT_LABELS: Record<string, string> = {
   dashboard: 'Home',
   datalakes: 'Data',
-  quackboard: 'Quackboard',
+  quackboard: 'Memory',
   agents: 'Agents',
   connected: 'Connected agents',
   acl: 'Access',

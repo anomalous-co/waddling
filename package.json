@@ -20,7 +20,8 @@
     "db:boot": "pnpm --filter @pglite-sandbox/db boot",
     "demo:federation": "bash scripts/federation-demo.sh",
     "dev:waddling": "pnpm --filter @waddling/app dev",
-    "db:migrate": "tsx scripts/migrate.ts"
+    "db:migrate": "tsx scripts/migrate.ts",
+    "deploy:control-api": "PROJECT=project-bd87157a-f6fd-4d44-830 REGION=us-west1 TAG=$(git rev-parse --short HEAD) bash infra/gcp/deploy-cutover.sh control-api"
   },
   "dependencies": {
     "@cloudflare/workers-types": "^4.20260617.1",

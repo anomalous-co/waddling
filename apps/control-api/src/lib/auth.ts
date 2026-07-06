@@ -34,8 +34,15 @@ import { queryOne } from './db';
 import { fulfillCreditPackEvent } from './credit-packs';
 import { captureCheckoutCompletedEvent } from './funnel-stripe';
 
-function stripePlans(env: Env): { name: string; priceId: string }[] {
+function stripePlans(
+  env: Env,
+): { name: string; priceId: string; freeTrial?: { days: number } }[] {
   return [
+    // Starter carries a short card-required trial: value lands in the first
+    // session (connect → remember → recall), so the trial converts fast; the
+    // plugin marks the subscription `trialing`, which getActivePlanName treats
+    // as active and /billing/status counts as paid.
+    { name: 'starter', priceId: env.STRIPE_PRICE_STARTER, freeTrial: { days: 3 } },
     { name: 'pro', priceId: env.STRIPE_PRICE_PRO },
     { name: 'scale', priceId: env.STRIPE_PRICE_SCALE },
   ].filter((p) => p.priceId);
