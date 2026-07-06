@@ -49,14 +49,40 @@ export async function getActivePlanName(orgId: string): Promise<PlanName> {
     [orgId],
   ).catch(() => null); // subscription table may not exist before BA migration
 
-  const name = (row?.plan ?? 'free').toLowerCase();
-  return (PLAN_ORDER as readonly string[]).includes(name)
-    ? (name as PlanName)
-    : 'free';
+  const name = (row?.plan ?? '').toLowerCase();
+  if ((PLAN_ORDER as readonly string[]).includes(name) && name !== 'free') {
+    return name as PlanName; // active/trialing paid subscription
+  }
+
+  // No active paid subscription — check the local 7-day no-card trial, which grants Pro
+  // (org.trialEndsAt, set at org creation). Expired/absent ⇒ the free floor.
+  const trial = await queryOne<{ trialEndsAt: string | null }>(
+    `SELECT "trialEndsAt" FROM "organization" WHERE id = $1`,
+    [orgId],
+  ).catch(() => null);
+  if (trial?.trialEndsAt && Date.parse(trial.trialEndsAt) > Date.now()) {
+    return 'pro';
+  }
+  return 'free';
 }
 
 export async function getActivePlan(orgId: string): Promise<Plan> {
   return getPlan(await getActivePlanName(orgId));
+}
+
+/**
+ * True if the org has an active PAID Stripe subscription (a real sub with a Stripe id, not a
+ * local no-card trial). Paid orgs meter compute overage instead of pausing at envelope-zero;
+ * trial/free orgs (no Stripe sub) pause. See credits.hasCredit + lib/metering.
+ */
+export async function hasActivePaidSubscription(orgId: string): Promise<boolean> {
+  const row = await queryOne<{ one: number }>(
+    `SELECT 1 AS one FROM "subscription"
+      WHERE "referenceId" = $1 AND status IN ('active','trialing') AND "stripeSubscriptionId" IS NOT NULL
+      LIMIT 1`,
+    [orgId],
+  ).catch(() => null);
+  return !!row;
 }
 
 function rank(name: PlanName): number {
@@ -108,6 +134,6 @@ export async function requireEntitlement(
 ): Promise<void> {
   const current = await getActivePlanName(orgId);
   if (getPlan(current).entitlements[key]) return;
-  const min = (PLAN_ORDER.find((n) => getPlan(n).entitlements[key]) ?? 'enterprise') as PlanName;
+  const min = (PLAN_ORDER.find((n) => getPlan(n).entitlements[key]) ?? 'scale') as PlanName;
   throw new UpgradeRequiredError(min, current);
 }

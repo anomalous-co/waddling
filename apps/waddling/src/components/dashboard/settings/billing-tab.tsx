@@ -2,8 +2,13 @@
 
 /**
  * Billing settings — extracted from the former /dashboard/billing page so it renders as
- * the "Billing" tab of the unified settings page, plus the prepaid-credit balance +
- * top-up UI (control-api already returns `credit` + `creditPacks`).
+ * the "Billing" tab of the unified settings page.
+ *
+ * Model: flat monthly base fee (Free/Pro/Max/Scale) that includes an envelope of storage
+ * + compute-hours, then metered overage on top. The `credit` balance the API returns is the
+ * remaining included-compute envelope for the month (read-only) — NOT a prepaid top-up
+ * balance. New orgs start on a local 7-day, no-card trial that grants full Pro access; the
+ * conversion path is "add a card to keep Pro".
  *
  * Loads its own data on mount. Because Radix <TabsContent> unmounts inactive tabs, this
  * fetch (and the `upgrade_viewed` PostHog event GET /api/cp/billing fires for free orgs)
@@ -29,10 +34,13 @@ import { Empty, EmptyHeader, EmptyTitle, EmptyDescription } from '@/components/u
 import { StatusBadge } from '@/components/dashboard/status';
 import { fetchCp, cpPost } from '@/components/dashboard/fetch';
 import { authClient } from '@/lib/auth-client';
+import { stripeConfigured } from '@/lib/stripe';
+import { UpgradeDialog } from '@/components/dashboard/settings/upgrade-dialog';
+import { ManageSubscriptionDialog } from '@/components/dashboard/settings/manage-subscription-dialog';
 import { toast } from 'sonner';
 
 interface PlanInfo {
-  name: 'free' | 'pro' | 'scale' | 'enterprise';
+  name: 'free' | 'pro' | 'max' | 'scale';
   status: 'active' | 'past_due' | 'canceled' | 'trialing';
   currentPeriodEnd?: string;
   cancelAtPeriodEnd?: boolean;
@@ -51,20 +59,17 @@ interface BillingActions {
   cancel: string;
   list: string;
 }
-interface CreditPack {
-  id: string;
-  label: string;
-  usd: number;
-}
 interface BillingData {
   plan: PlanInfo;
   entitlements: Record<string, unknown>;
   invoices: Invoice[];
+  // Local 7-day no-card trial (grants full Pro access). `endsAt` is null off-trial.
+  trial?: { endsAt: string | null; active: boolean };
   // Complimentary "free forever" org (company domain) — suppresses paywalls.
   comped?: boolean;
-  // Prepaid credit balance + buyable packs (added in control-api billing.ts).
+  // Remaining included-compute envelope for the month (drawn down per-second as agents
+  // run). Read-only — the prepaid top-up product is retired.
   credit: { balanceMicro: number; balanceUsd: number };
-  creditPacks: CreditPack[];
   subscription: {
     plan: string | null;
     status: string | null;
@@ -77,18 +82,48 @@ interface BillingData {
 }
 
 const PLAN_FEATURES: Record<string, string[]> = {
-  free: ['1 data lake', '2 agents', 'Audit & monitor (read-only)', 'Static reader/writer roles', 'Community support'],
-  pro: ['Up to 5 data lakes', '25 agents', 'Full dynamic ACL (column/row/window rules)', 'Instant revocation', 'Internal MCP admin server', '90-day audit retention', 'Email support'],
-  scale: ['Unlimited data lakes', 'Unlimited agents', 'Everything in Pro, uncapped', '1-year audit retention', 'Priority email support'],
-  enterprise: ['Everything in Scale', 'Dedicated isolated gateways', 'Dedicated encrypted R2 buckets', 'SSO / SAML', 'Uptime SLA', 'Priority support + onboarding'],
+  free: [
+    '1 seat',
+    '1 data lake',
+    '5 GB storage included',
+    '5 compute-hours / mo included',
+    'Full dynamic ACLs',
+    '7-day audit retention',
+  ],
+  pro: [
+    '3 seats',
+    '2 data lakes',
+    '50 GB storage included',
+    '25 compute-hours / mo included',
+    'Full dynamic ACLs',
+    '30-day audit retention',
+  ],
+  max: [
+    '10 seats',
+    '10 data lakes',
+    '500 GB storage included',
+    '75 compute-hours / mo included',
+    'Full dynamic ACLs',
+    'Internal MCP admin server',
+    '90-day audit retention',
+  ],
+  scale: [
+    'Unlimited seats',
+    'Unlimited data lakes',
+    '2 TB storage included',
+    '200 compute-hours / mo included',
+    'Full dynamic ACLs',
+    'Internal MCP admin server',
+    '365-day audit retention',
+  ],
 };
 
 // Per-plan monthly price label for the comparison grid + CTAs.
 const PLAN_PRICE: Record<string, string> = {
   free: '$0',
-  pro: '$49 / mo',
-  scale: '$199 / mo',
-  enterprise: 'Contact us',
+  pro: '$29 / mo',
+  max: '$99 / mo',
+  scale: '$299 / mo',
 };
 
 function BillingSkeleton() {
@@ -101,42 +136,46 @@ function BillingSkeleton() {
   );
 }
 
-function CreditsCard({
-  balanceUsd,
-  packs,
-  onBuy,
-  busy,
-}: {
-  balanceUsd: number;
-  packs: CreditPack[];
-  onBuy: (packId: string) => void;
-  busy: boolean;
-}) {
+// Duckling (baseline size) compute price — used to express the remaining envelope in hours.
+const DUCKLING_PRICE_PER_HR = 0.55;
+
+function IncludedComputeCard({ balanceUsd }: { balanceUsd: number }) {
+  const hours = balanceUsd / DUCKLING_PRICE_PER_HR;
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Credits</CardTitle>
-        <CardDescription>Prepaid balance, drawn down as your agents run.</CardDescription>
+        <CardTitle>Included compute</CardTitle>
+        <CardDescription>
+          Your plan&apos;s included compute envelope for this month, drawn down as your agents run.
+        </CardDescription>
       </CardHeader>
-      <CardContent className="flex flex-col gap-4">
+      <CardContent className="flex flex-col gap-2">
         <div className="text-3xl font-semibold tabular-nums">
           {balanceUsd.toLocaleString('en-US', { style: 'currency', currency: 'USD' })}
+          <span className="ml-2 text-base font-normal text-muted-foreground">of compute included this month</span>
         </div>
-        {packs.length === 0 ? (
-          <p className="text-sm text-muted-foreground">Credit packs aren&apos;t available yet.</p>
-        ) : (
-          <div className="flex flex-wrap gap-2">
-            {packs.map((p) => (
-              <Button key={p.id} variant="outline" disabled={busy} onClick={() => onBuy(p.id)}>
-                Add ${p.usd}
-              </Button>
-            ))}
-          </div>
-        )}
+        <div className="text-sm text-muted-foreground tabular-nums">
+          ≈ {hours.toLocaleString('en-US', { maximumFractionDigits: 1 })} Duckling-hours remaining
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Usage is metered: $0.55 / compute-hour (Duckling) scaling up the size ladder, storage $0.04 / GB over your
+          included cap.
+        </p>
       </CardContent>
     </Card>
   );
 }
+
+// Human labels for the (camelCase) entitlement keys the API returns.
+const ENTITLEMENT_LABELS: Record<string, string> = {
+  seats: 'Seats',
+  lakes: 'Data lakes',
+  storageGb: 'Storage (GB)',
+  includedComputeHours: 'Included compute (hrs)',
+  dynamicAcl: 'Dynamic ACLs',
+  adminMcp: 'Internal MCP admin server',
+  auditRetentionDays: 'Audit retention (days)',
+};
 
 function EntitlementsCard({ entitlements }: { entitlements: Record<string, unknown> }) {
   const entries = Object.entries(entitlements);
@@ -165,7 +204,9 @@ function EntitlementsCard({ entitlements }: { entitlements: Record<string, unkno
             <TableBody>
               {entries.map(([key, val]) => (
                 <TableRow key={key}>
-                  <TableCell className="capitalize text-muted-foreground">{key.replace(/_/g, ' ')}</TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {ENTITLEMENT_LABELS[key] ?? key.replace(/_/g, ' ')}
+                  </TableCell>
                   <TableCell className="font-mono text-xs">{String(val)}</TableCell>
                 </TableRow>
               ))}
@@ -229,32 +270,39 @@ function InvoicesCard({ invoices }: { invoices: Invoice[] }) {
   );
 }
 
+const PLAN_LABEL: Record<'free' | 'pro' | 'max' | 'scale', string> = {
+  free: 'Free',
+  pro: 'Pro',
+  max: 'Max',
+  scale: 'Scale',
+};
+
 function PlanComparisonCard({
   currentPlan,
   onUpgrade,
 }: {
   currentPlan: string;
-  onUpgrade: (plan: 'pro' | 'scale') => void;
+  onUpgrade: (plan: 'pro' | 'max' | 'scale') => void;
 }) {
   return (
     <Card>
       <CardHeader>
         <CardTitle>Compare plans</CardTitle>
-        <CardDescription>Upgrade to unlock more data lakes, agents, and ACL power.</CardDescription>
+        <CardDescription>Upgrade to unlock more seats, data lakes, storage, and included compute.</CardDescription>
       </CardHeader>
       <CardContent>
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          {(['free', 'pro', 'scale', 'enterprise'] as const).map((name) => {
+          {(['free', 'pro', 'max', 'scale'] as const).map((name) => {
             const isCurrent = name === currentPlan;
             const isPro = name === 'pro';
-            const isSelfServePaid = name === 'pro' || name === 'scale';
+            const isSelfServePaid = name === 'pro' || name === 'max' || name === 'scale';
             return (
               <div
                 key={name}
                 className={`flex flex-col gap-3 rounded-lg border p-4 ${isPro ? 'border-primary/50 ring-1 ring-primary/20' : 'border-border'}`}
               >
                 <div className="flex items-center justify-between">
-                  <span className="font-semibold capitalize">{name}</span>
+                  <span className="font-semibold">{PLAN_LABEL[name]}</span>
                   <Badge variant={isPro ? 'default' : 'outline'}>{PLAN_PRICE[name]}</Badge>
                 </div>
                 <ul className="flex flex-col gap-1.5">
@@ -271,11 +319,7 @@ function PlanComparisonCard({
                   </Badge>
                 ) : isSelfServePaid ? (
                   <Button size="sm" onClick={() => onUpgrade(name)}>
-                    Upgrade to {name === 'pro' ? 'Pro' : 'Scale'}
-                  </Button>
-                ) : name === 'enterprise' ? (
-                  <Button size="sm" variant="outline" asChild>
-                    <a href="https://getwaddling.com/enterprise">Contact sales</a>
+                    Upgrade to {PLAN_LABEL[name]}
                   </Button>
                 ) : null}
               </div>
@@ -293,7 +337,10 @@ export function BillingTab() {
   const [orgId, setOrgId] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
+  // The plan whose embedded-checkout dialog is open (null = closed).
+  const [upgradePlan, setUpgradePlan] = useState<'pro' | 'max' | 'scale' | null>(null);
+  // Manage-subscription modal (existing subscribers: switch tier / cancel).
+  const [manageOpen, setManageOpen] = useState(false);
 
   const load = useCallback(async () => {
     const res = await fetchCp<BillingData>('/api/cp/billing');
@@ -322,26 +369,47 @@ export function BillingTab() {
     });
   }, [load]);
 
-  // Returned from a credit-pack Checkout — the webhook grants async, so reload shortly.
+  // Returned from an SCA redirect (return_url). The webhook flips the subscription
+  // active asynchronously — and SCA is where webhook timing is least predictable — so
+  // poll billing until it lands rather than a single reload.
   useEffect(() => {
-    if (params.get('topup') === 'success') {
-      toast.success('Payment received — updating your balance…');
-      const t = setTimeout(() => void load(), 2500);
-      return () => clearTimeout(t);
-    }
-  }, [params, load]);
+    if (params.get('sub') !== 'success') return;
+    let active = true;
+    toast.success('Payment received — activating your subscription…');
+    void (async () => {
+      for (let i = 0; i < 15 && active; i += 1) {
+        const res = await fetchCp<BillingData>('/api/cp/billing');
+        if (!active) return;
+        if (res.ok) {
+          setData(res.data);
+          const status = res.data.subscription?.status;
+          if (status === 'active' || status === 'trialing') return;
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [params]);
 
-  const subscribe = useCallback(async (plan: 'pro' | 'scale' = 'pro') => {
+  /**
+   * Hosted-Checkout fallback (Better Auth plugin). Used only when Stripe.js isn't
+   * configured for this deployment (no publishable key) — otherwise the embedded
+   * Elements dialog handles the free→paid conversion.
+   */
+  const subscribeHosted = useCallback(async (plan: 'pro' | 'max' | 'scale' = 'pro') => {
     if (!orgId) {
       toast.error('No active organization to bill.');
       return;
     }
-    // Conversion-funnel ping (best-effort, server-side, non-spoofable).
     await cpPost('/billing/checkout-intent', { toPlan: plan }).catch(() => {});
     const origin = window.location.origin;
     const res = (await authClient.subscription.upgrade({
       plan,
       referenceId: orgId,
+      // Org-scoped customer (matches the embedded flow) — one Stripe customer per org.
+      customerType: 'organization',
       successUrl: `${origin}/settings?tab=billing`,
       cancelUrl: `${origin}/settings?tab=billing`,
     })) as unknown as { data?: { url?: string }; error?: { message?: string } };
@@ -352,19 +420,17 @@ export function BillingTab() {
     if (res?.data?.url) window.location.assign(res.data.url);
   }, [orgId]);
 
-  const buyPack = useCallback(async (packId: string) => {
-    setBusy(true);
-    const res = await cpPost<{ url: string }>('/api/cp/billing/credit-pack', {
-      packId,
-      returnPath: '/settings?tab=billing',
-    });
-    setBusy(false);
-    if (!res.ok) {
-      toast.error(res.error === 'billing_not_configured' ? 'Credit packs are not configured yet.' : res.error);
+  /** Start an upgrade: embedded Elements dialog when configured, else hosted redirect. */
+  const startUpgrade = useCallback((plan: 'pro' | 'max' | 'scale') => {
+    if (!orgId) {
+      toast.error('No active organization to bill.');
       return;
     }
-    window.location.assign(res.data.url);
-  }, []);
+    // Fire the funnel ping either way (best-effort, server-side, non-spoofable).
+    void cpPost('/billing/checkout-intent', { toPlan: plan }).catch(() => {});
+    if (stripeConfigured) setUpgradePlan(plan);
+    else void subscribeHosted(plan);
+  }, [orgId, subscribeHosted]);
 
   if (loading) return <BillingSkeleton />;
 
@@ -392,10 +458,15 @@ export function BillingTab() {
   if (!data) return null;
 
   const comped = !!data.comped;
-  const isFree = data.plan.name === 'free';
-  // 'scale' is self-serve, so it gets the Stripe customer portal like pro. Enterprise
-  // is sales-led (no portal); it never reaches this surface via self-serve checkout.
-  const isPaidPlan = data.plan.name === 'pro' || data.plan.name === 'scale';
+  const trialActive = !!data.trial?.active;
+  // Whole days left in the local no-card trial (rounded up), for the banner readout.
+  const trialDaysLeft = data.trial?.endsAt
+    ? Math.max(0, Math.ceil((new Date(data.trial.endsAt).getTime() - Date.now()) / 86_400_000))
+    : 0;
+  // Gate "Manage subscription" on the authoritative signal: a real Stripe subscription.
+  // This is null on Free AND during a local no-card trial (which grants Pro entitlements
+  // with no Stripe sub), so trial orgs correctly see the convert CTA, not manage/cancel.
+  const isSubscribed = !!data.subscription;
 
   return (
     <div className="flex flex-col gap-6">
@@ -414,11 +485,31 @@ export function BillingTab() {
         </Card>
       ) : null}
 
+      {/* Trial banner — local 7-day no-card trial that grants full Pro access. No card was
+          collected at signup, so this is the conversion surface. */}
+      {trialActive && !comped ? (
+        <Card className="border-primary/50 ring-1 ring-primary/20">
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <CardTitle>Free trial — {trialDaysLeft} {trialDaysLeft === 1 ? 'day' : 'days'} left</CardTitle>
+              <Badge>Full Pro access</Badge>
+            </div>
+            <CardDescription>
+              You have full Pro access during your trial. Add a card before it ends to keep Pro without
+              interruption.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button onClick={() => startUpgrade('pro')}>Add a card to keep Pro</Button>
+          </CardContent>
+        </Card>
+      ) : null}
+
       {/* Current plan */}
       <Card>
         <CardHeader>
           <div className="flex items-center gap-3">
-            <CardTitle className="capitalize">{data.plan.name} plan</CardTitle>
+            <CardTitle>{PLAN_LABEL[data.plan.name]} plan</CardTitle>
             <StatusBadge status={data.plan.status} />
           </div>
           <CardDescription>
@@ -431,42 +522,68 @@ export function BillingTab() {
         {!comped ? (
           <CardContent>
             <div className="flex flex-wrap gap-2">
-              {isFree ? <Button onClick={() => void subscribe('pro')}>Upgrade to Pro — $49/mo</Button> : null}
-              {isFree ? (
-                <Button variant="outline" onClick={() => void subscribe('scale')}>
-                  Upgrade to Scale — $199/mo
-                </Button>
-              ) : null}
-              {isPaidPlan ? (
-                <Button variant="outline" onClick={() => window.location.assign(data.actions.portal)}>
-                  Manage subscription
-                </Button>
-              ) : null}
-              {isFree ? (
-                <Button variant="outline" asChild>
-                  <a href="https://getwaddling.com/enterprise">Contact sales — Enterprise</a>
-                </Button>
-              ) : null}
+              {/* No Stripe subscription yet (Free or on a local trial) → embedded Payment
+                  Element (Elements dialog). On trial the primary "Add a card to keep Pro"
+                  CTA lives in the banner above; here we offer the fuller ladder. */}
+              {!isSubscribed ? (
+                <>
+                  <Button onClick={() => startUpgrade('pro')}>Upgrade to Pro — $29/mo</Button>
+                  <Button variant="outline" onClick={() => startUpgrade('max')}>
+                    Upgrade to Max — $99/mo
+                  </Button>
+                  <Button variant="outline" onClick={() => startUpgrade('scale')}>
+                    Upgrade to Scale — $299/mo
+                  </Button>
+                </>
+              ) : (
+                /* Existing subscriber: manage subscription in-app — switch plan / cancel. */
+                <Button onClick={() => setManageOpen(true)}>Manage subscription</Button>
+              )}
             </div>
           </CardContent>
         ) : null}
       </Card>
 
-      {/* Prepaid credits + top-up (hidden for comped orgs) */}
-      {!comped ? (
-        <CreditsCard balanceUsd={data.credit?.balanceUsd ?? 0} packs={data.creditPacks ?? []} onBuy={(id) => void buyPack(id)} busy={busy} />
-      ) : null}
+      {/* Included-compute envelope (read-only; hidden for comped orgs) */}
+      {!comped ? <IncludedComputeCard balanceUsd={data.credit?.balanceUsd ?? 0} /> : null}
 
       {/* Entitlements */}
       <EntitlementsCard entitlements={data.entitlements} />
 
-      {/* Plan comparison (free upsell only; not for comped) */}
-      {isFree && !comped ? (
-        <PlanComparisonCard currentPlan={data.plan.name} onUpgrade={(p) => void subscribe(p)} />
+      {/* Plan comparison (upsell for orgs without a subscription; not for comped) */}
+      {!isSubscribed && !comped ? (
+        <PlanComparisonCard currentPlan={data.plan.name} onUpgrade={startUpgrade} />
       ) : null}
 
       {/* Invoices */}
       <InvoicesCard invoices={data.invoices ?? []} />
+
+      {/* Embedded Stripe Elements upgrade (free→paid). */}
+      <UpgradeDialog
+        plan={upgradePlan}
+        onClose={() => setUpgradePlan(null)}
+        onSuccess={(plan) => {
+          setUpgradePlan(null);
+          toast.success(`You're now on ${PLAN_LABEL[plan]}.`);
+          void load();
+        }}
+      />
+
+      {/* Manage subscription (existing subscribers): in-app switch/cancel, no hosted portal. */}
+      {isSubscribed ? (
+        <ManageSubscriptionDialog
+          open={manageOpen}
+          plan={data.plan.name as 'pro' | 'max' | 'scale'}
+          status={data.plan.status}
+          periodEnd={data.plan.currentPeriodEnd}
+          onClose={() => setManageOpen(false)}
+          onChanged={(message) => {
+            setManageOpen(false);
+            toast.success(message);
+            void load();
+          }}
+        />
+      ) : null}
     </div>
   );
 }

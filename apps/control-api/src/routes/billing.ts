@@ -41,7 +41,7 @@ interface SubRow {
 
 /** Mirrors the dashboard billing page's PlanInfo / Invoice shapes. */
 interface PlanInfo {
-  name: 'free' | 'starter' | 'pro' | 'scale' | 'enterprise';
+  name: 'free' | 'pro' | 'max' | 'scale';
   status: 'active' | 'past_due' | 'canceled' | 'trialing';
   currentPeriodEnd?: string;
   cancelAtPeriodEnd?: boolean;
@@ -94,14 +94,25 @@ billing.get('/', (c) =>
       cancelAtPeriodEnd: sub?.cancelAtPeriodEnd ?? false,
     };
 
-    // Prepaid credit balance + the purchasable packs, for the top-up surface.
+    // Included-compute envelope remaining (µUSD ledger balance, re-denominated).
     const balanceMicro = await getBalanceMicro(caller.orgId);
     const comped = await isOrgComped(caller.orgId);
+
+    // Local 7-day no-card trial (grants Pro). `active` ⇒ show "trial — N days left" and the
+    // "add a card to keep Pro" conversion CTA; there is no Stripe subscription yet.
+    const trialRow = await queryOne<{ trialEndsAt: string | null }>(
+      `SELECT "trialEndsAt" FROM "organization" WHERE id = $1`,
+      [caller.orgId],
+    ).catch(() => null);
+    const trialEndsAt = trialRow?.trialEndsAt ?? null;
+    const trialActive = !!trialEndsAt && Date.parse(trialEndsAt) > Date.now() && !sub;
+
     return ok(c, {
       plan: planInfo,
       entitlements: plan.entitlements,
       invoices: [] as Invoice[],
       comped,
+      trial: { endsAt: trialEndsAt, active: trialActive },
       credit: { balanceMicro, balanceUsd: balanceMicro / MICRO_PER_USD },
       creditPacks: availablePacks(c.env),
       subscription: sub
@@ -145,11 +156,7 @@ billing.get('/status', (c) =>
     // Complimentary orgs (company domains) are free forever — paid regardless of plan.
     const comped = await isOrgComped(caller.orgId);
     const planName = await getActivePlanName(caller.orgId);
-    const subscribed =
-      planName === 'starter' ||
-      planName === 'pro' ||
-      planName === 'scale' ||
-      planName === 'enterprise';
+    const subscribed = planName !== 'free';
     const boughtPack = await queryOne<{ one: number }>(
       `SELECT 1 AS one FROM waddling.credit_ledger
         WHERE org_id = $1 AND reason = 'credit_pack' LIMIT 1`,
@@ -214,8 +221,231 @@ billing.post('/credit-pack', (c) =>
   }),
 );
 
-// Only the self-serve paid tiers reach Checkout; enterprise is contact-us.
-const CheckoutIntentSchema = z.object({ toPlan: z.enum(['starter', 'pro', 'scale']) });
+// ── Embedded subscription checkout (Stripe Elements) ─────────────────────────
+//
+// The @better-auth/stripe plugin only speaks HOSTED Checkout (returns a redirect
+// url). To mount a Payment Element IN-PAGE we create the Stripe subscription here
+// and hand back a client secret for the Element to confirm. Reconciliation into the
+// `subscription` row that entitlements read is the plugin's: we mint + persist
+// organization.stripeCustomerId, then create the subscription on that org customer
+// with a configured plan price, so the plugin's `customer.subscription.created`
+// webhook resolves the org (findReferenceByStripeCustomerId, enabled by the stripe
+// plugin's `organization: { enabled: true }` option) and writes the row. Portal /
+// cancel / plan-switch stay on the plugin; only the free→paid card entry is embedded.
+
+const SubscriptionCheckoutSchema = z.object({ plan: z.enum(['pro', 'max', 'scale']) });
+
+type SelfServePlan = 'pro' | 'max' | 'scale';
+
+function priceForPlan(env: Env, plan: SelfServePlan): string {
+  return { pro: env.STRIPE_PRICE_PRO, max: env.STRIPE_PRICE_MAX, scale: env.STRIPE_PRICE_SCALE }[plan];
+}
+
+/** Metered subscription items (compute + storage overage) attached alongside the base price.
+ *  Metered ⇒ no upfront charge; usage is reported to their Billing Meters. Skipped when a
+ *  price id is unset/placeholder so a partially-configured env still creates the base sub. */
+function meteredItems(env: Env): { price: string }[] {
+  const items: { price: string }[] = [];
+  for (const p of [env.STRIPE_PRICE_COMPUTE, env.STRIPE_PRICE_STORAGE]) {
+    if (p && !/placeholder/i.test(p)) items.push({ price: p });
+  }
+  return items;
+}
+
+/** billing-manage = org owner/admin (mirrors the plugin's authorizeReference). */
+async function isBillingManager(caller: { callerId: string; orgId: string }): Promise<boolean> {
+  const row = await queryOne<{ role: string }>(
+    `SELECT role FROM "member" WHERE "userId" = $1 AND "organizationId" = $2`,
+    [caller.callerId, caller.orgId],
+  ).catch(() => null);
+  return !!row && (row.role === 'owner' || row.role === 'admin');
+}
+
+/** The org's live subscription (active/trialing) Stripe id, or null. */
+async function activeSubscriptionId(orgId: string): Promise<string | null> {
+  const row = await queryOne<{ stripeSubscriptionId: string | null }>(
+    `SELECT "stripeSubscriptionId" FROM "subscription"
+      WHERE "referenceId" = $1 AND status IN ('active','trialing')
+      ORDER BY "periodEnd" DESC NULLS LAST LIMIT 1`,
+    [orgId],
+  ).catch(() => null);
+  return row?.stripeSubscriptionId ?? null;
+}
+
+/**
+ * Return the org's Stripe customer id, minting + persisting one if absent. Mirrors
+ * the plugin's own customer creation (metadata.referenceId is what
+ * findReferenceByStripeCustomerId resolves back to). The conditional UPDATE guards
+ * against two concurrent create calls double-minting: the loser deletes its extra
+ * customer and adopts the winner's.
+ */
+async function ensureOrgStripeCustomer(
+  stripe: Stripe,
+  orgId: string,
+): Promise<string> {
+  const row = await queryOne<{ stripeCustomerId: string | null; name: string | null }>(
+    `SELECT "stripeCustomerId", name FROM "organization" WHERE id = $1`,
+    [orgId],
+  ).catch(() => null);
+  if (row?.stripeCustomerId) return row.stripeCustomerId;
+
+  const customer = await stripe.customers.create({
+    name: row?.name ?? undefined,
+    metadata: { referenceId: orgId, organizationId: orgId },
+  });
+  const won = await queryOne<{ stripeCustomerId: string | null }>(
+    `UPDATE "organization" SET "stripeCustomerId" = $1
+       WHERE id = $2 AND "stripeCustomerId" IS NULL
+       RETURNING "stripeCustomerId"`,
+    [customer.id, orgId],
+  ).catch(() => null);
+  if (won?.stripeCustomerId) return won.stripeCustomerId;
+
+  // Lost the race (or no org row): adopt whoever won and discard our extra customer.
+  const winner = await queryOne<{ stripeCustomerId: string | null }>(
+    `SELECT "stripeCustomerId" FROM "organization" WHERE id = $1`,
+    [orgId],
+  ).catch(() => null);
+  if (winner?.stripeCustomerId && winner.stripeCustomerId !== customer.id) {
+    await stripe.customers.del(customer.id).catch(() => {});
+    return winner.stripeCustomerId;
+  }
+  return customer.id;
+}
+
+/**
+ * POST /subscription-checkout — create an unconfirmed subscription and return the
+ * client secret for an in-page Payment/Setup Element to confirm.
+ *
+ * Owner/admin only. Free/trial→paid conversion ONLY: if the org already has an active or
+ * trialing Stripe subscription this 409s (plan switches go through /subscription-change,
+ * which needs no new card). Returns the first invoice's PaymentIntent client secret for an
+ * in-page Payment Element to confirm. The 7-day trial is LOCAL (org.trialEndsAt) — there is
+ * no Stripe trial subscription, so this always creates a real, immediately-charged sub.
+ */
+billing.post('/subscription-checkout', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    if (!(await isBillingManager(caller))) {
+      return err(c, 'forbidden', 403, 'Only an organization owner or admin can manage billing.');
+    }
+
+    const { plan } = await parseBody(c, SubscriptionCheckoutSchema);
+    const priceId = priceForPlan(c.env, plan);
+    if (!priceId || /placeholder/i.test(priceId)) {
+      return err(c, 'billing_not_configured', 409, `No Stripe price configured for the ${plan} plan.`);
+    }
+
+    // Double-billing guard — check the ENTITLEMENTS source of truth, not Stripe. A
+    // legacy org that subscribed via the old hosted flow has a user-scoped customer,
+    // so a Stripe list on the org customer would miss it and we'd create a second live
+    // subscription. The `subscription` row (referenceId=orgId) spans every customer scope.
+    const live = await queryOne<{ one: number }>(
+      `SELECT 1 AS one FROM "subscription"
+        WHERE "referenceId" = $1 AND status IN ('active','trialing') LIMIT 1`,
+      [caller.orgId],
+    ).catch(() => null);
+    if (live) {
+      return err(c, 'already_subscribed', 409, 'This organization already has an active subscription.');
+    }
+
+    const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { httpClient: Stripe.createFetchHttpClient() });
+    const customerId = await ensureOrgStripeCustomer(stripe, caller.orgId);
+
+    // Sweep abandoned incompletes on the org customer so retries don't stack duplicates.
+    const existing = await stripe.subscriptions.list({ customer: customerId, status: 'incomplete', limit: 20 });
+    for (const s of existing.data) {
+      await stripe.subscriptions.cancel(s.id).catch(() => {});
+    }
+
+    const sub = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{ price: priceId }, ...meteredItems(c.env)],
+      payment_behavior: 'default_incomplete',
+      payment_settings: { save_default_payment_method: 'on_subscription' },
+      expand: ['latest_invoice.confirmation_secret', 'pending_setup_intent'],
+      metadata: { referenceId: caller.orgId },
+    });
+
+    const invoice = sub.latest_invoice;
+    const clientSecret =
+      invoice && typeof invoice === 'object' ? invoice.confirmation_secret?.client_secret ?? null : null;
+    if (!clientSecret) {
+      return err(c, 'stripe_no_payment_intent', 502, 'Stripe returned no payment intent for the subscription.');
+    }
+    return ok(c, { type: 'payment' as const, clientSecret, subscriptionId: sub.id });
+  }),
+);
+
+// ── Manage an existing subscription (in-app modal, no hosted portal) ─────────
+const SubscriptionChangeSchema = z.object({ plan: z.enum(['pro', 'max', 'scale']) });
+
+/**
+ * POST /subscription-change — switch an existing subscription to a higher tier.
+ *
+ * Owner/admin only. The card is already on file, so no Elements — we update the
+ * Stripe subscription item to the new price with proration. During a trial there's
+ * no immediate charge (the plan just changes and the trial continues); on an active
+ * sub Stripe prorates against the saved card. The plugin's `onSubscriptionUpdated`
+ * webhook reconciles the new plan into the local row that entitlements read.
+ */
+billing.post('/subscription-change', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    if (!(await isBillingManager(caller))) {
+      return err(c, 'forbidden', 403, 'Only an organization owner or admin can manage billing.');
+    }
+    const { plan } = await parseBody(c, SubscriptionChangeSchema);
+    const priceId = priceForPlan(c.env, plan);
+    if (!priceId || /placeholder/i.test(priceId)) {
+      return err(c, 'billing_not_configured', 409, `No Stripe price configured for the ${plan} plan.`);
+    }
+    const subId = await activeSubscriptionId(caller.orgId);
+    if (!subId) {
+      return err(c, 'no_subscription', 409, 'This organization has no active subscription to change.');
+    }
+
+    const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { httpClient: Stripe.createFetchHttpClient() });
+    const sub = await stripe.subscriptions.retrieve(subId);
+    // The BASE (licensed) item — NOT a metered item. A sub carries base + compute + storage
+    // items; only the base price is swapped on a tier change, leaving the meters attached.
+    const baseItem =
+      sub.items.data.find((it) => it.price?.recurring?.usage_type !== 'metered') ?? sub.items.data[0];
+    if (!baseItem?.id) return err(c, 'stripe_no_item', 502, 'Subscription has no base line item to update.');
+    if (baseItem.price?.id === priceId) {
+      return err(c, 'already_on_plan', 409, `Already on the ${plan} plan.`);
+    }
+
+    await stripe.subscriptions.update(subId, {
+      items: [{ id: baseItem.id, price: priceId }],
+      proration_behavior: 'create_prorations',
+    });
+    return ok(c, { ok: true, plan });
+  }),
+);
+
+/**
+ * POST /subscription-cancel — cancel at period end (keeps access through the paid
+ * period). Owner/admin only. The webhook reflects cancelAtPeriodEnd into the row.
+ */
+billing.post('/subscription-cancel', (c) =>
+  handle(c, async () => {
+    const caller = await resolveCaller(c);
+    if (!(await isBillingManager(caller))) {
+      return err(c, 'forbidden', 403, 'Only an organization owner or admin can manage billing.');
+    }
+    const subId = await activeSubscriptionId(caller.orgId);
+    if (!subId) {
+      return err(c, 'no_subscription', 409, 'This organization has no active subscription to cancel.');
+    }
+    const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, { httpClient: Stripe.createFetchHttpClient() });
+    await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
+    return ok(c, { ok: true });
+  }),
+);
+
+// The self-serve paid tiers.
+const CheckoutIntentSchema = z.object({ toPlan: z.enum(['pro', 'max', 'scale']) });
 
 /**
  * POST /checkout-intent — record that the user is starting a subscription checkout,

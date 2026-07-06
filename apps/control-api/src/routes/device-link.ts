@@ -23,7 +23,6 @@ import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
 import { buildAuth } from '../lib/auth';
-import { getEntitlements } from '../lib/entitlements';
 import { resolveCaller, parseBody, handle, ok, err, AuthError } from '../lib/cp-shared';
 import { makePostHog } from '../lib/posthog';
 import type { DeviceLinkInit, DeviceLinkClaimResult, DeviceLinkPoll } from '../lib/types';
@@ -198,15 +197,7 @@ deviceLink.post('/claim', (c) =>
 
     const agentName = input.agentName?.trim() || 'claude-code';
 
-    // Agent quota (same gate as /api/cp/agents).
-    const ent = await getEntitlements(orgId);
-    const count = await queryOne<{ n: string }>(
-      `SELECT count(*)::text AS n FROM waddling.agent WHERE org_id = $1 AND status <> 'revoked'`,
-      [orgId],
-    );
-    if (Number(count?.n ?? 0) >= ent.agents) {
-      return err(c, 'agent_quota_exceeded', 402, `Plan allows ${ent.agents} agent(s)`);
-    }
+    // Agents are unbounded (plan sells seats + lakes + compute, not agent count).
 
     // Create the Better Auth API key bound to the org (uses caller's session).
     const created = await buildAuth(c.env).api.createApiKey({

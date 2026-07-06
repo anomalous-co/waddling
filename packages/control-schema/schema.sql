@@ -213,7 +213,8 @@ CREATE TABLE IF NOT EXISTS waddling.agent_session (
   user_agent      TEXT,
   started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at      TIMESTAMPTZ NOT NULL,                   -- = JWT exp
-  ended_at        TIMESTAMPTZ
+  ended_at        TIMESTAMPTZ,
+  compute_size    TEXT NOT NULL DEFAULT 'duckling'        -- COMPUTE_SIZES rung billed for this session
 );
 CREATE INDEX IF NOT EXISTS agent_session_org_status_idx
   ON waddling.agent_session (org_id, status);

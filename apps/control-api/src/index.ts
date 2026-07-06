@@ -22,6 +22,7 @@ import {
   currentBillingPeriod,
   reconcileDebits,
 } from "./lib/credits";
+import { reportComputeOverage } from "./lib/metering";
 import { buildAuth, runMigrations, initAuth } from "./lib/auth";
 import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { makeCrypto, initCrypto } from "./lib/secret-crypto";
@@ -778,7 +779,11 @@ export async function scheduledHandler(env: Env): Promise<void> {
     console.log(`[cron] drainQuackboardEmbeddings failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   try {
-    const n = await sweepExpiredSessions();
+    // Forward each debited session's compute overage (usage past the included envelope) to the
+    // Stripe compute meter — paid orgs only; the reporter no-ops for trial/free (no Stripe sub).
+    const n = await sweepExpiredSessions((orgId, overageMicro, id) =>
+      reportComputeOverage(env, orgId, overageMicro, id),
+    );
     if (n > 0) console.log(`[cron] swept + debited ${n} session(s)`);
   } catch (e) {
     console.log(`[cron] sweepExpiredSessions failed: ${e instanceof Error ? e.message : String(e)}`);

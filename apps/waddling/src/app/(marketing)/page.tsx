@@ -4,15 +4,15 @@ import { appUrl } from '@/lib/site';
 import { LakeScene } from '@/components/lake-scene';
 import { SkyScene } from '@/components/sky-scene';
 import { TrackedLink } from '@/components/tracked-link';
+import { AgentCarousel } from '@/components/agent-carousel';
 import { SwarmMemory } from './swarm-memory';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Card } from '@/components/ui/card';
 
 export const metadata: Metadata = {
-  title: 'waddling — your personal data store',
+  title: 'waddling — the agent native data lake',
   description:
-    'waddling Swarm Memory: a personal data store you own, that your agents remember how to use. Ingest, query, and grow your own corpus — managed, governed, $15/mo.',
+    'A managed DuckDB/DuckLake lake your agents spin up, manage, and maintain themselves — no infrastructure, no glue code. They create tables, ingest, query, and remember; you govern what each one sees. Connections coming soon. Start free, 7 days, no card.',
 };
 
 export default function LandingPage() {
@@ -30,20 +30,30 @@ export default function LandingPage() {
               variant="outline"
               className="mb-6 border-emerald-500/40 bg-emerald-500/10 font-mono text-emerald-600 dark:text-emerald-400"
             >
-              Swarm Memory · managed data lake — $15/mo
+              the agent native data lake · connections coming soon
             </Badge>
             <h1 className="mb-6 font-mono text-4xl font-bold leading-tight tracking-tight sm:text-5xl">
-              Agent Analytics as good as
-              <br className="hidden sm:block" /> its Quacked
-              <span className="text-emerald-500 dark:text-emerald-400"> up to be</span>
+              The Agent Native Data Lake
+              <br className="hidden sm:block" /> as good as its
+              <span className="text-emerald-500 dark:text-emerald-400"> Quacked</span> up to be
             </h1>
             <p className="mb-8 max-w-xl text-base leading-relaxed text-muted-foreground">
-              Your personal data store — a managed lake you own, that your
-              agents remember how to use. They ingest, query, and grow your
-              corpus session after session. No infrastructure to run.
+              A managed DuckDB/DuckLake lake your agents spin up, manage, and
+              maintain themselves — no infrastructure, no glue code. They create
+              tables, ingest, query, and remember; you govern exactly what each
+              one sees. Connections to your own sources coming soon.
             </p>
             <div className="flex flex-wrap gap-3">
               <Button asChild className={BRAND_BTN}>
+                <TrackedLink
+                  href={appUrl('/dashboard')}
+                  location="landing_hero"
+                  text="start free — 7 days, no card"
+                >
+                  start free — 7 days, no card →
+                </TrackedLink>
+              </Button>
+              <Button asChild variant="outline" className="font-mono">
                 <Link href="/docs/quickstart">quickstart →</Link>
               </Button>
               <Button asChild variant="outline" className="font-mono">
@@ -59,83 +69,18 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* The one offer: Swarm Memory at $15/mo */}
-      <SwarmMemory />
-
-      {/* Setup — a single config block is the whole integration */}
+      {/* Agents that connect — infinite marquee */}
       <section className="border-t border-border">
-        <div className="mx-auto max-w-6xl px-6 py-20">
-          <div className="grid grid-cols-1 items-center gap-8 lg:grid-cols-2 lg:gap-12">
-            <div>
-              <h2 className="mb-4 font-mono text-2xl font-bold tracking-tight sm:text-3xl">
-                Set up in one config block
-              </h2>
-              <p className="mb-6 max-w-md leading-relaxed text-muted-foreground">
-                Paste this into your MCP host config and every agent in the
-                swarm shares the same lake. waddling handles auth, sessions,
-                and per-agent policy — your agents never see a credential.
-              </p>
-              <Link
-                href="/docs/quickstart"
-                className="font-mono text-sm text-emerald-600 transition-colors hover:text-emerald-500 dark:text-emerald-400 dark:hover:text-emerald-300"
-              >
-                full quickstart guide →
-              </Link>
-            </div>
-            <Card className="gap-0 overflow-hidden py-0">
-              <div className="border-b border-border px-4 py-2 font-mono text-xs text-muted-foreground">
-                .mcp.json — remote server, nothing to install
-              </div>
-              <pre className="overflow-x-auto whitespace-pre-wrap p-4 font-mono text-xs text-muted-foreground">
-                {`{
-  "mcpServers": {
-    "waddling": {
-      "type": "http",
-      "url": "https://api.getwaddling.com/mcp",
-      "headers": { "Authorization": "Bearer sk_agent_…" }
-    }
-  }
-}
-
-// or one line in Claude Code:
-// claude mcp add --transport http waddling \\
-//   https://api.getwaddling.com/mcp \\
-//   --header "Authorization: Bearer sk_agent_…"`}
-              </pre>
-            </Card>
-          </div>
-        </div>
-      </section>
-
-      {/* CTA */}
-      <section className="border-t border-border">
-        <div className="mx-auto max-w-6xl px-6 py-20 text-center">
-          <h2 className="mb-4 font-mono text-3xl font-bold">
-            your agents forget everything.
-            <span className="text-emerald-500 dark:text-emerald-400"> fix that for $15.</span>
-          </h2>
-          <p className="mx-auto mb-8 max-w-xl text-muted-foreground">
-            Swarm Memory is one managed data lake your whole swarm reads,
-            writes, and remembers in. Set up in minutes, cancel anytime.
+        <div className="mx-auto max-w-6xl px-6 py-10">
+          <p className="mb-5 text-center font-mono text-xs uppercase tracking-wider text-muted-foreground/70">
+            works with the agents you already run
           </p>
-          <div className="flex flex-wrap justify-center gap-4">
-            <Button asChild size="lg" className={BRAND_BTN}>
-              <TrackedLink
-                href={appUrl('/dashboard')}
-                location="landing_footer"
-                text="start free — 3 days, then $15/mo"
-              >
-                start free — 3 days, then $15/mo
-              </TrackedLink>
-            </Button>
-            <Button asChild size="lg" variant="outline" className="font-mono">
-              <TrackedLink href="/pricing" location="landing_footer" text="see pricing">
-                see pricing
-              </TrackedLink>
-            </Button>
-          </div>
+          <AgentCarousel />
         </div>
       </section>
+
+      {/* Positioning + four-tier glance */}
+      <SwarmMemory />
     </main>
   );
 }

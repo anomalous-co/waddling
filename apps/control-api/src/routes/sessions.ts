@@ -481,6 +481,9 @@ sessions.post('/', (c) =>
         // workspace's quack_serve is loopback-only and birdshot RS256 is the real auth gate, so this
         // value is never presented on the wire; it only satisfies quack_serve's required token arg.
         serverToken: deriveWorkspaceServerToken(workspaceKey),
+        // The workspace's recorded compute size drives the provisioned Cloud Run cpu/memory and
+        // the per-second billing rate charged against this session.
+        size: ws.size,
       });
       wsUrl = prov.url;
     } catch (e) {
@@ -551,8 +554,8 @@ sessions.post('/', (c) =>
         }
         const r = await q<{ id: string }>(
           `INSERT INTO waddling.agent_session
-             (org_id, agent_id, datalake_id, sid, jwt_jti, status, granted_roles, origin, ip, user_agent, expires_at)
-           VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10)
+             (org_id, agent_id, datalake_id, sid, jwt_jti, status, granted_roles, origin, ip, user_agent, expires_at, compute_size)
+           VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$8,$9,$10,$11)
            RETURNING id`,
           [
             endpoint.org_id,
@@ -565,6 +568,7 @@ sessions.post('/', (c) =>
             c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || null,
             c.req.header('user-agent') || null,
             expiresAt.toISOString(),
+            ws.size, // billed at this size's per-second rate (COMPUTE_SIZES)
           ],
         );
         return r.rows[0] ?? null;

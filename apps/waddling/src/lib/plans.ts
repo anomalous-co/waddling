@@ -1,83 +1,76 @@
 /**
- * Stripe plans + entitlements (§6, W1).
+ * Plan catalog + entitlements (control-plane render-side mirror).
  *
- * `PLANS` is the single source of truth consumed by:
- *  - auth.ts        → maps to the @better-auth/stripe `subscription.plans` array
+ * `PLANS` feeds:
+ *  - auth.ts        → @better-auth/stripe `subscription.plans` (via `stripePlans()`)
  *  - entitlements.ts → requirePlan / getActivePlan / entitlement gates
- *  - W5 pricing page → reads PLANS for display
  *
- * priceId placeholders come from env (lazy) so import never throws at build.
+ * Model: flat base fee (`baseMonthlyUsd`, the Stripe subscription price) + included
+ * envelope (storage GB + compute Duckling-hours) + metered overage. priceId comes from
+ * env (lazy) so import never throws at build. Keep in sync with apps/control-api/src/lib/plans.ts.
  */
 import type { Plan } from './types';
-import { getStripePricePro, getStripePriceScale } from './env';
+import { getStripePricePro, getStripePriceMax, getStripePriceScale } from './env';
 
 export type PlanName = Plan['name'];
 
 /** Plan tiers in increasing order of capability. Index = rank for `requirePlan`. */
-export const PLAN_ORDER: readonly PlanName[] = ['free', 'starter', 'pro', 'scale', 'enterprise'];
+export const PLAN_ORDER: readonly PlanName[] = ['free', 'pro', 'max', 'scale'];
 
-/**
- * Build the plan table. Functioned (not a frozen const) so price-id env vars are
- * read at call time, not module-eval time.
- */
+/** Build the plan table. Functioned so price-id env vars are read at call time. */
 export function getPlans(): Plan[] {
   return [
     {
       name: 'free',
       priceId: '',
+      baseMonthlyUsd: 0,
       entitlements: {
-        endpoints: 1,
-        agents: 2,
-        dynamicAcl: false,
+        seats: 1,
+        lakes: 1,
+        storageGb: 5,
+        includedComputeHours: 5,
+        dynamicAcl: true,
         adminMcp: false,
         auditRetentionDays: 7,
       },
     },
     {
-      // $15/mo entry tier — the personal data store: 1 data lake + the memory
-      // lake (quota-exempt) + 3 agents. Display copy only; checkout price ids
-      // are threaded in control-api's auth.ts.
-      name: 'starter',
-      priceId: '',
+      name: 'pro',
+      priceId: getStripePricePro(),
+      baseMonthlyUsd: 29,
       entitlements: {
-        endpoints: 1,
-        agents: 3,
-        dynamicAcl: false,
+        seats: 3,
+        lakes: 2,
+        storageGb: 50,
+        includedComputeHours: 25,
+        dynamicAcl: true,
         adminMcp: false,
         auditRetentionDays: 30,
       },
     },
     {
-      name: 'pro',
-      priceId: getStripePricePro(),
+      name: 'max',
+      priceId: getStripePriceMax(),
+      baseMonthlyUsd: 99,
       entitlements: {
-        endpoints: 5,
-        agents: 25,
+        seats: 10,
+        lakes: 10,
+        storageGb: 500,
+        includedComputeHours: 75,
         dynamicAcl: true,
         adminMcp: true,
         auditRetentionDays: 90,
       },
     },
     {
-      // Self-serve top tier — everything pro has, uncapped, $199/mo.
       name: 'scale',
       priceId: getStripePriceScale(),
+      baseMonthlyUsd: 299,
       entitlements: {
-        endpoints: Number.POSITIVE_INFINITY,
-        agents: Number.POSITIVE_INFINITY,
-        dynamicAcl: true,
-        adminMcp: true,
-        auditRetentionDays: 365,
-      },
-    },
-    {
-      // Sales-led (contact-us): dedicated gateways, dedicated R2, SSO/SAML, SLA.
-      // No self-serve Stripe price — priceId stays '' so stripePlans() omits it.
-      name: 'enterprise',
-      priceId: '',
-      entitlements: {
-        endpoints: Number.POSITIVE_INFINITY,
-        agents: Number.POSITIVE_INFINITY,
+        seats: Number.POSITIVE_INFINITY,
+        lakes: Number.POSITIVE_INFINITY,
+        storageGb: 2000,
+        includedComputeHours: 200,
         dynamicAcl: true,
         adminMcp: true,
         auditRetentionDays: 365,
@@ -95,9 +88,9 @@ export function getPlan(name: PlanName): Plan {
   return p;
 }
 
-/** Shape the @better-auth/stripe plugin wants: `{ name, priceId }` (+ limits optional). */
+/** Shape the @better-auth/stripe plugin wants: `{ name, priceId }`. Free has no price. */
 export function stripePlans(): { name: string; priceId: string }[] {
   return getPlans()
-    .filter((p) => p.priceId) // free plan has no Stripe price
+    .filter((p) => p.priceId)
     .map((p) => ({ name: p.name, priceId: p.priceId }));
 }

@@ -357,14 +357,19 @@ async function main() {
   // Any other GCS error surfaces loudly here (mis-config/IAM) rather than silently starting
   // with an empty database and losing the workspace. The SA (gateway-run@...) must have
   // storage.objectAdmin on the workspace bucket — provisioned in provision.sh.
+  // The .duckdb is a SINGLE app-level GCS object: DuckDB does file locking + random in-place page
+  // writes, which gcsfuse cannot host, so the live database file stays on LOCAL disk and is uploaded
+  // whole (CHECKPOINT → gcsUpload). Workspace DATA FILES (loaded parquet/csv/etc.) instead live under
+  // /tmp/workspace/files, a gcsfuse volume mount (see the provisioner) that persists them transparently
+  // with zero app code — so there is NO tar of the workspace dir. Restore the .duckdb here before open;
+  // a 404 (first boot) starts fresh.
   const wsBucket = process.env.WORKSPACE_GCS_BUCKET ?? "";
   const wsObject = process.env.WORKSPACE_GCS_OBJECT ?? "";
-  if ((workspaceMode || quackboard) && wsBucket && wsObject && config.databasePath !== ":memory:") {
-    mkdirSync(dirname(resolve(config.databasePath)), { recursive: true });
+  const wsDir = config.databasePath !== ":memory:" ? dirname(resolve(config.databasePath)) : "";
+  if ((workspaceMode || quackboard) && wsBucket && wsObject && wsDir) {
+    mkdirSync(wsDir, { recursive: true });
     const found = await gcsDownload(wsBucket, wsObject, config.databasePath);
-    log(found
-      ? `workspace restored from gs://${wsBucket}/${wsObject}`
-      : `workspace not found in GCS (${wsObject}) — starting fresh`);
+    log(found ? `durable db restored from gs://${wsBucket}/${wsObject}` : `durable db not found in GCS (${wsObject}) — starting fresh`);
   }
 
   const rt = await bootDuckRuntime(config);
@@ -377,6 +382,16 @@ async function main() {
   // fresh-boot-then-idle silently dropped every write (the file often never even landed in GCS).
   // Fix: persist after each successful write, and flush once more on the way down.
   const wsDurable = (workspaceMode || quackboard) && wsBucket && wsObject && config.databasePath !== ":memory:";
+
+  // The single shared persist primitive for all durability seams (coalesced writer, SIGTERM flush,
+  // /ctrl/checkpoint). Uploads the .duckdb WHOLE (single GCS object) — the live DB file can't sit on
+  // gcsfuse (file locking + random in-place page writes), so it lives on local disk and is pushed as
+  // one object. Workspace DATA FILES persist separately+transparently via the gcsfuse mount at
+  // /tmp/workspace/files (no upload here). NOTE: gcsUpload readFileSync's the whole object into memory
+  // — fine at current sizes; a very large .duckdb may later need a resumable upload here.
+  const persistDurableDb = async () => {
+    await gcsUpload(wsBucket, wsObject, config.databasePath);
+  };
 
   // Coalescing writer: CHECKPOINT + push the file to GCS. While an upload is in flight, further
   // calls just re-arm a trailing flush (dirty) instead of queueing N uploads, so a burst of
@@ -392,7 +407,7 @@ async function main() {
         do {
           flushDirty = false;
           await rt.run("CHECKPOINT");
-          await gcsUpload(wsBucket, wsObject, config.databasePath);
+          await persistDurableDb();
         } while (flushDirty);
       } catch (e) {
         log(`workspace persist failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -416,7 +431,7 @@ async function main() {
       try {
         if (flushInFlight) await flushInFlight; // let any in-flight upload settle first
         await rt.run("CHECKPOINT");
-        await gcsUpload(wsBucket, wsObject, config.databasePath); // authoritative final flush
+        await persistDurableDb(); // authoritative final flush of the .duckdb
         log(`${signal}: flushed durable db to gs://${wsBucket}/${wsObject} before shutdown`);
       } catch (e) {
         log(`${signal}: shutdown flush failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -654,7 +669,7 @@ async function main() {
       await rt.run("CHECKPOINT");
       if ((workspaceMode || quackboard) && wsBucket && wsObject && config.databasePath !== ":memory:") {
         try {
-          await gcsUpload(wsBucket, wsObject, config.databasePath);
+          await persistDurableDb();
         } catch (uploadErr) {
           const reason = uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
           log(`GCS upload failed after CHECKPOINT: ${reason}`);

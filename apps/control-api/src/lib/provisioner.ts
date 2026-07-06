@@ -13,6 +13,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { Env } from './env';
+import type { ComputeSizeId } from './compute-sizes';
 import { getOrgCatalogDsn } from './catalog-provision';
 import { getDatalakeGatewayConfig } from './datalake-secrets';
 import { quackboardR2Key } from './gateway-boot';
@@ -176,6 +177,8 @@ export interface ProvisionWorkspaceInput {
   serverToken: string;
   gcsBucket?: string;
   gcsObject?: string;
+  /** Cloud Run instance size for this workspace (default duckling). Drives cpu/memory. */
+  size?: ComputeSizeId;
 }
 
 // Provision (create-or-wake) a per-(org,agent) workspace Cloud Run service (ws-<slug>).
@@ -188,7 +191,11 @@ export async function provisionWorkspace(env: Env, input: ProvisionWorkspaceInpu
   if (!env.PROVISIONER_URL) throw new Error('PROVISIONER_URL unset — cannot provision workspace');
 
   const gcsBucket = input.gcsBucket ?? LAKE_BUCKET;
+  // The live .duckdb persists as a SINGLE app-level GCS object (CHECKPOINT → upload); it can't sit on
+  // gcsfuse (file locking + random in-place page writes). Workspace DATA FILES instead persist via a
+  // gcsfuse volume mount at /tmp/workspace/files scoped to WORKSPACE_FILES_PREFIX (see the provisioner).
   const gcsObject = input.gcsObject ?? `workspace/${input.workspaceId}/db/${input.agentId}.duckdb`;
+  const filesPrefix = `workspace/${input.workspaceId}/files/${input.agentId}`;
 
   // Filesystem-jail rollout gate (see Env.WORKSPACE_FS_JAIL). A global toggle jails every workspace;
   // otherwise the agentId must be in the comma-separated allowlist (canary). The gateway reads
@@ -204,6 +211,8 @@ export async function provisionWorkspace(env: Env, input: ProvisionWorkspaceInpu
     DUCKDB_DATABASE_PATH: '/tmp/workspace/ws.duckdb',
     WORKSPACE_GCS_BUCKET: gcsBucket,
     WORKSPACE_GCS_OBJECT: gcsObject,
+    // Scopes the gcsfuse volume mount (in the provisioner) to just this workspace's files subdir.
+    WORKSPACE_FILES_PREFIX: filesPrefix,
     WORKSPACE_ENCRYPTION_KEY: input.encryptionKey,
     GW_SERVER_TOKEN: input.serverToken,
     ...(fsJail ? { WORKSPACE_FS_JAIL: '1' } : {}),
@@ -223,7 +232,7 @@ export async function provisionWorkspace(env: Env, input: ProvisionWorkspaceInpu
   const res = await fetch(`${env.PROVISIONER_URL}/provision`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ slug: input.slug, env: envMap, kind: 'workspace' }),
+    body: JSON.stringify({ slug: input.slug, env: envMap, kind: 'workspace', size: input.size }),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '');

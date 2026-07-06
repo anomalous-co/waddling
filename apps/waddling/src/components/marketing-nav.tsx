@@ -19,7 +19,7 @@ export function MarketingNav() {
 
   return (
     <nav className="border-b border-zinc-800 bg-zinc-950/80 backdrop-blur-sm">
-      <div className="px-6 py-4 flex items-center justify-between">
+      <div className="mx-auto max-w-6xl px-6 py-4 flex items-center justify-between">
         <Link href="/" className="flex items-end gap-2">
           <BrandMark className="text-zinc-50" />
           <span className="text-xs font-mono text-zinc-500 border border-zinc-700 rounded px-1.5 py-0.5">beta</span>
@@ -63,7 +63,7 @@ export function MarketingNav() {
 
       {/* Mobile menu */}
       {open && (
-        <div className="md:hidden border-t border-zinc-800 px-6 py-4 flex flex-col gap-4 text-sm font-mono">
+        <div className="md:hidden border-t border-zinc-800 mx-auto max-w-6xl px-6 py-4 flex flex-col gap-4 text-sm font-mono">
           {LINKS.map((link) => (
             <Link
               key={link.href}

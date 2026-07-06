@@ -25,6 +25,18 @@ const PEM_SECRETS = {
   GW_PG_SSLROOTCERT_PEM_B64: process.env.SEC_SSLROOTCERT ?? "gw-pg-sslrootcert-pem-b64",
 };
 
+// Compute-size → Cloud Run {cpu (vCPU), memGb (GiB)}. SOURCE OF TRUTH is
+// apps/control-api/src/lib/compute-sizes.ts (COMPUTE_SIZES); replicated here because this
+// plain .mjs can't import the TS module. Keep these numbers in sync with that file.
+// All ratios satisfy Cloud Run's cpu ≥ memory/2 rule (1/2, 2/8, 4/16, 8/32 are supported).
+const SIZE_LIMITS = {
+  duckling: { cpu: 1, memGb: 2 },
+  mallard: { cpu: 2, memGb: 8 },
+  goose: { cpu: 4, memGb: 16 },
+  swan: { cpu: 8, memGb: 32 },
+};
+const DEFAULT_SIZE = "duckling";
+
 const log = (...a) => console.log("[provisioner]", ...a);
 const auth = new GA({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] });
 const API = "https://run.googleapis.com/v2";
@@ -42,8 +54,9 @@ async function api(method, url, body) {
 // kind 'workspace' opens an encrypted durable .duckdb (restored/persisted to GCS) and relays the lake
 // over the public router — it has NO Cloud SQL catalog and NO libpq mTLS, so its body OMITS the shared
 // PEM secrets and the cloudsql-instances annotation. kind 'gateway' (default) is unchanged.
-function serviceBody(envMap, secretEnvMap, kind = "gateway") {
+function serviceBody(envMap, secretEnvMap, kind = "gateway", size = DEFAULT_SIZE) {
   const isWorkspace = kind === "workspace";
+  const { cpu, memGb } = SIZE_LIMITS[size] ?? SIZE_LIMITS[DEFAULT_SIZE];
   // Quackboards need Cloud SQL for the birdshot grant store (attachGrantStore).
   const needsCloudSql = !isWorkspace || String(envMap?.QUACKBOARD ?? '') === '1';
   const env = [
@@ -54,6 +67,13 @@ function serviceBody(envMap, secretEnvMap, kind = "gateway") {
       valueSource: { secretKeyRef: { secret, version: "latest" } },
     })),
   ];
+  // Workspace DATA FILES persist via a gcsfuse volume mount at /tmp/workspace/files, scoped (only-dir)
+  // to this workspace's prefix in the regional bucket. Loaded parquet/csv/etc. persist transparently —
+  // no app code, no tar. The live .duckdb is NOT on this mount (gcsfuse can't host a locked, in-place-
+  // written DB): it stays on local disk, uploaded whole by the entrypoint. Requires gen2 (set above).
+  // Guard on bucket+prefix so a mis-config never emits an invalid volume. (google.cloud.run.v2.Service:
+  // template.volumes[].gcs + containers[].volumeMounts[].)
+  const mountWsFiles = isWorkspace && !!envMap?.WORKSPACE_GCS_BUCKET && !!envMap?.WORKSPACE_FILES_PREFIX;
   return {
     template: {
       scaling: { minInstanceCount: 0, maxInstanceCount: 1 },
@@ -61,12 +81,14 @@ function serviceBody(envMap, secretEnvMap, kind = "gateway") {
       executionEnvironment: "EXECUTION_ENVIRONMENT_GEN2",
       // Quackboards need Cloud SQL for the grant store; pure workspaces don't.
       ...(needsCloudSql ? { annotations: { "run.googleapis.com/cloudsql-instances": CLOUDSQL_INSTANCE } } : {}),
+      ...(mountWsFiles ? { volumes: [{ name: "ws-files", gcs: { bucket: envMap.WORKSPACE_GCS_BUCKET, readOnly: false, mountOptions: [`only-dir=${envMap.WORKSPACE_FILES_PREFIX}`] } }] } : {}),
       containers: [
         {
           image: GATEWAY_IMAGE,
           ports: [{ containerPort: 8080 }],
           env,
-          resources: { cpuIdle: false, startupCpuBoost: true, limits: { cpu: "1", memory: "1Gi" } },
+          resources: { cpuIdle: false, startupCpuBoost: true, limits: { cpu: String(cpu), memory: `${memGb}Gi` } },
+          ...(mountWsFiles ? { volumeMounts: [{ name: "ws-files", mountPath: "/tmp/workspace/files" }] } : {}),
         },
       ],
     },
@@ -89,11 +111,11 @@ async function waitOperation(opName) {
   throw new Error("operation timed out after 240s");
 }
 
-async function provision(slug, envMap, secretEnvMap, kind = "gateway") {
+async function provision(slug, envMap, secretEnvMap, kind = "gateway", size = DEFAULT_SIZE) {
   // Workspaces deploy as ws-<slug>; gateways as gw-<slug>.
   const service = `${kind === "workspace" ? "ws" : "gw"}-${slug}`;
   const svcPath = `${parent}/services/${service}`;
-  const body = serviceBody(envMap, secretEnvMap, kind);
+  const body = serviceBody(envMap, secretEnvMap, kind, size);
 
   // create-or-update (idempotent): GET → PATCH if exists, else POST with serviceId.
   const existing = await api("GET", `${API}/${svcPath}`);
@@ -133,13 +155,14 @@ const server = http.createServer((req, res) => {
   req.on("data", (c) => (raw += c));
   req.on("end", async () => {
     try {
-      const { slug, env: envMap, secretEnv, kind: rawKind } = JSON.parse(raw || "{}");
+      const { slug, env: envMap, secretEnv, kind: rawKind, size: rawSize } = JSON.parse(raw || "{}");
       if (!slug || !/^[a-z0-9-]+$/.test(slug)) return send(400, { error: "invalid slug" });
       if (!GATEWAY_IMAGE || !GATEWAY_SA) return send(500, { error: "provisioner misconfigured: GATEWAY_IMAGE/GATEWAY_SA unset" });
       const kind = rawKind === "workspace" ? "workspace" : "gateway";
+      const size = SIZE_LIMITS[rawSize] ? rawSize : DEFAULT_SIZE;
       const prefix = kind === "workspace" ? "ws" : "gw";
-      log(`provision ${prefix}-${slug} (${Object.keys(envMap ?? {}).length} env)`);
-      const out = await provision(slug, envMap, secretEnv, kind);
+      log(`provision ${prefix}-${slug} (${Object.keys(envMap ?? {}).length} env, size=${size})`);
+      const out = await provision(slug, envMap, secretEnv, kind, size);
       log(`provisioned ${out.service} → ${out.url}`);
       send(200, { ok: true, ...out });
     } catch (e) {

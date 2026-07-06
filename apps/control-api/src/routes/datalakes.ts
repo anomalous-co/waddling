@@ -153,8 +153,8 @@ datalakes.post('/', (c) =>
           WHERE org_id = $1 AND kind IS DISTINCT FROM 'quackboard'`,
         [caller.orgId],
       );
-      if (billingOn && Number(count?.n ?? 0) >= ent.endpoints) {
-        return err(c, 'endpoint_quota_exceeded', 402, `Plan allows ${ent.endpoints} endpoint(s)`);
+      if (billingOn && Number(count?.n ?? 0) >= ent.lakes) {
+        return err(c, 'lake_quota_exceeded', 402, `Plan allows ${ent.lakes} data lake(s)`);
       }
     }
 

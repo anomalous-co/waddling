@@ -24,12 +24,15 @@ import { createHash, randomBytes } from 'node:crypto';
 import { query, queryOne } from './db';
 import { getCrypto, type SealedSecret } from './secret-crypto';
 import { getDatalakeGatewayConfig } from './datalake-secrets';
+import { resolveComputeSize, type ComputeSizeId } from './compute-sizes';
 
 export interface ResolvedWorkspace {
   workspaceId: string;
   agentId: string;
   /** s3://<bucket>/workspace/<workspaceId>/db/<agentId>.duckdb */
   dbUri: string;
+  /** The workspace's Cloud Run instance size — drives provisioned cpu/memory + billing rate. */
+  size: ComputeSizeId;
 }
 
 /** S3 coords for the session actor's WorkspaceStore (mirrors workspace-store S3StoreConfig). */
@@ -67,8 +70,8 @@ export async function resolveWorkspaceForSession(
   name: string = DEFAULT_WORKSPACE,
 ): Promise<ResolvedWorkspace> {
   // Upsert the workspace (org, name) bound to this endpoint.
-  let ws = await queryOne<{ id: string; data_path: string }>(
-    `SELECT w.id, e.data_path
+  let ws = await queryOne<{ id: string; data_path: string; compute_size: string | null }>(
+    `SELECT w.id, w.compute_size, e.data_path
        FROM waddling.workspace w
        JOIN waddling.datalake e ON e.id = w.datalake_id
       WHERE w.org_id = $1 AND w.name = $2 AND w.datalake_id = $3`,
@@ -86,7 +89,8 @@ export async function resolveWorkspaceForSession(
       `SELECT data_path FROM waddling.datalake WHERE id = $1`,
       [datalakeId],
     );
-    ws = { id: created!.id, data_path: dp!.data_path };
+    // A freshly-created workspace takes the column default (duckling); compute_size is null here.
+    ws = { id: created!.id, data_path: dp!.data_path, compute_size: null };
   }
 
   // db_uri is informational for the CF data plane: the dataplane owns the actual workspace
@@ -105,7 +109,7 @@ export async function resolveWorkspaceForSession(
     [ws.id, agentId, dbUri],
   );
 
-  return { workspaceId: ws.id, agentId, dbUri };
+  return { workspaceId: ws.id, agentId, dbUri, size: resolveComputeSize(ws.compute_size).id };
 }
 
 interface KeyRow { key_iv: Buffer | null; key_auth_tag: Buffer | null; key_ciphertext: Buffer | null }

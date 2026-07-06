@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
-import { LayoutGrid, Plus, Loader2, CreditCard, Hash, Brain, Activity, RefreshCw } from 'lucide-react';
+import { LayoutGrid, Plus, Loader2, CreditCard, Hash, Brain, Activity, Network } from 'lucide-react';
 import Link from 'next/link';
 import { toast } from 'sonner';
 import {
@@ -24,6 +24,8 @@ import { StatusDot } from '@/components/waddling/status-dot';
 import type { SemanticStatus } from '@/components/waddling/status-dot';
 import { fetchCp, cpPost } from '@/components/dashboard/fetch';
 import { cn } from '@/lib/utils';
+import { QuackboardGraphView, type QbGraphResponse } from './quackboard-graph';
+import { formatTs, WakingNotice } from './shared';
 
 /**
  * Quackboard — the per-org governed agent-coordination board (shared observations
@@ -323,37 +325,11 @@ interface MemoryEntry {
   ts?: unknown;
 }
 
-type QbSelection = { kind: 'all' } | { kind: 'topic'; topic: string } | { kind: 'memory' };
-
-// DuckDB TIMESTAMP normalizes to a naive string ("2026-07-05 17:53:52[.sss]"); treat it as UTC
-// and render relative. Falls back to the raw value if it can't be parsed.
-function formatTs(ts: unknown): string {
-  if (ts == null || ts === '') return '';
-  const s = String(ts).trim();
-  const base = s.includes('T') ? s : s.replace(' ', 'T');
-  const hasTz = base.endsWith('Z') || /[+-]\d\d:?\d\d$/.test(base);
-  const d = new Date(hasTz ? base : `${base}Z`);
-  if (Number.isNaN(d.getTime())) return s;
-  const mins = Math.floor((Date.now() - d.getTime()) / 60_000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.floor(hrs / 24)}d ago`;
-}
-
-function WakingNotice({ onRetry }: { onRetry: () => void }) {
-  return (
-    <div className="flex flex-col items-center gap-3 py-12 text-center">
-      <Loader2 className="size-5 animate-spin text-muted-foreground" aria-hidden="true" />
-      <p className="text-sm text-muted-foreground">The quackboard gateway is waking up.</p>
-      <Button variant="outline" size="sm" onClick={onRetry}>
-        <RefreshCw className="mr-1.5 size-3.5" aria-hidden="true" />
-        Retry
-      </Button>
-    </div>
-  );
-}
+type QbSelection =
+  | { kind: 'all' }
+  | { kind: 'topic'; topic: string }
+  | { kind: 'memory' }
+  | { kind: 'graph' };
 
 function RailButton({
   active,
@@ -391,6 +367,7 @@ function QuackboardWorkspace({ board }: { board: QuackboardSummary }) {
   const [topics, setTopics] = useState<TopicRow[] | null>(null);
   const [feed, setFeed] = useState<ObservationEntry[] | null>(null);
   const [memory, setMemory] = useState<MemoryEntry[] | null>(null);
+  const [graph, setGraph] = useState<QbGraphResponse | null>(null);
   const [waking, setWaking] = useState(false);
 
   const loadTopics = useCallback(() => {
@@ -424,19 +401,33 @@ function QuackboardWorkspace({ board }: { board: QuackboardSummary }) {
     });
   }, []);
 
+  const loadGraph = useCallback(() => {
+    setGraph(null);
+    setWaking(false);
+    void fetchCp<QbGraphResponse>('/api/cp/quackboard/graph').then((res) => {
+      if (res.ok) setGraph(res.data);
+      else {
+        setGraph({ nodes: [], edges: [] });
+        if (res.status === 503) setWaking(true);
+      }
+    });
+  }, []);
+
   useEffect(() => {
     loadTopics();
   }, [loadTopics]);
 
   useEffect(() => {
     if (selection.kind === 'memory') loadMemory();
+    else if (selection.kind === 'graph') loadGraph();
     else loadFeed(selection.kind === 'topic' ? selection.topic : undefined);
-  }, [selection, loadFeed, loadMemory]);
+  }, [selection, loadFeed, loadMemory, loadGraph]);
 
   const retry = useCallback(() => {
     if (selection.kind === 'memory') loadMemory();
+    else if (selection.kind === 'graph') loadGraph();
     else loadFeed(selection.kind === 'topic' ? selection.topic : undefined);
-  }, [selection, loadFeed, loadMemory]);
+  }, [selection, loadFeed, loadMemory, loadGraph]);
 
   // Group memory by agent for the oversight view.
   const memoryByAgent = new Map<string, MemoryEntry[]>();
@@ -488,8 +479,9 @@ function QuackboardWorkspace({ board }: { board: QuackboardSummary }) {
               />
             ))
           )}
-          <div className="mt-2 border-t pt-2">
+          <div className="mt-2 flex flex-col gap-1 border-t pt-2">
             <RailButton active={selection.kind === 'memory'} icon={<Brain className="size-4" />} label="Memory" onClick={() => setSelection({ kind: 'memory' })} />
+            <RailButton active={selection.kind === 'graph'} icon={<Network className="size-4" />} label="Graph" onClick={() => setSelection({ kind: 'graph' })} />
           </div>
         </nav>
 
@@ -499,9 +491,31 @@ function QuackboardWorkspace({ board }: { board: QuackboardSummary }) {
           <div className="flex flex-wrap gap-1.5 border-b p-2 sm:hidden">
             <RailButton active={selection.kind === 'all'} icon={<Activity className="size-4" />} label="All" onClick={() => setSelection({ kind: 'all' })} />
             <RailButton active={selection.kind === 'memory'} icon={<Brain className="size-4" />} label="Memory" onClick={() => setSelection({ kind: 'memory' })} />
+            <RailButton active={selection.kind === 'graph'} icon={<Network className="size-4" />} label="Graph" onClick={() => setSelection({ kind: 'graph' })} />
           </div>
 
-          {selection.kind === 'memory' ? (
+          {selection.kind === 'graph' ? (
+            // Context graph — nodes are observations/memories, edges are semantic
+            // (embedding similarity), structural (reply/thread chains), or declared
+            // (explicit cross-references). See QuackboardGraphView for rendering.
+            <div className="flex h-full flex-col">
+              {graph === null ? (
+                <div className="flex flex-col gap-3 p-4">
+                  <Skeleton className="h-40 w-full rounded" />
+                </div>
+              ) : waking ? (
+                <WakingNotice onRetry={retry} />
+              ) : graph.nodes.length === 0 ? (
+                <EmptyState
+                  icon={<Network />}
+                  title="No graph yet"
+                  description="Observations and memories appear here once embedded."
+                />
+              ) : (
+                <QuackboardGraphView data={graph} />
+              )}
+            </div>
+          ) : selection.kind === 'memory' ? (
             // Memory oversight
             <div className="flex flex-col">
               <div className="border-b px-4 py-3">

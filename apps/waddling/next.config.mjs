@@ -48,14 +48,17 @@ function buildCsp(dev) {
     : '';
   const posthog = POSTHOG_HOST ? ` ${POSTHOG_HOST.replace(/\/$/, '')}` : '';
   // Allow leading/trailing whitespace; browsers normalise.
+  // Stripe Elements (embedded Payment Element on the billing page): Stripe.js loads
+  // from js.stripe.com, the card fields + 3DS render in iframes from js.stripe.com /
+  // hooks.stripe.com, and confirm calls hit api.stripe.com. All three must be allowed.
   return [
     `default-src 'self';`,
-    `script-src 'self' 'unsafe-inline'${eval_};`,
-    `connect-src 'self'${controlApi}${posthog};`,
+    `script-src 'self' 'unsafe-inline' https://js.stripe.com${eval_};`,
+    `connect-src 'self' https://api.stripe.com${controlApi}${posthog};`,
     `style-src 'self' 'unsafe-inline';`,
-    `img-src 'self' data: blob:;`,
+    `img-src 'self' data: blob: https://*.stripe.com;`,
     `font-src 'self';`,
-    `frame-src 'self';`,
+    `frame-src 'self' https://js.stripe.com https://hooks.stripe.com;`,
     `form-action 'self'${controlApi};`,
     `base-uri 'self';`,
     `object-src 'none';`,

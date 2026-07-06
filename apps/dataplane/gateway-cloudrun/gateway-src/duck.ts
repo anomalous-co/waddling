@@ -7,6 +7,7 @@
 // birdshot fn signatures and ducklake.md for ATTACH syntax.
 
 import { dirname } from "node:path";
+import { mkdirSync } from "node:fs";
 
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import type { GatewayConfig } from "./config";
@@ -481,6 +482,13 @@ export async function bootDuckRuntime(
     const wsDir = dirname(config.databasePath);
     await connection.run(`SET home_directory=${q(wsDir)}`);
 
+    // DuckDB temp/spill MUST stay on LOCAL disk — never /tmp/workspace/files (the gcsfuse mount), which
+    // can't take DuckDB's random in-place spill writes. Pin temp_directory to a dedicated local dir so a
+    // large sort/hash-join/aggregate spills locally rather than into the mounted, GCS-backed files dir.
+    const tempDir = "/tmp/duckdb-tmp";
+    mkdirSync(tempDir, { recursive: true });
+    await connection.run(`SET temp_directory=${q(tempDir)}`);
+
     // Optional hard jail (WORKSPACE_FS_JAIL): confine ALL DuckDB file access to the workspace
     // + extension dirs. `allowed_directories` is the allow-list DuckDB honors when external
     // access is off, so with `enable_external_access=false` a read_csv/read_blob/COPY can only
@@ -498,7 +506,9 @@ export async function bootDuckRuntime(
       // session secrets live here), so allowing it does not widen the blast radius: /proc, /etc, and
       // the gateway source stay unreachable.
       const duckHome = `${process.env.HOME || "/root"}/.duckdb`;
-      const allowed = [wsDir, extDir, birdshotDir, duckHome].map(q).join(", ");
+      // tempDir must be allow-listed too: with enable_external_access=false, DuckDB can only spill to a
+      // path inside allowed_directories, and tempDir lives OUTSIDE wsDir (local disk, off the mount).
+      const allowed = [wsDir, tempDir, extDir, birdshotDir, duckHome].map(q).join(", ");
       await connection.run(`SET allowed_directories=[${allowed}]`);
       await connection.run("SET enable_external_access=false");
       console.log(`[gateway] workspace FS jail ON — file access confined to ${wsDir} (+ ext/home state)`);

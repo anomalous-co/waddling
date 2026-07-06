@@ -7,9 +7,9 @@
  *
  *  - org:        create the first org (when the user has none). Reuses the sign-up
  *                org form pattern; never routes to /dashboard.
- *  - choose:     subscribe (Pro) OR buy a credit pack. Both start a Stripe Checkout and
- *                return to ?step=confirming.
- *  - confirming: Stripe's success redirect lands here. Credits/subscription are granted
+ *  - choose:     subscribe to a plan. Starts a Stripe Checkout and returns to
+ *                ?step=confirming.
+ *  - confirming: Stripe's success redirect lands here. The subscription is granted
  *                ASYNCHRONOUSLY by the webhook, NOT the redirect — so poll the paid
  *                status until true, then enter the dashboard.
  */
@@ -17,7 +17,7 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Loader2 } from 'lucide-react';
 import { authClient } from '@/lib/auth-client';
-import { fetchCp, cpPost } from '@/components/dashboard/fetch';
+import { fetchCp } from '@/components/dashboard/fetch';
 import { BrandMark } from '@/components/brand-mark';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -27,19 +27,8 @@ import { Field, FieldLabel, FieldGroup } from '@/components/ui/field';
 
 type Step = 'org' | 'choose' | 'confirming';
 
-interface Pack {
-  id: string;
-  label: string;
-  usd: number;
-}
-interface BillingLite {
-  creditPacks?: Pack[];
-}
-
 /** Map control-api error codes to onboarding-friendly copy. */
 function billingMessage(code: string): string {
-  if (code === 'billing_not_configured')
-    return 'Credit packs are not configured for this deployment yet.';
   if (/forbidden|organization|authoriz|permission/i.test(code))
     return 'Ask an organization owner to set up billing for this org.';
   return code;
@@ -61,23 +50,8 @@ export function OnboardingFlow({
   const [step, setStep] = useState<Step>(initialStep);
   const [orgId, setOrgId] = useState<string | undefined>(initialOrgId);
   const [orgName, setOrgName] = useState('');
-  const [packs, setPacks] = useState<Pack[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Load the purchasable credit packs when the choose step is shown.
-  useEffect(() => {
-    if (step !== 'choose') return;
-    let active = true;
-    void (async () => {
-      const res = await fetchCp<BillingLite>('/api/cp/billing');
-      if (!active) return;
-      setPacks(res.ok ? res.data.creditPacks ?? [] : []);
-    })();
-    return () => {
-      active = false;
-    };
-  }, [step]);
 
   const createOrg = async (e: FormEvent) => {
     e.preventDefault();
@@ -110,22 +84,7 @@ export function OnboardingFlow({
     setStep('choose');
   };
 
-  const buyPack = async (packId: string) => {
-    setLoading(true);
-    setError(null);
-    const res = await cpPost<{ url: string }>('/api/cp/billing/credit-pack', {
-      packId,
-      returnPath: '/onboarding?step=confirming',
-    });
-    if (!res.ok) {
-      setLoading(false);
-      setError(billingMessage(res.error));
-      return;
-    }
-    window.location.assign(res.data.url);
-  };
-
-  const subscribe = async (plan: 'starter' | 'pro') => {
+  const subscribe = async (plan: 'pro' | 'max' | 'scale') => {
     if (!orgId) {
       setError('No active organization to bill.');
       return;
@@ -137,6 +96,9 @@ export function OnboardingFlow({
       const res = (await authClient.subscription.upgrade({
         plan,
         referenceId: orgId,
+        // Org-scoped customer (matches the embedded billing flow), so an org has one
+        // Stripe customer across hosted + embedded checkout — no duplicate subscriptions.
+        customerType: 'organization',
         successUrl: `${origin}/onboarding?step=confirming`,
         cancelUrl: `${origin}/onboarding?step=choose`,
       })) as unknown as { data?: { url?: string }; error?: { message?: string } };
@@ -191,7 +153,9 @@ export function OnboardingFlow({
       <div className="flex w-full max-w-lg flex-col gap-6">
         <div className="text-center">
           <BrandMark />
-          <p className="mt-1 text-sm text-muted-foreground">Set up billing to get started</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Start your 7-day free trial — no credit card required
+          </p>
         </div>
 
         {step === 'org' && (
@@ -199,8 +163,8 @@ export function OnboardingFlow({
             <CardHeader>
               <CardTitle>Create your organization</CardTitle>
               <CardDescription>
-                Organizations group your data lakes, agents, and team. You&apos;ll set up billing
-                next.
+                Organizations group your data lakes, agents, and team. Your 7-day free trial
+                starts right away — full Pro access, no card required.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -224,7 +188,7 @@ export function OnboardingFlow({
                   ) : null}
                   <Button type="submit" disabled={loading} className="w-full">
                     {loading ? <Loader2 data-icon="inline-start" className="animate-spin" /> : null}
-                    Continue to billing
+                    Start free trial
                   </Button>
                 </FieldGroup>
               </form>
@@ -243,69 +207,45 @@ export function OnboardingFlow({
 
             <Card className="border-emerald-500/50">
               <CardHeader>
-                <CardTitle>Start your personal data store</CardTitle>
+                <CardTitle>Choose your plan</CardTitle>
                 <CardDescription>
-                  Starter — $15/mo. Your managed memory lake, 1 data lake, 3 agents.
-                  First 3 days free; cancel anytime during the trial and pay nothing.
+                  Pro — $29/mo: 3 users, 2 data lakes, 50 GB storage, 25 included compute-hours,
+                  and dynamic per-agent access control. Flat base + metered usage; cancel anytime.
                 </CardDescription>
               </CardHeader>
               <CardContent>
                 <Button
                   className="w-full"
                   disabled={loading}
-                  onClick={() => void subscribe('starter')}
+                  onClick={() => void subscribe('pro')}
                 >
                   {loading ? <Loader2 data-icon="inline-start" className="animate-spin" /> : null}
-                  Start 3-day free trial
+                  Continue on Pro — $29/mo
                 </Button>
                 <p className="mt-3 text-center text-xs text-muted-foreground">
-                  Need more lakes and agents?{' '}
+                  Need more?{' '}
                   <button
                     type="button"
                     disabled={loading}
-                    onClick={() => void subscribe('pro')}
+                    onClick={() => void subscribe('max')}
                     className="text-primary hover:underline disabled:opacity-50"
                   >
-                    Subscribe to Pro ($49/mo)
+                    Max ($99/mo)
+                  </button>
+                  {' · '}
+                  <button
+                    type="button"
+                    disabled={loading}
+                    onClick={() => void subscribe('scale')}
+                    className="text-primary hover:underline disabled:opacity-50"
+                  >
+                    Scale ($299/mo)
                   </button>
                   {' · '}
                   <a href="mailto:sales@getwaddling.com" className="text-primary hover:underline">
                     Contact sales
                   </a>
                 </p>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Or buy credits</CardTitle>
-                <CardDescription>
-                  Prepaid, pay-as-you-go. Credits are drawn down as your agents run.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                {packs === null ? (
-                  <div className="flex justify-center py-4">
-                    <Loader2 className="size-5 animate-spin text-muted-foreground" />
-                  </div>
-                ) : packs.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">
-                    Credit packs aren&apos;t available yet — use a subscription above.
-                  </p>
-                ) : (
-                  <div className="grid grid-cols-3 gap-3">
-                    {packs.map((p) => (
-                      <Button
-                        key={p.id}
-                        variant="outline"
-                        disabled={loading}
-                        onClick={() => void buyPack(p.id)}
-                      >
-                        ${p.usd}
-                      </Button>
-                    ))}
-                  </div>
-                )}
               </CardContent>
             </Card>
           </>

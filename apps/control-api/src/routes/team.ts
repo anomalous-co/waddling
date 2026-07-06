@@ -20,6 +20,7 @@ import { z } from 'zod';
 import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
+import { getEntitlements } from '../lib/entitlements';
 import { recompileAndEnqueue } from '../lib/gateway-dispatch';
 import { resolveCaller, parseBody, handle, ok, err, type Caller } from '../lib/cp-shared';
 import { sendEmail, invitationEmail } from '../lib/email';
@@ -216,6 +217,32 @@ team.post('/', (c) =>
         ORDER BY "expiresAt" DESC LIMIT 1`,
       [caller.orgId, email],
     );
+    // Seat limit (billed tiers only). A seat = an active member OR a pending invite. A NEW
+    // invite that would push the org past its plan's seat allowance is blocked; resends
+    // (existingInvite) reuse an already-counted seat, so they're exempt. Mirrors the plan-
+    // gate pattern (billingOn ⇒ can't enforce a paid limit with no way to pay).
+    if (!existingInvite) {
+      const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
+      if (billingOn) {
+        const ent = await getEntitlements(caller.orgId);
+        const seatCount = await queryOne<{ n: string }>(
+          `SELECT (
+             (SELECT count(*) FROM "member" WHERE "organizationId" = $1)
+             + (SELECT count(*) FROM "invitation" WHERE "organizationId" = $1 AND status = 'pending')
+           )::text AS n`,
+          [caller.orgId],
+        );
+        if (Number(seatCount?.n ?? 0) >= ent.seats) {
+          return err(
+            c,
+            'seat_quota_exceeded',
+            402,
+            `Plan allows ${ent.seats} user(s). Upgrade to invite more.`,
+          );
+        }
+      }
+    }
+
     let invitationId: string;
     if (existingInvite) {
       invitationId = existingInvite.id;

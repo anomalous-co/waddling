@@ -71,6 +71,8 @@ export const getStripeWebhookSecret = (): string =>
     : required('STRIPE_WEBHOOK_SECRET');
 export const getStripePricePro = (): string =>
   optional('STRIPE_PRICE_PRO', 'price_pro');
+export const getStripePriceMax = (): string =>
+  optional('STRIPE_PRICE_MAX', 'price_max');
 export const getStripePriceScale = (): string =>
   optional('STRIPE_PRICE_SCALE', 'price_scale');
 

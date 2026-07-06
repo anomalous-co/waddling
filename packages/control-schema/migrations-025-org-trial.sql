@@ -1,0 +1,11 @@
+-- 7-day no-card trial.
+--
+-- A new org starts a local trial (no Stripe subscription, no card): trialEndsAt is set to
+-- now()+7d at org creation (auth.ts afterCreateOrganization). While now() < trialEndsAt and
+-- the org has no active paid subscription, getActivePlanName resolves to 'pro' — so the trial
+-- grants full Pro entitlements and clears the onboarding paid-gate. A card is collected only
+-- at conversion, which creates the real Stripe subscription. Expired trials fall back to 'free'.
+--
+-- Lives on the Better Auth "organization" table (public schema). Nullable: existing orgs have
+-- no trial (they resolve by subscription/comp as before); backfill is intentionally omitted.
+ALTER TABLE "organization" ADD COLUMN IF NOT EXISTS "trialEndsAt" timestamptz;

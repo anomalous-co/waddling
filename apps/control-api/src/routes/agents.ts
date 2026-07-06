@@ -14,7 +14,6 @@
 import { z } from 'zod';
 import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
-import { getEntitlements } from '../lib/entitlements';
 import type { Env } from '../lib/env';
 import { resolveCaller, assertOrg, parseBody, handle, ok, err, AuthError } from '../lib/cp-shared';
 import {
@@ -174,17 +173,9 @@ agents.post('/', (c) =>
       }
     }
 
-    // Plan quotas only apply when billing is configured (can't enforce a paid limit with
-    // no way to pay — mirrors the ACL plan gate + auth.ts stripeConfigured check).
-    const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
-    const ent = await getEntitlements(caller.orgId);
-    const count = await queryOne<{ n: string }>(
-      `SELECT count(*)::text AS n FROM waddling.agent WHERE org_id = $1 AND status <> 'revoked'`,
-      [caller.orgId],
-    );
-    if (billingOn && Number(count?.n ?? 0) >= ent.agents) {
-      return err(c, 'agent_quota_exceeded', 402, `Plan allows ${ent.agents} agent(s)`);
-    }
+    // Agents are unbounded — the plan sells SEATS (org users) + lakes + compute, not agent
+    // count. Seat limits are gated at invite time (routes/team.ts); compute + storage caps
+    // bound the actual cost. So no per-agent quota here.
 
     // Create the Better Auth API key bound to the org (uses caller's session).
     // Exactly one key per agent (one-key-per-agent): the key is minted here, 1:1

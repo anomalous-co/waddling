@@ -70,18 +70,23 @@ export interface AuditQuery {
 
 // ── Plans ──────────────────────────────────────────────────────────────────────
 export interface Plan {
-  // 'starter' is the $15/mo personal-data-store entry tier; 'scale' is the
-  // self-serve top tier ($199/mo, auto-provisionable); 'enterprise' is sales-led
-  // (dedicated gateways/SSO/SLA) with no self-serve Stripe price.
-  name: 'free' | 'starter' | 'pro' | 'scale' | 'enterprise';
+  // Base subscription + included envelope + metered usage. 'pro' is the $29/mo entry
+  // tier (7-day no-card trial grants it); 'max' $99; 'scale' $299 self-serve top tier.
+  // 'free' is the implicit floor (lapsed/no subscription).
+  name: 'free' | 'pro' | 'max' | 'scale';
   priceId: string;
-  /** Monthly prepaid credit allotment (USD). The org's tier-credit bucket is RESET to
-   *  this each billing cycle (unused tier credit expires; purchased top-ups persist).
-   *  Equals the tier's monthly subscription price. See docs/credit-unit-economics.md. */
-  monthlyCreditUsd: number;
+  /** Flat monthly base fee (USD) — the Stripe subscription price. Free = 0. */
+  baseMonthlyUsd: number;
   entitlements: {
-    endpoints: number;
-    agents: number;
+    /** Org seats (users/members). */
+    seats: number;
+    /** Data lakes (endpoints). The org memory lake (kind='quackboard') is exempt. */
+    lakes: number;
+    /** Included storage (GB). Overage billed at $0.04/GB-mo. */
+    storageGb: number;
+    /** Included compute envelope, in Duckling-equivalent hours/month. Overage metered
+     *  to Stripe; granted monthly as tier credit = includedComputeHours × Duckling $/hr. */
+    includedComputeHours: number;
     dynamicAcl: boolean;
     adminMcp: boolean;
     auditRetentionDays: number;

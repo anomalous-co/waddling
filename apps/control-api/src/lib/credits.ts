@@ -22,18 +22,21 @@
 import { query, withTransaction } from './db';
 import { isOrgComped } from './comp';
 import { getPlan, type PlanName } from './plans';
-import { getActivePlanName } from './entitlements';
+import { getActivePlanName, hasActivePaidSubscription } from './entitlements';
+import { DUCKLING_USD_PER_HOUR, resolveComputeSize } from './compute-sizes';
 
 /** µUSD per US dollar. Stripe cents → µUSD = cents × 10_000. */
 export const MICRO_PER_USD = 1_000_000;
 
 // ── Pricing dials (USD) ──────────────────────────────────────────────────────────
-/** COGS basis: ~$0.10 / active session-hour (container memory × wall-clock). Cost, not price. */
-export const SESSION_COGS_USD_PER_HOUR = 0.10;
-/** Retail multiple over COGS — the gross-margin dial. 5× ⇒ ~80% gross margin. */
+/** COGS basis for the base (Duckling) size: ~$0.11 / active session-hour. Cost, not price. */
+export const SESSION_COGS_USD_PER_HOUR = 0.11;
+/** Retail multiple over COGS — the gross-margin dial. ~5× ⇒ ~80% gross margin. */
 export const RETAIL_MARGIN = 5;
-/** Billed session rate = COGS × margin = $0.50 / active session-hour. */
-export const SESSION_USD_PER_HOUR = SESSION_COGS_USD_PER_HOUR * RETAIL_MARGIN;
+/** Base (Duckling) billed rate = $0.55 / active session-hour — the base unit the included
+ *  compute envelope is priced in. Larger workspace sizes (Mallard…Swan) bill at their own
+ *  COMPUTE_SIZES rate; debitSessionDuration applies the session's recorded size. */
+export const SESSION_USD_PER_HOUR = DUCKLING_USD_PER_HOUR;
 /** Per-query floor at retail — minor request overhead ($0.0002 COGS × margin = $0.001). */
 export const QUERY_FLOOR_USD = 0.0002 * RETAIL_MARGIN;
 
@@ -42,6 +45,16 @@ export const QUERY_FLOOR_USD = 0.0002 * RETAIL_MARGIN;
 // granularity the model promises; only the rate (above) is the retail dial.
 export const SESSION_MICRO_PER_MS = (SESSION_USD_PER_HOUR * MICRO_PER_USD) / 3_600_000;
 export const QUERY_FLOOR_MICRO = Math.round(QUERY_FLOOR_USD * MICRO_PER_USD);
+
+/**
+ * µUSD-per-ms duration rate for a session's compute size. Derived from the size's retail
+ * $/hr (COMPUTE_SIZES via resolveComputeSize, which maps unknown/legacy → the Duckling
+ * default). This is the single rate function BOTH the debit path and the reconcile pass use,
+ * so a session bills — and re-derives — at the exact rate of the size it actually ran at.
+ */
+export function sessionMicroPerMs(computeSize: string | null | undefined): number {
+  return (resolveComputeSize(computeSize).usdPerHour * MICRO_PER_USD) / 3_600_000;
+}
 
 export interface PostEntryArgs {
   orgId: string;
@@ -166,14 +179,17 @@ export async function grantCredits(
 }
 
 // ── Monthly tier-credit reset ─────────────────────────────────────────────────────
-// Each tier carries a monthly prepaid allotment (plans.ts monthlyCreditUsd). Once per
+// Each tier's INCLUDED COMPUTE ENVELOPE (plans.ts includedComputeHours) is granted monthly
+// as tier credit, priced at the Duckling base rate: N Duckling-hours × $0.55. Once per
 // billing period the org's TIER bucket is SET to that allotment — unused tier credit
-// expires; purchased top-ups (the topup bucket) are untouched. A lapsed/cancelled
-// subscription resolves to 'free' via getActivePlanName, so it resets to the free max.
+// expires; purchased top-ups (the topup bucket) are untouched. Usage draws it down at the
+// running workspace's size rate; overage beyond the envelope is metered to Stripe. A
+// lapsed/cancelled subscription resolves to 'free', so it resets to the free envelope.
 
-/** The plan's monthly tier allotment in µUSD. */
+/** The plan's monthly included-compute envelope in µUSD (includedComputeHours × Duckling $/hr). */
 export function tierMonthlyMicro(planName: PlanName): number {
-  return Math.round(getPlan(planName).monthlyCreditUsd * MICRO_PER_USD);
+  const hours = getPlan(planName).entitlements.includedComputeHours;
+  return Math.round(hours * DUCKLING_USD_PER_HOUR * MICRO_PER_USD);
 }
 
 /** Current billing period as 'YYYY-MM' (UTC) — the per-period idempotency stamp. */
@@ -309,9 +325,12 @@ export async function hasCredit(orgId: string): Promise<boolean> {
     );
     if (r.rows.length === 0) return true; // no row → fail-open (see doc above)
     if (Number(r.rows[0]!.balance_micro) > 0) return true;
-    // Balance exhausted — complimentary orgs (company domains) are never cut off.
-    // Checked only here (not on every call) so the hot path stays a single cheap read.
-    return await isOrgComped(orgId);
+    // Balance exhausted. Complimentary orgs (company domains) are never cut off.
+    if (await isOrgComped(orgId)) return true;
+    // Paid orgs (a real Stripe subscription) keep serving — overage is METERED to Stripe, not
+    // paused. Only card-less trial/free orgs pause here. Checked only on exhaustion so the hot
+    // path stays a single cheap read.
+    return await hasActivePaidSubscription(orgId);
   } catch (e) {
     console.log(`[credits] hasCredit fail-open (DB error): ${e instanceof Error ? e.message : String(e)}`);
     return true; // never break the data path on a credits read
@@ -339,15 +358,23 @@ export async function getBalanceMicro(orgId: string): Promise<number> {
  * idle-but-open session the sweeper closes well past its TTL can't be overcharged.
  * A zero-duration session still gets `billed_at` set so the sweeper stops rescanning it.
  */
-export async function debitSessionDuration(sessionId: string): Promise<void> {
+/** Callback to forward a session's compute OVERAGE (µUSD beyond the org's available balance)
+ *  to Stripe. Injected so credits.ts stays Stripe-agnostic (wired in the cron handler). */
+export type OverageReporter = (orgId: string, overageMicro: number, identifier: string) => Promise<void>;
+
+export async function debitSessionDuration(
+  sessionId: string,
+  onOverage?: OverageReporter,
+): Promise<void> {
   const row = await query<{
     org_id: string;
     started_at: string;
     ended_at: string | null;
     expires_at: string;
     billed_at: string | null;
+    compute_size: string | null;
   }>(
-    `SELECT org_id, started_at, ended_at, expires_at, billed_at
+    `SELECT org_id, started_at, ended_at, expires_at, billed_at, compute_size
        FROM waddling.agent_session WHERE id = $1`,
     [sessionId],
   );
@@ -357,9 +384,13 @@ export async function debitSessionDuration(sessionId: string): Promise<void> {
   const startMs = Date.parse(s.started_at);
   const endMs = Math.min(Date.parse(s.ended_at), Date.parse(s.expires_at));
   const durationMs = Math.max(0, endMs - startMs);
-  const micro = Math.round(durationMs * SESSION_MICRO_PER_MS);
+  // Bill at the rate of the SIZE this session actually ran at (not the flat base rate).
+  const micro = Math.round(durationMs * sessionMicroPerMs(s.compute_size));
 
   if (micro > 0) {
+    // Overage = the part of this debit not covered by the balance BEFORE it (i.e. usage past
+    // the included envelope). Read before posting so the meter gets exactly the excess.
+    const beforeMicro = onOverage ? await getBalanceMicro(s.org_id) : 0;
     await postEntry({
       orgId: s.org_id,
       amountMicro: -micro,
@@ -369,6 +400,10 @@ export async function debitSessionDuration(sessionId: string): Promise<void> {
       refKind: 'session',
       refId: sessionId,
     });
+    if (onOverage) {
+      const overageMicro = Math.max(0, micro - Math.max(0, beforeMicro));
+      if (overageMicro > 0) await onOverage(s.org_id, overageMicro, `session:${sessionId}`);
+    }
   }
   // Mark billed regardless (incl. zero-duration) so the sweeper won't rescan it.
   await query(`UPDATE waddling.agent_session SET billed_at = now() WHERE id = $1`, [sessionId]);
@@ -408,7 +443,7 @@ export async function debitQueryFloor(
  *
  * Returns the number of sessions debited this tick.
  */
-export async function sweepExpiredSessions(): Promise<number> {
+export async function sweepExpiredSessions(onOverage?: OverageReporter): Promise<number> {
   // Pass 1 — close abandoned (expired-but-active) sessions.
   await query(
     `UPDATE waddling.agent_session
@@ -426,7 +461,7 @@ export async function sweepExpiredSessions(): Promise<number> {
   let debited = 0;
   for (const r of unbilled.rows) {
     try {
-      await debitSessionDuration(r.id);
+      await debitSessionDuration(r.id, onOverage);
       debited++;
     } catch (e) {
       console.log(`[credits] sweep debit failed for ${r.id}: ${e instanceof Error ? e.message : String(e)}`);
@@ -463,11 +498,12 @@ export interface ReconcileResult {
  * Bounded to the most-recently-billed `limit` sessions per tick (a drift alarm, not a
  * full-history audit). Cheap, read-only; safe to run every cron tick.
  *
- * Caveat — rate history: expectation is re-derived at the CURRENT SESSION_MICRO_PER_MS.
- * A session billed under a different rate (e.g. before a retail-margin change) will
- * surface as `amount_mismatch` even though its debit was correct at the time. So a
- * non-empty drift report right after a rate change is expected, not necessarily a bug;
- * a clean "zero drift" is only meaningful for sessions billed at today's rate.
+ * Caveat — rate history: expectation is re-derived at the session's recorded compute-size
+ * rate (COMPUTE_SIZES[size].usdPerHour) as it stands TODAY. A session billed before a rate
+ * change to that size (e.g. a retail-margin edit) will surface as `amount_mismatch` even
+ * though its debit was correct at the time. So a non-empty drift report right after a rate
+ * change is expected, not necessarily a bug; a clean "zero drift" is only meaningful for
+ * sessions billed at today's rate for their size.
  */
 export async function reconcileDebits(limit = 1000): Promise<ReconcileResult> {
   const rows = await query<{
@@ -476,9 +512,10 @@ export async function reconcileDebits(limit = 1000): Promise<ReconcileResult> {
     started_at: string;
     ended_at: string;
     expires_at: string;
+    compute_size: string | null;
     ledger_micro: string | null;
   }>(
-    `SELECT s.id AS session_id, s.org_id, s.started_at, s.ended_at, s.expires_at,
+    `SELECT s.id AS session_id, s.org_id, s.started_at, s.ended_at, s.expires_at, s.compute_size,
             l.amount_micro AS ledger_micro
        FROM waddling.agent_session s
        LEFT JOIN waddling.credit_ledger l
@@ -495,7 +532,8 @@ export async function reconcileDebits(limit = 1000): Promise<ReconcileResult> {
     const startMs = Date.parse(r.started_at);
     const endMs = Math.min(Date.parse(r.ended_at), Date.parse(r.expires_at));
     const durationMs = Math.max(0, endMs - startMs);
-    const expectedMicro = Math.round(durationMs * SESSION_MICRO_PER_MS);
+    // Re-derive at the SESSION'S recorded size rate — same function debitSessionDuration uses.
+    const expectedMicro = Math.round(durationMs * sessionMicroPerMs(r.compute_size));
     const ledgerMicro = r.ledger_micro == null ? null : Number(r.ledger_micro);
 
     let kind: DebitDrift['kind'] | null = null;

@@ -129,6 +129,12 @@ export const auth = betterAuth({
       stripeClient: stripeClientInstance,
       stripeWebhookSecret: getStripeWebhookSecret(),
       createCustomerOnSignup: true,
+      // Org-scoped billing: adds organization.stripeCustomerId (created by
+      // getMigrations) and lets the customer.subscription.* webhooks resolve a
+      // Stripe customer back to its org (findReferenceByStripeCustomerId). Required
+      // for subscriptions created outside the plugin's own hosted-Checkout upgrade
+      // (the embedded Elements flow in control-api) to reconcile into entitlements.
+      organization: { enabled: true },
       subscription: {
         enabled: true,
         // Subscriptions bound to organization (§6) — referenceId = org id.

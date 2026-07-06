@@ -26,6 +26,17 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning className={cn("font-sans", geist.variable, coiny.variable)}>
       <body className="flex flex-col min-h-screen">
+        {/* next-themes (via fumadocs RootProvider) injects a pre-hydration inline theme
+            script; the SWC transform wraps its functions with `__name(fn, "name")`, but
+            that esbuild/keepNames helper isn't defined in the inline browser scope → an
+            app-wide `__name is not defined` ReferenceError that kills the theme script.
+            Shim it as identity BEFORE that script runs (first body child = first to
+            execute). No-op if already defined. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: 'globalThis.__name||(globalThis.__name=function(f){return f});',
+          }}
+        />
         {/* PostHogSetup is a no-op passthrough when NEXT_PUBLIC_POSTHOG_KEY is unset */}
         <PostHogSetup>
           {/* Ship dark by default (the brand's first impression); the toggle

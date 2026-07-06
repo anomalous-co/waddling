@@ -30,20 +30,19 @@ import {
   invitationEmail,
   paymentFailedEmail,
 } from './email';
-import { queryOne } from './db';
+import { query, queryOne } from './db';
 import { fulfillCreditPackEvent } from './credit-packs';
 import { captureCheckoutCompletedEvent } from './funnel-stripe';
 
 function stripePlans(
   env: Env,
-): { name: string; priceId: string; freeTrial?: { days: number } }[] {
+): { name: string; priceId: string }[] {
+  // Base subscription prices for the paid tiers. The 7-day trial is LOCAL (no Stripe
+  // subscription, no card — see org.trialEndsAt); a card is collected only at conversion,
+  // which creates the real subscription. So no plugin freeTrial here.
   return [
-    // Starter carries a short card-required trial: value lands in the first
-    // session (connect → remember → recall), so the trial converts fast; the
-    // plugin marks the subscription `trialing`, which getActivePlanName treats
-    // as active and /billing/status counts as paid.
-    { name: 'starter', priceId: env.STRIPE_PRICE_STARTER, freeTrial: { days: 3 } },
     { name: 'pro', priceId: env.STRIPE_PRICE_PRO },
+    { name: 'max', priceId: env.STRIPE_PRICE_MAX },
     { name: 'scale', priceId: env.STRIPE_PRICE_SCALE },
   ].filter((p) => p.priceId);
 }
@@ -162,6 +161,20 @@ function construct(env: Env, pool: Pool) {
             organization: { id: string; name?: string };
             user: { id: string };
           }) => {
+            // Start the 7-day no-card trial: grants Pro entitlements until trialEndsAt
+            // (see getActivePlanName). No Stripe subscription/card yet — a card is
+            // collected only at conversion. Set BEFORE the tier-credit seed below so the
+            // seed grants Pro's compute envelope, not Free's.
+            try {
+              await query(
+                `UPDATE "organization" SET "trialEndsAt" = now() + interval '7 days' WHERE id = $1`,
+                [args.organization.id],
+              );
+            } catch (e) {
+              console.log(
+                `[trial] set trialEndsAt failed for org ${args.organization.id}: ${e instanceof Error ? e.message : String(e)}`,
+              );
+            }
             try {
               makePostHog(env, authExecutionCtx()).capture({
                 distinctId: args.user.id,
@@ -203,6 +216,12 @@ function construct(env: Env, pool: Pool) {
       stripe({
         stripeClient: stripeClientInstance,
         stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET,
+        // Org-scoped billing. Enables findReferenceByStripeCustomerId's organization
+        // lookup (organization.stripeCustomerId → org), so the customer.subscription.*
+        // webhooks reconcile subscriptions created OUTSIDE the plugin's hosted upgrade
+        // — i.e. the embedded Elements flow (routes/billing.ts subscription-checkout),
+        // which mints + persists organization.stripeCustomerId before creating the sub.
+        organization: { enabled: true },
         onEvent: async (event) => {
           await fulfillCreditPackEvent(event);
           await captureCheckoutCompletedEvent(env, event, authExecutionCtx());

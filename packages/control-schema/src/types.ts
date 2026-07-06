@@ -62,14 +62,21 @@ export interface AuditQuery {
 
 // ── Plans ──────────────────────────────────────────────────────────────────────
 export interface Plan {
-  // 'starter' is the $15/mo personal-data-store entry tier; 'scale' is the
-  // self-serve top tier ($199/mo); 'enterprise' is sales-led (dedicated
-  // gateways/SSO/SLA) with no self-serve Stripe price.
-  name: 'free' | 'starter' | 'pro' | 'scale' | 'enterprise';
+  // Base subscription + included envelope + metered usage. 'pro' $29 (7-day no-card trial
+  // grants it), 'max' $99, 'scale' $299 self-serve top tier; 'free' is the lapsed floor.
+  name: 'free' | 'pro' | 'max' | 'scale';
   priceId: string;
+  /** Flat monthly base fee (USD) — the Stripe subscription price. Free = 0. */
+  baseMonthlyUsd: number;
   entitlements: {
-    endpoints: number;
-    agents: number;
+    /** Org seats (users/members). */
+    seats: number;
+    /** Data lakes (endpoints). The org memory lake (kind='quackboard') is exempt. */
+    lakes: number;
+    /** Included storage (GB). Overage billed at $0.04/GB-mo. */
+    storageGb: number;
+    /** Included compute envelope, in Duckling-equivalent hours/month. Overage metered. */
+    includedComputeHours: number;
     dynamicAcl: boolean;
     adminMcp: boolean;
     auditRetentionDays: number;

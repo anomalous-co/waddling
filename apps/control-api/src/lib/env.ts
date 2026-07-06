@@ -111,13 +111,16 @@ export interface Env {
   // ── Stripe (placeholder values in B1; real keys are Worker secrets later) ─
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
-  // 'starter' is the $15/mo entry tier (3-day trial; see auth.ts stripePlans).
-  STRIPE_PRICE_STARTER: string;
+  // Base subscription prices: Pro $29, Max $99, Scale $299 (Free has no price).
   STRIPE_PRICE_PRO: string;
-  // 'scale' is the self-serve $199/mo tier (formerly labelled enterprise). The
-  // sales-led `enterprise` tier has no self-serve price, hence no var here.
+  STRIPE_PRICE_MAX: string;
   STRIPE_PRICE_SCALE: string;
-  // One-time credit-pack Prices (ANO-64 fills these). Unset/placeholder ⇒ pack hidden.
+  // Metered usage prices, each backed by a Stripe Billing Meter. COMPUTE bills the
+  // compute-envelope overage (in USD via a $1/unit meter reporting overage dollars);
+  // STORAGE bills lake storage beyond the tier cap at $0.04/GB-mo. Unset ⇒ metering off.
+  STRIPE_PRICE_COMPUTE: string;
+  STRIPE_PRICE_STORAGE: string;
+  // Legacy one-time credit-pack Prices (being retired with the prepaid model). Unset ⇒ hidden.
   STRIPE_PRICE_CREDIT_10: string;
   STRIPE_PRICE_CREDIT_25: string;
   STRIPE_PRICE_CREDIT_100: string;
