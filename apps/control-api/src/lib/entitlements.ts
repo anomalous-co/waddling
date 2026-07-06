@@ -89,3 +89,25 @@ export async function getEntitlements(
 ): Promise<Plan['entitlements']> {
   return (await getActivePlan(orgId)).entitlements;
 }
+
+/** The boolean (feature-flag) entitlement keys — the ones `requireEntitlement` gates on. */
+type BooleanEntitlement = {
+  [K in keyof Plan['entitlements']]: Plan['entitlements'][K] extends boolean ? K : never;
+}[keyof Plan['entitlements']];
+
+/**
+ * Gate an action behind a boolean feature entitlement (e.g. `dynamicAcl`, `adminMcp`) rather
+ * than a raw plan rank. Prefer this over `requirePlan` for feature gates: it tracks the plan
+ * CATALOG (plans.ts), so re-tiering a feature — say, making per-agent ACLs a `starter` perk —
+ * needs no route edits. Throws `UpgradeRequiredError` (→ 402) naming the cheapest plan that
+ * grants the entitlement.
+ */
+export async function requireEntitlement(
+  orgId: string,
+  key: BooleanEntitlement,
+): Promise<void> {
+  const current = await getActivePlanName(orgId);
+  if (getPlan(current).entitlements[key]) return;
+  const min = (PLAN_ORDER.find((n) => getPlan(n).entitlements[key]) ?? 'enterprise') as PlanName;
+  throw new UpgradeRequiredError(min, current);
+}

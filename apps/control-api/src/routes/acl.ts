@@ -8,7 +8,7 @@
  * GET  /        → list the datalake's literal statements (org-scoped; ?datalakeId= required-ish).
  * POST /        → author one GRANT (effect='allow') or DENY (effect='deny') from granular inputs
  *                 (privilege ∈ SELECT/INSERT/UPDATE/DELETE/TRUNCATE/CREATE/DROP/ALTER/USAGE/EXECUTE/
- *                 DETACH — NO coarse read/write). Guards preserved: billing (requirePlan), tenant
+ *                 DETACH — NO coarse read/write). Guards preserved: billing (dynamicAcl entitlement), tenant
  *                 isolation (assertOrg on datalake + agent), owner/admin gate for subjectKind='user'.
  * GET  /:id     → a single statement row (org-scoped).
  * DELETE /:id   → object grant/deny: DELETE the row + bump epoch. A role-MEMBERSHIP row is instead
@@ -21,7 +21,7 @@ import { z } from 'zod';
 import { Hono } from 'hono';
 import { query, queryOne } from '../lib/db';
 import type { Env } from '../lib/env';
-import { requirePlan, UpgradeRequiredError } from '../lib/entitlements';
+import { requireEntitlement, UpgradeRequiredError } from '../lib/entitlements';
 import {
   grant, deny, revokeRole, grantRole, granteeFromInput,
   applyStatement, deleteGrantById, listStatements,
@@ -130,12 +130,15 @@ acl.post('/', (c) =>
     const caller = await resolveCaller(c);
     const input = await parseBody(c, GrantInputSchema);
 
-    // Billing gate (only when billing is actually configured — placeholder Stripe ⇒ skip so
-    // we don't lock everyone out; mirrors the previous acl.ts + auth.ts stripeConfigured check).
+    // Feature gate: per-agent access control is the `dynamicAcl` entitlement — free lacks it,
+    // starter+ have it (plans.ts). This is the PRODUCT'S CORE MECHANIC, not a Pro upsell, so it
+    // gates on the entitlement (tracks the plan catalog) rather than a hard requirePlan('pro'),
+    // which locked every starter org out of managing its own agents. Only enforced when billing
+    // is actually configured — placeholder Stripe ⇒ skip so we don't lock everyone out.
     const billingOn = !!c.env.STRIPE_SECRET_KEY && !/placeholder/i.test(c.env.STRIPE_SECRET_KEY);
     if (billingOn) {
       try {
-        await requirePlan(caller.orgId, 'pro');
+        await requireEntitlement(caller.orgId, 'dynamicAcl');
       } catch (e) {
         if (e instanceof UpgradeRequiredError) { /* analytics deferred on workerd */ }
         throw e;
