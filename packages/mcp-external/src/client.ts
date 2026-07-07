@@ -41,8 +41,12 @@ export function loadClientConfig(): ClientConfig {
   return { baseUrl: baseUrl.replace(/\/+$/, ""), apiKey };
 }
 
-/** Resolves the live {baseUrl, apiKey} at call time (so a mid-session link works). */
-export type ConfigProvider = () => ClientConfig;
+/**
+ * Resolves the live {baseUrl, apiKey} at call time (so a mid-session link works).
+ * Takes an optional profile name so a single tool call can target a specific
+ * bearer-token profile; the provider throws if that profile is not linked.
+ */
+export type ConfigProvider = (profile?: string) => ClientConfig;
 
 export class WaddlingClient {
   private readonly resolve: ConfigProvider;
@@ -52,9 +56,14 @@ export class WaddlingClient {
     this.resolve = typeof config === "function" ? config : () => config;
   }
 
+  /** The base URL (app origin) for the resolved profile — used for deep links. */
+  baseUrl(profile?: string): string {
+    return this.resolve(profile).baseUrl;
+  }
+
   /** Call a control-plane REST endpoint with Bearer API-key auth. */
-  async cp<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
-    const config = this.resolve();
+  async cp<T>(path: string, init?: { method?: string; body?: unknown; profile?: string }): Promise<T> {
+    const config = this.resolve(init?.profile);
     const res = await fetch(`${config.baseUrl}${path}`, {
       method: init?.method ?? "GET",
       headers: {

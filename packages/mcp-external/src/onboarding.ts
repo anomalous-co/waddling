@@ -18,7 +18,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { DeviceLinkInit, DeviceLinkPoll } from "@waddling/control-schema";
 import {
   onboardingBaseUrl,
-  persistCredentials,
+  persistProfile,
   type ResolvedCredentials,
 } from "./credentials";
 
@@ -33,6 +33,8 @@ export interface LinkState {
   /** poll_token of the in-flight link, set by waddling_signup. */
   pollToken?: string;
   verifyUrl?: string;
+  /** Profile name the in-flight signup will persist the claimed key into. */
+  profileName?: string;
 }
 
 function json(value: unknown, isError = false): CallToolResult {
@@ -64,11 +66,15 @@ export function registerOnboardingTools(server: McpServer, state: LinkState): vo
         "Connect this device to waddling (one-time, ~60s). Returns a verify_url and a short " +
         "code — show BOTH to the human and ask them to open the link and sign in. Then poll " +
         "waddling_signup_status until it reports connected. Use this whenever a waddling tool " +
-        "returns { error:'not_linked' }.",
-      inputSchema: {},
+        "returns { error:'not_linked' }. Pass `profile` to store the new key under a named " +
+        "bearer profile (default 'default') so this install can hold several identities.",
+      inputSchema: {
+        profile: z.string().optional().describe("Name for the stored bearer profile (default 'default')."),
+      },
     },
-    async (): Promise<CallToolResult> => {
+    async (args): Promise<CallToolResult> => {
       try {
+        state.profileName = args.profile ?? "default";
         const res = await fetch(`${baseUrl}/api/cp/device-link`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -125,16 +131,18 @@ export function registerOnboardingTools(server: McpServer, state: LinkState): vo
           });
         }
         if (body.status === "claimed" && body.apiKey) {
-          // Persist + go live in-memory so the full surface works without restart.
-          persistCredentials(body.apiKey, baseUrl);
-          state.creds = { apiKey: body.apiKey, baseUrl, source: "file" };
+          // Persist into the target profile + go live in-memory (no restart needed).
+          const profile = state.profileName ?? "default";
+          const creds = persistProfile(profile, body.apiKey, { baseUrl });
+          state.creds = creds;
           state.pollToken = undefined;
           return json({
             status: "claimed",
             connected: true,
+            profile,
             message:
               "Connected. The full waddling tool surface is now available — retry the task the user " +
-              "originally asked for (start with waddling_list_endpoints).",
+              "originally asked for (start with waddling_list_datalakes).",
           });
         }
         if (body.status === "claimed") {

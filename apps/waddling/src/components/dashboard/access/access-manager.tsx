@@ -16,6 +16,7 @@
  * DELETE removed rows + POST added statements, batched, reduction-gated.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { Boxes, UserCog, RefreshCw, Loader2, ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
 import { fetchCp, cpPost, cpDelete } from '@/components/dashboard/fetch';
@@ -86,8 +87,70 @@ export interface AccessManagerProps {
 /** The subject placeholder used for own-grant SQL before the agent id exists. */
 const NEW_SUBJECT = 'new';
 
+// ── Access-request proposals (?propose= deep link) ────────────────────────────
+// The `waddling_request_access` MCP tool sends a human here with a base64url
+// `?propose=` payload of the grants an agent wants. We decode it and overlay the
+// requested grants into the draft as PENDING additions so the operator reviews +
+// Saves. Coarse caps map to the same granular privileges the Picker presets use.
+
+interface ProposedGrant {
+  datalakeId?: string;
+  schema: string;
+  table: string;
+  caps: string[];
+}
+
+const CAP_PRIVILEGES: Record<string, string[]> = {
+  read: ['SELECT'],
+  write: ['INSERT', 'UPDATE', 'DELETE'],
+  create: ['CREATE'],
+  drop: ['DROP'],
+  alter: ['ALTER'],
+  // `detach` has no granular privilege in this vocab — ignored in the overlay.
+};
+
+function capsToPrivileges(caps: string[]): string[] {
+  const out = new Set<string>();
+  for (const cap of caps) for (const priv of CAP_PRIVILEGES[cap] ?? []) out.add(priv);
+  return [...out];
+}
+
+/** Decode the base64url `?propose=` payload. Malformed → null (ignored silently). */
+function decodeProposal(param: string): ProposedGrant[] | null {
+  try {
+    const b64 = param.replace(/-/g, '+').replace(/_/g, '/');
+    const bin = atob(b64);
+    const bytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+    const obj = JSON.parse(new TextDecoder().decode(bytes)) as { grants?: unknown };
+    const grants = Array.isArray(obj.grants) ? obj.grants : [];
+    return grants
+      .filter(
+        (g): g is ProposedGrant =>
+          !!g && typeof (g as ProposedGrant).schema === 'string' &&
+          typeof (g as ProposedGrant).table === 'string' && Array.isArray((g as ProposedGrant).caps),
+      )
+      .map((g) => ({
+        datalakeId: typeof g.datalakeId === 'string' ? g.datalakeId : undefined,
+        schema: g.schema,
+        table: g.table,
+        caps: g.caps.filter((c): c is string => typeof c === 'string'),
+      }));
+  } catch {
+    return null;
+  }
+}
+
 export function AccessManager({ mode, agentId, datalakes: datalakesProp, draft, onDraftChange, fill }: AccessManagerProps) {
   const subjectAgentId = agentId ?? NEW_SUBJECT;
+
+  // ?propose= deep link (agent access request) — decoded once, overlaid on load.
+  const searchParams = useSearchParams();
+  const proposeParam = searchParams.get('propose');
+  const proposal = useMemo(
+    () => (mode === 'detail' && proposeParam ? decodeProposal(proposeParam) : null),
+    [mode, proposeParam],
+  );
+  const proposalApplied = useRef(false);
 
   const [datalakes, setDatalakes] = useState<DatalakeOption[]>(datalakesProp ?? []);
   const [datalakeId, setDatalakeId] = useState<string>(draft?.datalakeId ?? datalakesProp?.[0]?.id ?? '');
@@ -191,6 +254,42 @@ export function AccessManager({ mode, agentId, datalakes: datalakesProp, draft, 
       cancelled = true;
     };
   }, [datalakeId, loadCatalog, loadGrants]);
+
+  // Point the editor at the proposal's datalake before overlaying its grants.
+  useEffect(() => {
+    if (!proposal || proposalApplied.current) return;
+    const wantLake = proposal.find((g) => g.datalakeId)?.datalakeId;
+    if (wantLake && wantLake !== datalakeId && datalakes.some((d) => d.id === wantLake)) {
+      setDatalakeId(wantLake);
+    }
+  }, [proposal, datalakes, datalakeId]);
+
+  // Overlay the requested grants onto the loaded draft as PENDING additions — once,
+  // after baseline load, for grants targeting the currently-selected datalake.
+  useEffect(() => {
+    if (!proposal || proposalApplied.current || loading || !agentId || !datalakeId) return;
+    const forLake = proposal.filter((g) => !g.datalakeId || g.datalakeId === datalakeId);
+    // If every grant names a different lake, wait for the datalake switch above.
+    if (forLake.length === 0) return;
+    const additions: DraftStatement[] = [];
+    for (const g of forLake) {
+      const privileges = capsToPrivileges(g.caps);
+      if (privileges.length === 0) continue;
+      const object = g.table === '*' ? { schema: g.schema, allTables: true as const } : { schema: g.schema, table: g.table };
+      additions.push(draftFromSpec({ kind: 'object', effect: 'allow', privileges, object, grantee: { kind: 'agent', agentId } }));
+    }
+    proposalApplied.current = true;
+    if (additions.length === 0) return;
+    setOwn((prev) => {
+      const seen = new Set(prev.map((s) => s.sql));
+      const fresh = additions.filter((a) => !seen.has(a.sql));
+      if (fresh.length === 0) return prev;
+      queueMicrotask(() =>
+        toast.info(`${fresh.length} requested grant${fresh.length > 1 ? 's' : ''} added as pending — review and Save.`),
+      );
+      return [...prev, ...fresh];
+    });
+  }, [proposal, loading, agentId, datalakeId]);
 
   const refresh = async () => {
     setRefreshing(true);

@@ -12,12 +12,12 @@ import { Button } from '@/components/ui/button';
 const SPEC = sphere();
 
 const BULLETS = [
-  'Agents self-serve — they spin up a lake, create tables, and load data with plain SQL, no provisioning',
-  'Runs itself — no clusters, no glue code, no ops; the lake scales and maintains itself in the background',
-  'Agents remember — what they loaded, how your tables work, what they learned last session',
-  'Governed by default — dynamic per-agent ACLs on columns, rows, and time windows, with instant revoke',
-  'Metered compute — pick a size from Duckling to Swan, billed per-second, no infrastructure to run',
-  'Connections coming soon — point the lake at your own sources and let agents query them in place',
+  'Agents self-serve — spin up a lake and load data in plain SQL',
+  'Runs itself — no clusters, no glue code, no ops',
+  'Agents remember across sessions',
+  'Governed by default — per-agent ACLs, instant revoke',
+  'Metered compute, billed per-second',
+  'Connections coming soon',
 ];
 
 // Four-tier glance. Copy is hardcoded to stay decoupled from the PLANS schema
@@ -44,11 +44,8 @@ export function SwarmMemory() {
             A lake your agents run themselves.
           </h2>
           <p className="mb-6 max-w-md leading-relaxed text-muted-foreground">
-            A managed DuckDB/DuckLake lake built for agents to set up, manage, and
-            maintain on their own — they create tables, ingest, query, and
-            remember in plain SQL. No infrastructure, no glue code. You govern
-            exactly what each one can see, down to the column, row, and time
-            window. Connections to your own sources coming soon.
+            Agents set up, run, and remember in a managed DuckLake — governed
+            per-agent, no infrastructure.
           </p>
           <ul className="mb-8 max-w-md space-y-3">
             {BULLETS.map((b) => (
@@ -79,20 +76,20 @@ export function SwarmMemory() {
             ))}
           </div>
           <p className="mb-6 font-mono text-xs text-muted-foreground">
-            Base subscription + included storage & compute envelope + metered usage.
+            Base subscription + metered usage.
           </p>
 
           <Button
             asChild
             size="lg"
-            className="bg-emerald-500 font-mono font-semibold text-emerald-950 hover:bg-emerald-400"
+            className="rounded-none bg-emerald-500 px-7 font-mono text-base font-bold tracking-tight text-emerald-950 shadow-[0_0_30px_-6px_var(--color-emerald-500)] ring-1 ring-emerald-600/50 transition-all hover:bg-emerald-600 hover:text-emerald-50 hover:shadow-[0_0_40px_-4px_var(--color-emerald-600)]"
           >
             <TrackedLink
               href={appUrl('/dashboard')}
               location="landing_swarm_memory"
-              text="start free — 7 days, no card"
+              text="start free"
             >
-              start free — 7 days, no card →
+              Start free →
             </TrackedLink>
           </Button>
         </div>
