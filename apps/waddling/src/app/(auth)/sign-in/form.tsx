@@ -12,11 +12,19 @@ import { Input } from '@/components/ui/input';
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
 import { Field, FieldLabel, FieldGroup } from '@/components/ui/field';
 import { BrandMark } from '@/components/brand-mark';
+import { safeNextPath } from '@/lib/utils';
 
 export function SignInForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const next = searchParams.get('next') ?? '/dashboard';
+  // A validated same-origin return target. Defaults to the dashboard; used verbatim in
+  // router.push below and carried onward to sign-up.
+  const safeNext = safeNextPath(searchParams.get('next'));
+  const next = safeNext ?? '/dashboard';
+  // Carry `next` onward to sign-up so a user without an account (e.g. one funneled here
+  // from the MCP device-link at /link?code=…) keeps the same return target through
+  // account creation → onboarding → back to claim.
+  const signUpHref = safeNext ? `/sign-up?next=${encodeURIComponent(safeNext)}` : '/sign-up';
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -103,7 +111,7 @@ export function SignInForm() {
 
             <p className="mt-4 text-center text-xs text-muted-foreground">
               No account?{' '}
-              <Link href="/sign-up" className="text-primary hover:underline">
+              <Link href={signUpHref} className="text-primary hover:underline">
                 Create one
               </Link>
             </p>

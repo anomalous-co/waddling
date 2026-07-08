@@ -17,6 +17,8 @@ interface CopyButtonProps {
   /** Visual size variant (mirrors Button size). Defaults to 'icon'. */
   size?: 'icon' | 'sm' | 'default';
   className?: string;
+  /** When true, shows a brief emerald ring pulse to draw attention. */
+  glow?: boolean;
 }
 
 /**
@@ -31,7 +33,7 @@ interface CopyButtonProps {
  *   announcement. Mounting the element with content already set would not announce.
  * - The Check icon swap is `aria-hidden` — it is purely visual feedback.
  */
-export function CopyButton({ text, label, size = 'icon', className }: CopyButtonProps) {
+export function CopyButton({ text, label, size = 'icon', className, glow }: CopyButtonProps) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = useCallback(() => {
@@ -61,6 +63,7 @@ export function CopyButton({ text, label, size = 'icon', className }: CopyButton
         aria-label={label}
         className={cn(
           'shrink-0 text-muted-foreground hover:text-foreground',
+          glow && 'animate-pulse ring-2 ring-emerald-400/60',
           className,
         )}
       >

@@ -1,52 +1,68 @@
 ---
 title: What is waddling?
-description: Dynamic ACLs for AI agents on your analytics lakehouse — per-agent policies, instant revoke, and full audit enforced at the DuckDB gateway.
+description: A governed data lake for AI agents — connect an agent, and it queries, loads, and remembers under per-agent access controls enforced at the gateway.
 ---
 
 # What is waddling?
 
-waddling is the control plane for **governed AI agent access to analytics lakehouses**.
+waddling is a **governed data lake for AI agents**. You point an agent at your
+data, and it can explore schemas, run SQL, load new data, and remember what it
+learns — while every table, column, and row it can touch is controlled by
+per-agent grants and enforced inside the gateway. Agents never hold your storage
+credentials; they hold a scoped identity you can widen or revoke at any time.
 
-You connect your DuckLake (DuckDB + Parquet on Cloudflare R2 or S3) to a waddling-managed **DuckDB gateway endpoint**. Your agents connect to that endpoint using the standard DuckDB `ATTACH` command — but instead of raw lake credentials, they receive a short-lived session token. Every table, column, and row the agent can read or write is defined by ACL rules you control, enforced at the gateway, with every decision recorded in a live audit log.
+## The mental model
 
-## The problem it solves
+Four things make up the whole product. The rest of these docs are organized
+around them.
 
-LLM agents that query analytics data are a double-edged sword: they can surface insights faster than any human analyst, but they can also exfiltrate sensitive data, run expensive scans, or be compromised. Static database credentials don't help — they're all-or-nothing, and revoking them breaks every session.
+| Concept | One line | Where in the app |
+|---|---|---|
+| **[Data lakes](/docs/data-lakes)** | Your governed analytics data — a managed DuckLake catalog over storage you own, queried as `lake.<schema>.<table>`. | **Data lakes** |
+| **[Workspaces](/docs/workspaces)** | Each agent's own private, durable, encrypted DuckDB scratch database, provisioned automatically on connect. | *(automatic)* |
+| **[Topics](/docs/topics)** | Shared memory and coordination channels agents post to and subscribe on. | **Quackboard** |
+| **[Agents](/docs/agents)** | The machine identities that do the work, each with its own grants — driven entirely through MCP tools. | **Agents** |
 
-waddling gives you:
+<Callout title="Governance is the point">
+A data lake is only useful to an agent once it has grants. Access is default-deny:
+a fresh agent sees nothing until you grant it, and it can ask for more with a
+one-click human approval flow. See [Access control](/docs/access-control).
+</Callout>
 
-- **Per-agent ACL policies**: define exactly which tables, columns, and rows each agent may access. Policies are dynamic — change them live without restarting anything.
-- **Instant revocation**: kill any agent's access in milliseconds via the dashboard or admin MCP server. The next query is denied before any rows are returned.
-- **Layered enforcement**: table-level access enforced by birdshot (a DuckDB C++ extension) in-process at the gateway; column projection and row limits enforced by the gateway query proxy; time windows enforced at session mint. No single layer can be bypassed without hitting another.
-- **Full audit**: every auth decision, query, grant, and revoke — durable, queryable, streamable to your dashboard.
-
-## Architecture overview
+## How it fits together
 
 ```
-Agent DuckDB                waddling gateway             waddling control plane
-───────────────            ─────────────────────        ──────────────────────────
-ATTACH 'quack:…'  ──────▶  birdshot_authenticate()  ──▶  POST /api/cp/sessions
-                            birdshot_authorize()          (session JWT minted)
-SELECT …          ──────▶  column-proxy rewrite      ──▶  audit_event written
-                            LIMIT injection
-results           ◀──────  gateway streams rows           usage_event written
+Your agent (Claude, a script, …)
+        │  MCP tools (hosted /mcp  or  npx @waddling/mcp)
+        ▼
+waddling control plane ──────────────┐
+  • mints a short-lived session       │  grants (literal GRANT/DENY SQL)
+  • provisions the agent's workspace  │  pulled + enforced by birdshot
+        │                             ▼
+        ▼                        the gateway
+  the agent's private        (governed DuckDB + birdshot extension)
+  DuckDB workspace  ── ATTACH ──▶  your data lake  (lake.<schema>.<table>)
 ```
 
-The agent **never sees lake credentials**. It receives a short-lived RS256 session JWT that grants only the access its ACL rules allow.
+The agent talks to waddling over MCP. waddling opens a **session**, spins up the
+agent's **workspace**, and attaches your **data lake** into it — server-side, so
+the agent runs SQL against `lake.<schema>.<table>` without ever touching an
+`ATTACH` string or a storage key. Inside the gateway, the **birdshot** extension
+reads that agent's grants and strips anything it isn't allowed to see.
 
-## Key concepts
+## Two ways to connect an agent
 
-| Concept | What it is |
-|---------|-----------|
-| **Endpoint** | A DuckLake bound to a waddling-managed DuckDB gateway. Each endpoint has a `quack:` address your agents ATTACH to. |
-| **Agent** | A machine principal (not a human). Holds an API key, receives per-agent ACL grants, appears in the audit log. |
-| **ACL rule** | A policy row: `(endpoint, agent, schema, table, columns[], verb, effect, row_limit, window, ttl)`. The policy compiler turns active rules into birdshot grants. |
-| **Session** | A live ATTACH connection. Backed by a short-lived RS256 JWT (15 min default, 1 hour max). Revocable instantly via the denylist. |
-| **birdshot** | A DuckDB C++ extension that enforces table-level read/write access and maintains an in-memory denylist for instant revocation. Runs inside the gateway process. |
+- **Hosted MCP** — a zero-install remote server at `/mcp`. Claude connects over
+  OAuth; you approve once. Includes shared memory + the quackboard.
+- **Local MCP** — `npx -y @waddling/mcp`, a stdio server for the `claude` CLI and
+  other hosts. Adds multi-identity **profiles**, an in-agent **access-request**
+  flow, and transparent session refresh.
+
+They expose different tools — see [Working through an agent](/docs/agents).
 
 ## Next steps
 
-- [Quickstart](/docs/quickstart) — sign up, create your first endpoint, connect an agent
-- [ACL model](/docs/acl-model) — understand layered enforcement
-- [MCP tools](/docs/mcp-tools) — all 18 governed tools for agents and admins
-- [Security](/docs/security) — token model, audit, birdshot boundaries
+- **[Quickstart](/docs/quickstart)** — connect an agent and run a governed query.
+- **[Data lakes](/docs/data-lakes)** · **[Workspaces](/docs/workspaces)** · **[Topics](/docs/topics)** — the core concepts.
+- **[Tutorials](/docs/tutorial-query)** — query a lake, load data, use memory, request access.
+- **[MCP tools](/docs/mcp-tools)** — the full tool reference.

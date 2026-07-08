@@ -1,0 +1,78 @@
+---
+title: "Tutorial: Query a lake"
+description: Connect an agent to a data lake, run a governed query, and handle denials by self-correcting.
+---
+
+# Tutorial: Query a lake
+
+The core loop: orient, connect, query, and self-correct on denials. These calls
+work on either MCP server.
+
+## 1. See what you can reach
+
+```
+waddling_list_datalakes
+// → [{ id: "dl_abc", name: "prod-analytics", slug: "prod-analytics", status: "running" }]
+
+waddling_whoami
+// → { agentId, org, grants: { statements: ["GRANT SELECT ON sales.orders TO agent:…"] }, grantsByDatalake: [...] }
+```
+
+`waddling_whoami` is the honest picture of your access — it shows the literal grant
+SQL without triggering any denial. If a lake you need isn't listed, or a table you
+need isn't in your grants, jump to [Request access](/docs/tutorial-request-access).
+
+## 2. Connect
+
+```
+waddling_connect({ datalake_id: "dl_abc" })
+// → { session_id: "sess_…", workspace_id, agent_id, ttl_seconds: 900, granted: {...} }
+```
+
+This provisions your [workspace](/docs/workspaces) and attaches the lake as `lake`.
+Hold onto `session_id`. You don't need to reconnect when it expires — the local
+server refreshes it for you.
+
+## 3. Query
+
+Reference lake tables as `lake.<schema>.<table>`:
+
+```
+waddling_query({
+  session_id: "sess_…",
+  sql: "SELECT customer_id, amount, region FROM lake.sales.orders WHERE region = 'EMEA' LIMIT 100"
+})
+// → { columns: [...], rows: [...], row_count: 100, truncated: false, snapshot_version: 42 }
+```
+
+Prefer explicit column lists over `SELECT *` — it's clearer about intent and avoids
+pulling columns you don't need.
+
+## 4. Handle denials
+
+Denials are structured objects. Read `reason` and adjust:
+
+```json
+{ "error": "authorization_denied", "table": "lake.sales.orders", "reason": "column ssn not granted" }
+```
+
+| What you see | What to do |
+|---|---|
+| a column isn't granted | Drop it from the SELECT (check `waddling_whoami` for allowed columns). |
+| `truncated: true` | Your grant caps rows — the result was capped. Narrow with a `WHERE`/`LIMIT`. |
+| the table isn't granted | It's not in your grants. [Request access](/docs/tutorial-request-access) or pick a granted table. |
+| `needs_configure` / session cold | Call `waddling_connect` again, then retry (local server does this automatically). |
+
+Never silently return an empty result on a denial — surface the reason to the user
+with context.
+
+## 5. Keep results
+
+To reuse a result across steps or sessions, materialize it in your workspace's
+`main` schema (it persists; scratch files don't):
+
+```
+waddling_query({ session_id, sql: "CREATE TABLE main.emea AS SELECT * FROM lake.sales.orders WHERE region = 'EMEA'" })
+```
+
+Next: [Load external data](/docs/tutorial-load-data) into the lake.

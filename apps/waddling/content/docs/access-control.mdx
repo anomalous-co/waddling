@@ -1,0 +1,99 @@
+---
+title: Access control
+description: Per-agent grants, authored as literal GRANT/DENY SQL and enforced live by birdshot in the gateway — plus the agent-driven request-and-approve flow.
+---
+
+# Access control
+
+Every data lake is **default-deny**. A fresh agent can reach nothing until you
+grant it. Grants are per agent, take effect live, and can be widened or revoked in
+seconds.
+
+## How grants work
+
+A grant is a **literal `GRANT` or `DENY` statement** scoped to a lake — for example
+`GRANT SELECT ON sales.orders TO agent:<id>`. waddling stores these statements and
+the gateway **pulls them live**; the birdshot extension reads the pulled grants and
+enforces them on every query. There's no compile or deploy step — Save a grant and
+the next query reflects it.
+
+Enforcement happens in the gateway at query time:
+
+- **Tables & verbs** — a query touching an ungranted table (or using an ungranted
+  verb like write/create) is denied.
+- **Columns** — grants can carry a column allow-list; ungranted columns are stripped
+  from the projection.
+- **Rows** — grants can carry a row cap; results are truncated to it.
+
+Denials come back structured — `{ error: "authorization_denied", table, reason }` —
+so an agent can read `reason` and self-correct (drop a column, qualify a table)
+without a human round-trip.
+
+## Capabilities
+
+Grants are authored from a capability vocabulary, grouped two ways:
+
+- **Catalog capabilities** on tables — `read`, `write`, `create`, `drop`, `alter`,
+  `detach`. In the editor these map to granular SQL privileges (read → `SELECT`,
+  write → `INSERT`/`UPDATE`/`DELETE`, and so on).
+- **Policy capabilities** for I/O and extensions — `read_source`, `copy_from`,
+  `copy_to`, `attach`, `install`, `load` — each carrying a pattern (an allowed host
+  or extension). These gate what [`waddling_etl`](/docs/tutorial-load-data) can read
+  from and write to.
+
+Grants target an **agent**, a **role** (agents that hold the role inherit it), or
+**PUBLIC** (every agent in the org).
+
+## Authoring grants (dashboard)
+
+Open **Agents → *agent* → Access**. The editor has two views over the same model:
+
+- **Picker** — a live schema browser crossed with capability presets. Toggle
+  read/write/manage per table or schema, add column allow-lists, assign roles.
+- **Grant SQL** — the key's literal statements, editable directly, with an inherited
+  (role/PUBLIC) region shown read-only.
+
+Save computes the minimal set of grant/deny changes and applies them. Removing a
+grant takes effect immediately and can interrupt anything the key is doing, so the
+editor confirms before removing.
+
+## The agent-driven request flow
+
+Agents don't have to wait for a human to guess what they need — with the local
+`@waddling/mcp` server they can **ask**:
+
+<Steps>
+<Step>
+### The agent requests
+
+`waddling_request_access({ datalake_id, grants: [{ schema, table, caps }] })`. This
+grants nothing — it returns a **link** encoding the requested grants.
+</Step>
+<Step>
+### A human reviews and approves
+
+The link opens the agent's Access editor with the requested grants pre-filled as a
+**pending** change, highlighted for review. An owner or admin clicks **Save**.
+</Step>
+<Step>
+### The agent continues
+
+`waddling_await_access(...)` polls until every requested grant is live, then returns
+`{ granted: true }`. The access is now **permanent** on the agent's key — retry the
+work that was blocked.
+</Step>
+</Steps>
+
+Full walkthrough: [Requesting access](/docs/tutorial-request-access).
+
+## Revocation
+
+Suspend an agent, delete it, or remove a grant from the Access editor — enforcement
+updates on the next query. Because birdshot pulls grants live and the session token
+is short-lived, there's no stale cached access to wait out.
+
+## Checking access without triggering a denial
+
+`waddling_whoami` returns the agent's identity and the **literal grant SQL** in
+scope (and the grants it holds in every reachable lake). Use it to see exactly what
+an agent can do before acting, instead of probing and collecting denials.

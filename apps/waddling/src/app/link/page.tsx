@@ -2,10 +2,13 @@
  * /link — device-code claim page (FUNNEL / Stream B, self-contained).
  *
  * Server component. The onboarding agent shows the human this URL with ?code=…
- * prefilled. Flow:
- *   - no session         → redirect to /sign-in?next=/link?code=… (existing auth)
+ * prefilled. This is the endpoint of the MCP signup funnel: an agent that boots
+ * unlinked hands its human this link, so we MUST guarantee the human ends up with
+ * an account AND an onboarded org before the agent can claim a key. Flow:
+ *   - no session         → /sign-in?next=/link?code=…  (sign-in/sign-up carry `next`)
+ *   - signed in, no org  → /onboarding?next=/link?code=…  (create org + start trial,
+ *                          then onboarding forwards BACK here to claim)
  *   - signed in, has org → render the claim form (pick org, name the agent)
- *   - signed in, no org  → prompt to create an org first
  *
  * Does NOT import or edit any dashboard files — the user's orgs come from the
  * control-api auth plane (Better Auth organization/list). Styling mirrors the
@@ -13,7 +16,6 @@
  */
 import { redirect } from 'next/navigation';
 import { getServerSession, listOrgs } from '@/lib/control-api-server';
-import { Button } from '@/components/ui/button';
 import { ClaimForm } from './claim-form';
 
 export default async function LinkPage({
@@ -22,16 +24,24 @@ export default async function LinkPage({
   searchParams: Promise<{ code?: string }>;
 }) {
   const { code = '' } = await searchParams;
+  const self = `/link${code ? `?code=${encodeURIComponent(code)}` : ''}`;
+
   // Session + org list come from the control-api auth plane (inbound cookie
   // forwarded); this render plane holds no DB binding of its own.
   const session = await getServerSession();
 
   if (!session?.user) {
-    const next = `/link${code ? `?code=${encodeURIComponent(code)}` : ''}`;
-    redirect(`/sign-in?next=${encodeURIComponent(next)}`);
+    redirect(`/sign-in?next=${encodeURIComponent(self)}`);
   }
 
+  // No org yet → route through the SAME onboarding gate every new customer hits (org
+  // creation + 7-day trial), threading this page as the return target so onboarding
+  // forwards the human back here to finish connecting their agent. Previously this
+  // dead-ended at the dashboard, letting an MCP user skip onboarding entirely.
   const orgs = await listOrgs();
+  if (orgs.length === 0) {
+    redirect(`/onboarding?next=${encodeURIComponent(self)}`);
+  }
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -41,21 +51,7 @@ export default async function LinkPage({
           <p className="mt-1 text-sm text-muted-foreground">Connect your agent</p>
         </div>
 
-        {orgs.length === 0 ? (
-          <div className="flex flex-col gap-4 rounded-lg border border-border bg-card p-6">
-            <div className="flex flex-col gap-1.5">
-              <h1 className="text-base font-semibold">Create an organization first</h1>
-              <p className="text-sm text-muted-foreground">
-                Agents connect to an organization. Create one, then return to this link.
-              </p>
-            </div>
-            <Button asChild className="w-fit">
-              <a href="/dashboard">Go to dashboard</a>
-            </Button>
-          </div>
-        ) : (
-          <ClaimForm initialCode={code} orgs={orgs} />
-        )}
+        <ClaimForm initialCode={code} orgs={orgs} />
 
         <p className="text-center text-xs text-muted-foreground">
           Signed in as {session.user.email}

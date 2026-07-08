@@ -1,0 +1,43 @@
+---
+title: Skills
+description: The official waddling agent skills — curated guidance that teaches your agent to use the tools correctly, bundled with the Claude Code plugin.
+---
+
+# Skills
+
+waddling ships a set of official **agent skills** — focused guides that teach an
+agent how to use the tools well: connecting, querying, loading data, remembering,
+and handling denials. They're bundled with the [Claude Code plugin](/docs/plugin)
+and activate automatically whenever the waddling tools are present. You don't invoke
+or configure them; the agent picks the right one for the task.
+
+Skills are curated and maintained by waddling and update with the plugin, so your
+agents stay correct as the platform evolves.
+
+## The catalog
+
+| Skill | Activates when… | Teaches |
+|---|---|---|
+| **waddling-analyst** | reading a lake | Orient with `whoami`, connect, query `lake.<schema>.<table>`, keep results in `main`, self-correct on structured denials. |
+| **waddling-loader** | ingesting external data | Use `waddling_etl` (not `query`) for remote URLs, ensure source + write grants, verify the load. |
+| **waddling-memory** | starting work / coordinating *(hosted MCP)* | Recall before working, remember durable facts, post and subscribe on topics. |
+| **waddling-access** | denied a needed table *(local MCP)* | Request the exact grants, hand off the approval link, poll until live. |
+
+Each skill mirrors a tutorial in these docs:
+[Query a lake](/docs/tutorial-query) · [Load data](/docs/tutorial-load-data) ·
+[Memory & topics](/docs/tutorial-memory) · [Request access](/docs/tutorial-request-access).
+
+## Why skills matter
+
+The tools are safe by construction — birdshot enforces every grant — but an agent
+*works better* when it knows the idioms: recall context first, preview access with
+`whoami` instead of probing for denials, keep durable results in the `main` schema,
+and request access narrowly when blocked. The skills encode those habits so you get
+good behavior out of the box.
+
+## Getting them
+
+Install the [plugin](/docs/plugin) (`/plugin install waddling@waddling`) and the
+skills come with it. Installing only the MCP server (`claude mcp add …`) gives you
+the tools without the skills — the tools still work, but the agent won't have the
+built-in guidance.

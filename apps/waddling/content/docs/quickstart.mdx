@@ -1,205 +1,113 @@
 ---
 title: Quickstart
-description: Sign up, create your first endpoint and agent key, install the MCP server, ATTACH to your lakehouse, and run a governed query — every step copy-pasteable.
+description: Connect an agent to a governed data lake and run your first query — with the hosted MCP server or the local npx server.
 ---
 
 # Quickstart
 
-This guide takes you from zero to a running governed query in under 10 minutes.
+Goal: an agent running a **governed** query against a data lake in a few minutes.
+Pick the path that matches how your agent runs.
 
-## 1. Sign up
+## Path A — Hosted MCP (Claude, zero install)
 
-Go to [app.getwaddling.com](https://app.getwaddling.com) and create an account. You'll be prompted to name your organization (e.g. `acme`).
+The hosted server lives at `https://api.getwaddling.com/mcp`. Claude connects over
+OAuth — nothing to install.
 
-## 2. Create an endpoint
+<Steps>
+<Step>
+### Add the connector
 
-An endpoint binds a DuckLake (your Parquet data on R2/S3 + a Postgres metadata catalog) to a waddling-managed DuckDB gateway.
+In Claude, add a custom connector pointing at `https://api.getwaddling.com/mcp`.
+Claude opens a browser window; sign in and approve. That consent *is* the
+credential — no API key to copy.
+</Step>
+<Step>
+### Orient
 
-In the dashboard → **Endpoints** → **New endpoint**:
+Ask the agent to call `waddling_whoami` (who am I, what can I access) and
+`waddling_list_datalakes` (what lakes can I reach). A brand-new agent may have no
+grants yet — that's expected; see step 4.
+</Step>
+<Step>
+### Connect and query
 
-| Field | Example value |
-|-------|--------------|
-| Name | `prod-lake` |
-| Catalog DSN | `postgres://user:pass@host:5432/ducklake` |
-| Data path | `s3://my-org-bucket/lake/` |
-| Region | `auto` |
-
-Click **Create**. The endpoint status will move from `provisioning` → `running` in about 30 seconds.
-
-> **No DuckLake yet?** See the [enterprise setup guide](/docs/enterprise-setup) for a walkthrough of provisioning a DuckLake catalog and R2 bucket. For the demo, you can use the Docker Compose stack which seeds a DuckLake on MinIO automatically.
-
-## 3. Create an agent and API key
-
-In the dashboard → **Agents** → **New agent**:
-
-| Field | Example value |
-|-------|--------------|
-| Name | `analyst` |
-| Default role | `reader` |
-| Description | `LLM analyst agent for sales queries` |
-
-Click **Create**, then on the agent detail page click **Generate API key**. Copy the key — you'll see it only once.
-
-```
-sk_agent_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-## 4. Grant the agent access to a table
-
-Before an agent can query any table, it needs an explicit ACL rule. In the dashboard → **ACL** → **New rule**:
-
-| Field | Value |
-|-------|-------|
-| Endpoint | `prod-lake` |
-| Agent | `analyst` |
-| Schema | `sales` |
-| Table | `orders` |
-| Columns | *(leave blank for all columns)* |
-| Verb | `read` |
-| Effect | `allow` |
-
-Or via the admin MCP (if you have the admin server running):
-
-```json
-// tool: waddling_admin_grant
-{
-  "endpoint_id": "ep_xxxx",
-  "agent_id": "agt_xxxx",
-  "schema": "sales",
-  "table": "orders",
-  "verb": "read"
-}
-```
-
-The policy compiler runs immediately — birdshot on your gateway reflects the new grant within seconds.
-
-## 5. Install the MCP server
-
-Add waddling to your MCP host. For Claude Desktop, edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "waddling": {
-      "command": "npx",
-      "args": ["-y", "@waddling/mcp@latest"],
-      "env": {
-        "WADDLING_API_KEY": "sk_agent_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-        "WADDLING_URL": "https://app.getwaddling.com"
-      }
-    }
-  }
-}
-```
-
-For the `claude` CLI:
-
-```sh
-claude mcp add waddling -- npx -y @waddling/mcp@latest
-# then set env vars in ~/.claude/settings.json or export them
-```
-
-## 6. Connect — get the ATTACH SQL
-
-Ask your agent (or call the tool directly) to connect to your endpoint:
-
-```json
-// tool: waddling_connect
-{
-  "endpoint_id": "ep_xxxx"
-}
-```
-
-The server returns a `ConnectResult` including the literal `attach_sql` string your agent should run:
-
-```json
-{
-  "session_id": "sess_xxxx",
-  "attach_sql": "ATTACH 'quack:gw.getwaddling.com:9500' AS lake (TOKEN 'eyJ...', DISABLE_SSL false)",
-  "session_jwt": "eyJ...",
-  "endpoint": { "host": "gw.getwaddling.com", "port": 9500 },
-  "ttl_seconds": 900,
-  "granted": {
-    "tables": [
-      { "schema": "sales", "table": "orders", "verbs": ["read"] }
-    ]
-  }
-}
-```
-
-## 7. Run the ATTACH in your DuckDB
-
-Your agent runs the `attach_sql` in its own DuckDB instance:
+`waddling_connect({ datalake_id })` opens a session and attaches the lake. Then
+`waddling_query({ session_id, sql })` — reference tables as `lake.<schema>.<table>`:
 
 ```sql
-ATTACH 'quack:gw.getwaddling.com:9500' AS lake (TOKEN 'eyJ...', DISABLE_SSL false);
+SELECT id, region, amount FROM lake.sales.orders WHERE region = 'EMEA' LIMIT 100
+```
+</Step>
+<Step>
+### If you're denied
+
+Access is default-deny. A human grants access in the dashboard under
+**Agents → your agent → Access**, or the agent can ask for it — see
+[Requesting access](/docs/tutorial-request-access).
+</Step>
+</Steps>
+
+## Path B — Local MCP (`claude` CLI, scripts, other hosts)
+
+The local server ships on npm and runs over stdio.
+
+<Steps>
+<Step>
+### Add the server
+
+```sh
+claude mcp add waddling npx -- -y @waddling/mcp
 ```
 
-The session JWT is verified by birdshot on the gateway. If the token is valid and the agent's ACL grants are active, the ATTACH succeeds.
+No key required up front — it starts in onboarding mode.
+</Step>
+<Step>
+### Sign up / link this machine
 
-## 8. Query
+Ask the agent to call `waddling_signup`. It returns a verify URL and a short code
+— open the link, sign in, and the agent's key is saved locally under `~/.waddling/`
+as a named **profile**. Poll `waddling_signup_status` until it reports connected.
 
-```json
-// tool: waddling_query
-{
-  "session_id": "sess_xxxx",
-  "sql": "SELECT id, customer_id, amount, region FROM lake.sales.orders WHERE region = 'EMEA' LIMIT 100"
-}
-```
+Already have a key? Import it instead: `waddling_profile_add({ profile, api_key })`.
+</Step>
+<Step>
+### Connect and query
 
-Returns:
+Same as hosted: `waddling_list_datalakes` → `waddling_connect({ datalake_id })` →
+`waddling_query({ session_id, sql })`. Sessions refresh transparently — you won't
+hit a 15-minute cutoff (see [Workspaces](/docs/workspaces#sessions)).
+</Step>
+<Step>
+### Ask for access when you need it
 
-```json
-{
-  "columns": ["id", "customer_id", "amount", "region"],
-  "rows": [ ... ],
-  "row_count": 100,
-  "truncated": false,
-  "snapshot_version": 42
-}
-```
+`waddling_request_access({ datalake_id, grants })` returns a link a human approves;
+`waddling_await_access(...)` waits until the grant is live and permanent on your
+key. Full walkthrough: [Requesting access](/docs/tutorial-request-access).
+</Step>
+</Steps>
 
-## 9. Verify your grants
+<Callout type="info" title="Which one?">
+Use **hosted** for Claude with the least setup and for shared **memory + topics**.
+Use **local** when you want multiple **profiles**, the in-agent **access-request**
+flow, or to run inside the `claude` CLI or your own scripts. The tool sets differ —
+see [Working through an agent](/docs/agents).
+</Callout>
 
-At any point, the agent can check what it has access to:
+## Create a data lake first (owners)
 
-```json
-// tool: waddling_whoami
-{ "session_id": "sess_xxxx" }
-```
+If no lake exists yet, an owner creates one in the dashboard under **Data lakes →
+New**. You bring your own object storage (S3 / R2 / GCS) for the data files;
+waddling manages the DuckLake catalog. Details: [Data lakes](/docs/data-lakes).
 
-Returns the agent's identity, active grants, remaining TTL, and rate-limit headroom.
+## What just happened
 
-## 10. Explore the audit log
+- The agent authenticated (OAuth or a stored `sk_agent_` key) — it never saw a
+  storage credential.
+- `connect` provisioned the agent's private **[workspace](/docs/workspaces)** and
+  attached the lake into it server-side.
+- `query` ran inside that workspace against `lake.*`, and **birdshot** enforced the
+  agent's grants — stripping ungranted columns and capping rows.
 
-In the dashboard → **Audit** you'll see every auth decision, query, and column-denial in real time.
-
-Or via the admin MCP:
-
-```json
-// tool: waddling_admin_audit
-{
-  "agent_id": "agt_xxxx",
-  "since": "2026-06-12T00:00:00Z"
-}
-```
-
----
-
-## Troubleshooting
-
-**`authorization_denied` on connect**
-
-The agent's API key is valid but no active ACL rules allow it to access any table on the endpoint. Go to **ACL** in the dashboard and add at least one `allow` rule for this agent + endpoint combination.
-
-**`session_expired` mid-query**
-
-Sessions default to 15-minute TTL. Call `waddling_connect` again to get a fresh session JWT. You can request up to 1 hour at connect time (subject to your plan's policy).
-
-**`column_not_in_allow_list`**
-
-The rule that grants this table specifies a `columns[]` allow-list and the agent's SQL references a column not in it. The gateway proxy strips or rejects the column before the query reaches DuckDB — adjust the rule in the dashboard to expand the allow-list.
-
-**Gateway shows `provisioning` or `error`**
-
-Check the dashboard → Endpoints → detail → **Gateway status** tab. It shows `birdshot_status()` output including auth mode, policy size, and session count. Common causes: bad `catalog_dsn` (Postgres not reachable) or bad `data_path` (R2 credentials not configured).
+Next: understand the pieces — [Data lakes](/docs/data-lakes),
+[Workspaces](/docs/workspaces), [Topics](/docs/topics),
+[Access control](/docs/access-control).

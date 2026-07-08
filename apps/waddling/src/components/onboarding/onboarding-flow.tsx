@@ -17,6 +17,7 @@ import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Loader2 } from 'lucide-react';
 import { authClient } from '@/lib/auth-client';
+import { safeNextPath } from '@/lib/utils';
 import { fetchCp } from '@/components/dashboard/fetch';
 import { BrandMark } from '@/components/brand-mark';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
@@ -46,6 +47,14 @@ export function OnboardingFlow({
   const stepParam = params.get('step');
   const initialStep: Step =
     stepParam === 'confirming' ? 'confirming' : !hasOrg || stepParam === 'org' ? 'org' : 'choose';
+
+  // Validated same-origin return target from the MCP device-link funnel. When set, a
+  // completed onboarding forwards HERE (the /link claim) instead of the connect wizard —
+  // the wizard mints a competing agent key + re-teaches what the device-link already does,
+  // so an MCP user who came to connect a specific agent goes straight back to finish that.
+  const nextTarget = safeNextPath(params.get('next'));
+  const nextParam = nextTarget ? `&next=${encodeURIComponent(nextTarget)}` : '';
+  const afterOnboarding = nextTarget ?? '/onboarding/connect';
 
   const [step, setStep] = useState<Step>(initialStep);
   const [orgId, setOrgId] = useState<string | undefined>(initialOrgId);
@@ -78,7 +87,9 @@ export function OnboardingFlow({
     const statusRes = await fetchCp<{ paid: boolean }>('/api/cp/billing/status');
     setLoading(false);
     if (statusRes.ok && statusRes.data.paid) {
-      router.replace('/onboarding/connect');
+      // The no-card trial (set at org-create) makes billing/status.paid true immediately,
+      // so a fresh org lands here — forward to the funnel target or the connect wizard.
+      router.replace(afterOnboarding);
       return;
     }
     setStep('choose');
@@ -99,8 +110,8 @@ export function OnboardingFlow({
         // Org-scoped customer (matches the embedded billing flow), so an org has one
         // Stripe customer across hosted + embedded checkout — no duplicate subscriptions.
         customerType: 'organization',
-        successUrl: `${origin}/onboarding?step=confirming`,
-        cancelUrl: `${origin}/onboarding?step=choose`,
+        successUrl: `${origin}/onboarding?step=confirming${nextParam}`,
+        cancelUrl: `${origin}/onboarding?step=choose${nextParam}`,
       })) as unknown as { data?: { url?: string }; error?: { message?: string } };
       if (res?.error) {
         setLoading(false);
@@ -132,8 +143,9 @@ export function OnboardingFlow({
       if (!active) return;
       attempts += 1;
       if (await checkPaid()) {
-        // Paid → straight into the guided connect wizard (the "aha" flow), not a bare dashboard.
-        router.replace('/onboarding/connect');
+        // Paid → the funnel target (MCP device-link claim) if present, else straight into
+        // the guided connect wizard (the "aha" flow), not a bare dashboard.
+        router.replace(afterOnboarding);
         return;
       }
       if (attempts >= 15) {

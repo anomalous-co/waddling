@@ -52,6 +52,9 @@ pgdata-*/
 # compiled JS — this repo is TypeScript/ESM (.ts/.mjs); any .js is build output
 *.js
 
+# MCPB distribution bundles (built by pnpm run pack:mcpb)
+*.mcpb
+
 # local demo / scratch runtime state (pgdata, minio, seeded lake data)
 **/.local/
 **/.local-diag/

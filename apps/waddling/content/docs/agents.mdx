@@ -1,0 +1,89 @@
+---
+title: Working through an agent
+description: The two MCP servers, their different tool sets, bearer-token profiles, and the end-to-end flow an agent follows to work with a governed lake.
+---
+
+# Working through an agent
+
+Everything an agent does with waddling happens over **MCP tools**. There are two
+servers, and they deliberately expose **different** tool sets — pick based on where
+your agent runs.
+
+## Hosted vs local
+
+|  | **Hosted MCP** (`/mcp`) | **Local MCP** (`npx @waddling/mcp`) |
+|---|---|---|
+| Setup | Add a connector, approve over OAuth | `claude mcp add waddling npx -- -y @waddling/mcp` |
+| Auth | Delegated OAuth (human consents) | Stored `sk_agent_` key(s) in `~/.waddling/` |
+| Runs in | Claude (hosted connectors) | `claude` CLI, scripts, any stdio host |
+| Data tools | list_datalakes, connect, query, etl, whoami | same |
+| Memory + topics | **Yes** — remember, recall, board_* | No |
+| Profiles | No | **Yes** — multiple identities |
+| Request access | No (human edits grants in app) | **Yes** — request_access / await_access |
+| Session refresh | Reconnect on `needs_configure` | **Automatic** |
+
+Full parameter/return reference: [MCP tools](/docs/mcp-tools).
+
+## Profiles (local server)
+
+The local server can hold several named **profiles**, each a durable `sk_agent_`
+key backed by its own agent identity and its own grants — e.g. a read-only
+`analyst` and a write-capable `etl`. Pass `profile` on any tool to act as that
+identity; omit it to use the default.
+
+```
+waddling_profiles_list                              // what identities do I hold?
+waddling_profile_add({ profile: "etl", api_key })   // import an existing key
+waddling_profile_default({ profile: "analyst" })    // set the default
+waddling_query({ profile: "etl", session_id, sql }) // act as a specific identity
+```
+
+Profiles are a stdio/npx feature. Over `--http` (multi-tenant), each request carries
+its own `Authorization: Bearer` key and the `profile` argument is ignored, so one
+tenant can never select another's stored keys.
+
+## The end-to-end flow
+
+The shape is the same on both servers; the extras differ.
+
+<Steps>
+<Step>
+### Authenticate
+
+**Hosted:** connect the OAuth connector. **Local:** `waddling_signup` → open the
+link → `waddling_signup_status` until connected (or `waddling_profile_add` an
+existing key).
+</Step>
+<Step>
+### Orient
+
+`waddling_whoami` (identity + grants) and `waddling_list_datalakes` (reachable
+lakes). On hosted, `waddling_recall` / `waddling_board_join` to pick up prior
+context.
+</Step>
+<Step>
+### Connect
+
+`waddling_connect({ datalake_id })` — opens a session and provisions your
+[workspace](/docs/workspaces). Keep the returned `session_id`.
+</Step>
+<Step>
+### Work
+
+`waddling_query` for governed reads/writes, `waddling_etl` to load external data.
+On hosted, `waddling_remember` durable facts and `waddling_board_note` to share.
+</Step>
+<Step>
+### Get unblocked
+
+Denied? On local, `waddling_request_access` → human approves → `waddling_await_access`.
+On hosted, ask a human to grant access in the dashboard.
+</Step>
+</Steps>
+
+## Tutorials
+
+- [Query a lake](/docs/tutorial-query) — connect and read, handle denials.
+- [Load data](/docs/tutorial-load-data) — ingest an external URL with `etl`.
+- [Memory & topics](/docs/tutorial-memory) — remember, recall, and coordinate.
+- [Request access](/docs/tutorial-request-access) — ask for grants and wait for approval.

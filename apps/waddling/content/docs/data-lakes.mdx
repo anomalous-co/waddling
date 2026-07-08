@@ -1,0 +1,91 @@
+---
+title: Data lakes
+description: A governed analytics database — a managed DuckLake catalog over storage you own, queried by agents through the lake namespace and controlled by per-agent grants.
+---
+
+# Data lakes
+
+A **data lake** is a governed analytics database your organization registers with
+waddling. You bring your own object storage (S3, R2, or GCS) for the data files;
+waddling manages the **DuckLake catalog** (the table metadata) and puts a governed
+gateway in front of it. Agents query the lake as `lake.<schema>.<table>` and only
+ever see what their grants allow.
+
+<Callout title="“Endpoint” is the old name">
+Earlier versions called this an *endpoint*. The dashboard route `/endpoints`
+redirects to **`/datalakes`**, and some API paths still read `/api/cp/endpoints`
+as an alias. They mean the same thing.
+</Callout>
+
+## What's inside a lake
+
+- **Storage you own** — Parquet/data files in your S3/R2/GCS bucket. waddling reads
+  and writes them through the gateway; your bucket credentials are sealed in the
+  control plane and never handed to an agent.
+- **A managed catalog** — a DuckLake catalog (backed by Postgres) that tracks
+  schemas, tables, and snapshots. You can bring your own catalog DSN or let
+  waddling provision a managed one.
+- **A private gateway** — each lake gets its own governed DuckDB gateway
+  (`gw-<slug>`) running the birdshot extension, which is the only path to the data.
+
+## Create a data lake
+
+In the dashboard: **Data lakes → New**.
+
+| Field | What it is |
+|---|---|
+| **Name** | Human label (e.g. `prod-analytics`). |
+| **Slug** | URL-safe id (`a-z 0-9 -`) used to name the catalog schema and gateway. |
+| **Storage** | Bring your own bucket + credentials, or choose **managed** to have waddling provision R2 storage for you. |
+| **Catalog** | Bring your own DuckLake catalog DSN, or use a managed catalog. |
+
+On create, the lake goes `provisioning → running` (about half a minute) while its
+private gateway comes up. Credentials you provide are AES-sealed in the control
+plane. Once `running`, agents can connect.
+
+## How agents query it
+
+The lake is attached server-side into the agent's
+[workspace](/docs/workspaces) under the fixed alias **`lake`**. Agents never run
+`ATTACH` themselves — they just reference tables:
+
+```sql
+SELECT customer_id, amount, region
+FROM lake.sales.orders
+WHERE region = 'EMEA'
+LIMIT 100
+```
+
+For loading external data into the lake, agents use `waddling_etl` (a governed
+`CREATE TABLE AS` / `INSERT` that reads a remote URL) — see
+[Loading data](/docs/tutorial-load-data).
+
+## Governance
+
+Every lake is **default-deny**. Access is a set of per-agent **grants** —
+literal `GRANT`/`DENY` SQL that the gateway pulls and birdshot enforces live
+(there is no compile step). At query time birdshot:
+
+- **strips ungranted columns** from the projection,
+- **caps rows** to any configured limit,
+- **denies** tables/verbs the agent wasn't granted, returning a structured
+  `{ error, table, reason }` the agent can self-correct from.
+
+You author grants per agent in **Agents → *agent* → Access**. See
+[Access control](/docs/access-control) for the model and the agent-driven
+request flow.
+
+## Seeing what an agent can reach
+
+`waddling_whoami` returns the agent's identity and the **literal grant SQL** in
+scope — the reliable way to see exactly which tables and columns an agent can query,
+without triggering a denial. The **Access** editor in the dashboard shows the same
+grants and is where you author them.
+
+## Maintenance
+
+DuckLake tables accumulate snapshots and small files over time. waddling runs
+automated compaction, snapshot retention, and orphan cleanup — see
+[Lakehouse maintenance](/docs/lakehouse-maintenance). For provisioning dedicated
+storage, catalogs, and gateways per environment, see
+[Enterprise setup](/docs/enterprise-setup).

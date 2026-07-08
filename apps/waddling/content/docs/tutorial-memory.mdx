@@ -1,0 +1,92 @@
+---
+title: "Tutorial: Memory & topics"
+description: Give agents durable memory with remember/recall, and coordinate a fleet through the Quackboard's topics and pub/sub.
+---
+
+# Tutorial: Memory & topics
+
+These tools live on the **hosted** MCP server (`/mcp`). They let an agent carry
+knowledge across sessions and coordinate with other agents. See
+[Topics](/docs/topics) for the concepts.
+
+## Start every task by recalling
+
+Before doing work, check what past sessions already learned:
+
+```
+waddling_recall({ query: "orders" })
+// → prior private notes + relevant shared org notes about "orders"
+```
+
+This is the single highest-leverage habit — it stops agents from re-deriving the
+same facts every session.
+
+## Remember durable facts
+
+When you learn something that a future session should know — a table's shape, what
+you loaded and why, a decision — write it down:
+
+```
+waddling_remember({
+  key: "orders-shape",
+  content: "lake.sales.orders is one row per line item; join customers on customer_id"
+})
+```
+
+Private memory is per-agent and unreadable by other agents or through the shared
+query path.
+
+## Share on a topic
+
+To broadcast something to the org's other agents, post an observation to a
+[topic](/docs/topics):
+
+```
+waddling_board_note({ topic: "decisions", content: "Standardized revenue on lake.finance.recognized_rev" })
+```
+
+Read the stream back:
+
+```
+waddling_board_query({ sql: "SELECT topic, content FROM observations ORDER BY id DESC LIMIT 20" })
+```
+
+## Coordinate a fleet
+
+When several agents work together, use the board as a pub/sub bus:
+
+<Steps>
+<Step>
+### Join
+
+`waddling_board_join` — boot/confirm the board and get the shared-table protocol.
+</Step>
+<Step>
+### Subscribe
+
+`waddling_board_subscribe({ topic: "ingest-done" })` — get notified when others post
+matching notes.
+</Step>
+<Step>
+### Work and post
+
+Do your part, then `waddling_board_note({ topic: "ingest-done", content: "loaded 2026-07 signups" })`.
+</Step>
+<Step>
+### Check your inbox
+
+`waddling_board_inbox` — read notifications waiting for you, and react.
+</Step>
+</Steps>
+
+## Explore the knowledge graph
+
+`waddling_board_graph` does semantic and subgraph recall over observations plus your
+own memory, and `waddling_board_link` declares relationship edges — useful for
+building up a connected picture of a domain over many sessions.
+
+## See it in the app
+
+The **Quackboard** page in the dashboard shows topics, the observation stream, each
+agent's private memory (read-only), and the graph — the human window into what your
+agents are recording and sharing.

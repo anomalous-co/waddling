@@ -15,7 +15,7 @@ import {
   ClaudeIcon,
   CodexIcon,
   GeminiIcon,
-  CursorIcon,
+  //CursorIcon,
   PiIcon,
   OpenCodeIcon,
 } from '@/components/agent-logos';
@@ -48,14 +48,14 @@ const AGENTS: Agent[] = [
     label: 'Claude Code',
     icon: <ClaudeIcon size={16} />,
     file: 'terminal',
-    code: `claude mcp add --transport http waddling \\\n  ${URL} \\\n  --header "Authorization: Bearer ${KEY}"`,
+    code: `claude mcp add --transport http waddling  ${URL}`,
   },
   {
     id: 'codex',
     label: 'Codex',
     icon: <CodexIcon size={16} />,
     file: 'terminal',
-    code: `export WADDLING_KEY=${KEY}\ncodex mcp add waddling \\\n  --url ${URL} \\\n  --bearer-token-env-var WADDLING_KEY`,
+    code: `codex mcp add waddling --url ${URL}`,
   },
   {
     id: 'gemini',
@@ -64,17 +64,17 @@ const AGENTS: Agent[] = [
     file: 'terminal',
     code: `gemini mcp add --transport http waddling \\\n  ${URL} \\\n  --header "Authorization: Bearer ${KEY}"`,
   },
-  {
-    id: 'cursor',
-    label: 'Cursor',
-    icon: <CursorIcon size={16} />,
-    file: '~/.cursor/mcp.json',
-    code: JSON.stringify(
-      { mcpServers: { waddling: { url: URL, headers: { Authorization: `Bearer ${KEY}` } } } },
-      null,
-      2,
-    ),
-  },
+  // {
+  //   id: 'cursor',
+  //   label: 'Cursor',
+  //   icon: <CursorIcon size={16} />,
+  //   file: '~/.cursor/mcp.json',
+  //   code: JSON.stringify(
+  //     { mcpServers: { waddling: { url: URL, headers: { Authorization: `Bearer ${KEY}` } } } },
+  //     null,
+  //     2,
+  //   ),
+  // },
   {
     id: 'pi',
     label: 'pi',
@@ -86,27 +86,34 @@ const AGENTS: Agent[] = [
     label: 'OpenCode',
     icon: <OpenCodeIcon size={16} />,
     file: 'opencode.json',
-    code: JSON.stringify(
-      {
-        $schema: 'https://opencode.ai/config.json',
-        mcp: {
-          waddling: { type: 'remote', url: URL, enabled: true, headers: { Authorization: `Bearer ${KEY}` } },
-        },
-      },
-      null,
-      2,
-    ),
+    code: `opencode mcp add --url ${URL}`,
   },
 ];
 
-export function McpConnect({ className }: { className?: string }) {
-  const [active, setActive] = useState(AGENTS[0].id);
+export function McpConnect({
+  className,
+  active: controlledActive,
+  onActiveChange,
+  pulseAgent,
+}: {
+  className?: string;
+  active?: string;
+  onActiveChange?: (id: string) => void;
+  /** Agent id to briefly glow the copy button for. Cleared after animation. */
+  pulseAgent?: string | null;
+}) {
+  const [internalActive, setInternalActive] = useState(AGENTS[0].id);
+  const active = controlledActive ?? internalActive;
+  const setActive = (id: string) => {
+    setInternalActive(id);
+    onActiveChange?.(id);
+  };
   const agent = AGENTS.find((a) => a.id === active) ?? AGENTS[0];
 
   return (
     <div
       className={cn(
-        'border border-zinc-800 bg-zinc-950/85 shadow-2xl shadow-black/40 backdrop-blur-sm',
+        'border border-zinc-800 bg-zinc-950/85 shadow-sm shadow-black/20 backdrop-blur-sm',
         className,
       )}
     >
@@ -142,13 +149,6 @@ export function McpConnect({ className }: { className?: string }) {
       {/* Snippet */}
       <div className="relative">
         <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-1.5">
-          <span className="font-mono text-[11px] text-zinc-500">{agent.file}</span>
-          <CopyButton
-            text={agent.code}
-            label={`Copy ${agent.label} config`}
-            className="size-6 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
-          />
-        </div>
         <pre
           tabIndex={0}
           aria-label={`${agent.label} MCP config`}
@@ -156,6 +156,13 @@ export function McpConnect({ className }: { className?: string }) {
         >
           {agent.code}
         </pre>
+          <CopyButton
+            text={agent.code}
+            label={`Copy ${agent.label} config`}
+            glow={pulseAgent === agent.id}
+            className="size-6 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+          />
+        </div>
       </div>
     </div>
   );

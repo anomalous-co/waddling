@@ -4,8 +4,9 @@ import { appUrl } from '@/lib/site';
 import { LakeScene } from '@/components/lake-scene';
 import { SkyScene } from '@/components/sky-scene';
 import { TrackedLink } from '@/components/tracked-link';
-import { AgentCarousel } from '@/components/agent-carousel';
-import { McpConnect } from '@/components/mcp-connect';
+import { AgentConnectProvider } from '@/components/agent-connect-provider';
+import { AgentMcpSection } from '@/components/agent-mcp-section';
+import { InteractiveAgentCarousel } from '@/components/interactive-agent-carousel';
 import { SwarmMemory } from './swarm-memory';
 import { Button } from '@/components/ui/button';
 
@@ -17,7 +18,8 @@ export const metadata: Metadata = {
 
 export default function LandingPage() {
   return (
-    <main className="text-foreground">
+    <AgentConnectProvider>
+      <main className="text-foreground">
       {/* Hero — copy + CTA overlay a full-viewport backdrop: the ASCII sky up
           top, the lake pinned as a band at the very bottom. Both are absolute
           so the content (incl. the MCP picker) floats ABOVE them and never
@@ -56,7 +58,7 @@ export default function LandingPage() {
             </div>
 
             {/* Drop the waddling MCP into your agent — pick your agent, copy, go */}
-            <McpConnect className="mt-8 max-w-xl" />
+            <AgentMcpSection className="mt-8 max-w-xl" />
           </div>
         </div>
       </section>
@@ -67,13 +69,14 @@ export default function LandingPage() {
           <p className="mb-5 text-center font-mono text-xs uppercase tracking-wider text-muted-foreground/70">
             works with the agents you already run
           </p>
-          <AgentCarousel />
+          <InteractiveAgentCarousel />
         </div>
       </section>
 
       {/* Positioning + four-tier glance */}
       <SwarmMemory />
-    </main>
+      </main>
+    </AgentConnectProvider>
   );
 }
 

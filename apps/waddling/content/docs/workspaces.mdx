@@ -1,0 +1,81 @@
+---
+title: Workspaces
+description: Each agent's own private, durable, encrypted DuckDB scratch database — provisioned automatically on connect, where it can stage tables and keep results between sessions.
+---
+
+# Workspaces
+
+A **workspace** is the agent's own private DuckDB database — durable, encrypted,
+and isolated from every other agent. It's where an agent can `CREATE TABLE`, stage
+intermediate results, and keep data between sessions. You don't create workspaces;
+`waddling_connect` provisions one automatically the first time an agent connects to
+a data lake, and reconnecting wakes the same one.
+
+Think of it as the agent's desk: the [data lake](/docs/data-lakes) is the shared,
+governed library it reads from; the workspace is its private surface to work on.
+
+## What's private, what's shared
+
+- The workspace is **per agent**. Two agents connected to the same lake get
+  separate, independent workspaces — one can't see the other's tables.
+- Each workspace is an **encrypted** DuckDB file. The encryption key is minted per
+  workspace, sealed in the control plane, and **never returned to the agent** or
+  exposed to storage.
+- Compute is dedicated per workspace and scales to zero when idle; reconnecting
+  resumes the same workspace, so your staged tables are still there.
+
+## What persists
+
+<Callout type="warn" title="Only the main schema is durable">
+Tables you create in the **`main`** schema persist across restarts. Loose files
+you write and anything outside `main` are **scratch** and vanish when the workspace
+scales to zero. If you want to keep something, store it as a table in `main`.
+</Callout>
+
+```sql
+-- Persists: a real table in the workspace's main schema
+CREATE TABLE main.emea_orders AS
+SELECT * FROM lake.sales.orders WHERE region = 'EMEA';
+
+-- Later session, same agent, same workspace — still there:
+SELECT count(*) FROM main.emea_orders;
+```
+
+## The filesystem jail
+
+A workspace can read and write **local files only under `/tmp/workspace`** — useful
+for `COPY … TO` exports and `read_csv` / `read_parquet` / `read_json` staging:
+
+```sql
+COPY (SELECT * FROM main.emea_orders) TO '/tmp/workspace/emea.parquet';
+SELECT * FROM read_parquet('/tmp/workspace/emea.parquet');
+```
+
+Two hard rules enforced by the sandbox:
+
+- **No network egress** from the workspace — `http(s)://` and `s3://` reads are
+  blocked. To pull external data in, use [`waddling_etl`](/docs/tutorial-load-data),
+  which runs the ingest on the gateway with egress *after* birdshot authorizes it.
+- Files under `/tmp/workspace` are **scratch** (see the callout above).
+
+The only path from the workspace to your data lake is the birdshot-gated
+attachment set up at connect — the agent reaches the lake exclusively through
+governed SQL, never a raw connection.
+
+## Sessions
+
+`waddling_connect` opens a **session**: it provisions/wakes the workspace, attaches
+the lake, and mints a short-lived (15-minute) session token that birdshot trusts.
+
+You don't need to manage that expiry. With the **local** `@waddling/mcp` server,
+`waddling_query` and `waddling_etl` transparently re-connect and retry when a
+session goes cold, so an agent never hits a 15-minute wall mid-task. If a tool ever
+does surface `{ error: "needs_configure" }` (or similar), simply call
+`waddling_connect` again and retry — the workspace and its `main` tables are intact.
+
+## Operating a workspace
+
+Workspaces are managed automatically; there's no workspace screen in the dashboard.
+Owners have admin recovery levers (reconfigure, destroy, purge) exposed through the
+control API for support scenarios — these are intentionally **not** part of the
+agent tool surface, so an agent can never tear down its own or another's workspace.

@@ -1,0 +1,69 @@
+---
+title: "Tutorial: Load data"
+description: Ingest external data into a governed lake with waddling_etl — a governed CREATE TABLE AS / INSERT that reads a remote URL after birdshot authorizes it.
+---
+
+# Tutorial: Load data
+
+`waddling_query` runs inside the agent's [workspace](/docs/workspaces), which has no
+network access — so it can't read `http(s)://` or `s3://` URLs. To pull external
+data **into the lake**, use `waddling_etl`. It runs the statement on the gateway,
+where egress is allowed **only after birdshot authorizes** it against your grants.
+
+## What you need granted
+
+Loading data touches two capability groups (see [Access control](/docs/access-control)):
+
+- a **source** policy — `read_source` or `copy_from` for the host you're reading
+  from (e.g. `data.example.com`, or an exact `s3://bucket/prefix/**` glob);
+- **write** (and often **create**) on the **target** table in the lake.
+
+If you're missing either, `waddling_etl` returns a structured denial naming what's
+missing — [request it](/docs/tutorial-request-access).
+
+## Create a table from a URL
+
+`waddling_etl` accepts a single `CREATE TABLE AS` or `INSERT` statement. Reference
+the target as a bare `<schema>.<table>` (not `lake.…`) and read the source with
+DuckDB's `read_*` functions:
+
+```
+waddling_etl({
+  session_id: "sess_…",
+  sql: "CREATE TABLE staging.signups AS SELECT * FROM read_json('https://data.example.com/signups.json')"
+})
+```
+
+Append to an existing table:
+
+```
+waddling_etl({
+  session_id: "sess_…",
+  sql: "INSERT INTO staging.signups SELECT * FROM read_parquet('https://data.example.com/signups/2026-07.parquet')"
+})
+```
+
+`read_csv`, `read_parquet`, `read_json`, and `read_blob` are all supported; the host
+in the URL must be covered by a `read_source`/`copy_from` policy.
+
+## Verify
+
+Once loaded, the table is a normal governed lake table — query it through the
+workspace:
+
+```
+waddling_query({ session_id, sql: "SELECT count(*) FROM lake.staging.signups" })
+```
+
+## Exporting out
+
+To write results to a destination you control, grant a `copy_to` policy for that
+host and use `COPY … TO` in `waddling_etl`. For scratch files you'll read back in
+the same session, `COPY … TO '/tmp/workspace/…'` inside `waddling_query` works too —
+but remember those files are ephemeral (see [Workspaces](/docs/workspaces)).
+
+<Callout title="Why ETL is separate from query">
+Keeping ingest on the gateway (not in the sandboxed workspace) is what lets
+birdshot authorize the external read/write *before* any bytes move — the same
+governance that applies to lake tables also applies to what enters and leaves them.
+</Callout>

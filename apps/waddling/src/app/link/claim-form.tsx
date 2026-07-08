@@ -40,12 +40,14 @@ export function ClaimForm({
   const [agentName, setAgentName] = useState('claude-code');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [expired, setExpired] = useState(false);
   const [done, setDone] = useState(false);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
+    setExpired(false);
     try {
       const res = await fetch(cpUrl('/api/cp/device-link/claim'), {
         method: 'POST',
@@ -57,7 +59,14 @@ export function ClaimForm({
         detail?: string;
       };
       if (!res.ok) {
-        setError(body.detail ?? body.error ?? 'Could not claim this code.');
+        // Codes live 15 minutes. A first-time user who signs up + verifies email + onboards
+        // can blow that TTL before reaching this form — the reliable recovery is to re-run
+        // the tool for a fresh code (now instant, since they're signed-in with an org).
+        if (body.error === 'invalid_code') {
+          setExpired(true);
+        } else {
+          setError(body.detail ?? body.error ?? 'Could not claim this code.');
+        }
         return;
       }
       setDone(true);
@@ -78,6 +87,25 @@ export function ClaimForm({
             Your agent is now connected. It will detect the link automatically and continue what you
             asked it to do — you can close this tab.
           </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (expired) {
+    return (
+      <Card>
+        <CardContent className="flex flex-col items-center gap-3 py-8 text-center">
+          <CardTitle className="text-base">This link expired</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Connection codes are valid for 15 minutes. Your account is all set now — head back to
+            your terminal and ask your agent to connect again (it will run{' '}
+            <code className="font-mono">waddling_signup</code>), then open the fresh link. It only
+            takes a few seconds this time.
+          </p>
+          <Button variant="outline" onClick={() => setExpired(false)}>
+            Enter a new code manually
+          </Button>
         </CardContent>
       </Card>
     );

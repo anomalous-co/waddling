@@ -30,6 +30,8 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "node scripts/build.mjs && tsc --emitDeclarationOnly --outDir dist",
+    "build:mcpb": "node scripts/build.mjs --self-contained && tsc --emitDeclarationOnly --outDir dist",
+    "pack:mcpb": "pnpm run build:mcpb && npx mcpb pack . waddling.mcpb",
     "prepublishOnly": "pnpm run build",
     "typecheck": "tsc --noEmit"
   },
@@ -41,6 +43,7 @@
   "devDependencies": {
     "@waddling/control-schema": "workspace:*",
     "@types/node": "^20",
+    "@anthropic-ai/mcpb": "^2",
     "esbuild": "^0.24",
     "tsx": "^4",
     "typescript": "^5"

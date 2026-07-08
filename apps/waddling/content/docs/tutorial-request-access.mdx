@@ -1,0 +1,80 @@
+---
+title: "Tutorial: Request access"
+description: When an agent is denied, have it request the exact grants it needs, get a human to approve them in one click, and continue — with the access permanent on its key.
+---
+
+# Tutorial: Request access
+
+Access is default-deny, so an agent will sometimes hit a table it can't read. Instead
+of failing, it can request exactly what it needs and wait for a human to approve.
+This flow is on the **local** `@waddling/mcp` server.
+
+## 1. Request the grants
+
+Describe the access you need — a datalake, and the tables/capabilities on it:
+
+```
+waddling_request_access({
+  datalake_id: "dl_abc",
+  grants: [
+    { schema: "sales", table: "orders",    caps: ["read"] },
+    { schema: "sales", table: "customers", caps: ["read"] }
+  ]
+})
+```
+
+`caps` are catalog capabilities — `read`, `write`, `create`, `drop`, `alter`,
+`detach`; use `"*"` for `schema`/`table` to request a whole schema. This grants
+**nothing** yet — it returns a `url` and a `wait_for` block:
+
+```json
+{
+  "url": "https://app.getwaddling.com/agents/agt_123?section=access&propose=…",
+  "agent_id": "agt_123",
+  "requested": [ { "schema": "sales", "table": "orders", "caps": ["read"] }, … ],
+  "wait_for": { "tool": "waddling_await_access", "args": { … } }
+}
+```
+
+## 2. Show the link to a human
+
+Present the `url` to an org **owner or admin**. Opening it lands on the agent's
+Access editor with the requested grants pre-filled as a **pending** change,
+highlighted for review. They confirm and click **Save** — that's the only step that
+actually changes access.
+
+## 3. Wait for approval
+
+Poll with the `wait_for` args until it lands:
+
+```
+waddling_await_access({
+  datalake_id: "dl_abc",
+  grants: [ { schema: "sales", table: "orders", caps: ["read"] }, … ]
+})
+// → { granted: false, still_missing: [...] }   ← call again
+// → { granted: true }                           ← approved
+```
+
+Each call blocks briefly server-side; keep calling while `granted` is false. Give up
+after ~10 minutes and tell the user it's still pending rather than looping forever.
+
+## 4. Continue
+
+Once `granted: true`, retry the work that was blocked. The grant is now **permanent**
+on your key — no expiry, no re-request next session. Confirm anytime with
+`waddling_whoami`.
+
+<Callout title="No hosted equivalent">
+The hosted `/mcp` server doesn't expose request/await. There, a human grants access
+directly in **Agents → *agent* → Access** (see [Access control](/docs/access-control)).
+</Callout>
+
+## Multiple identities
+
+If you hold several [profiles](/docs/agents#profiles-local-server), pass `profile` to
+request access for a specific identity:
+
+```
+waddling_request_access({ profile: "etl", datalake_id: "dl_abc", grants: [{ schema: "staging", table: "*", caps: ["write", "create"] }] })
+```
